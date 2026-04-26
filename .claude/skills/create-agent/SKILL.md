@@ -114,7 +114,7 @@ NEW_REFRESH=$(echo "$RESP" | jq -r .refresh_token)
 
 Write the new pair back to `.env` (rotation invalidates the old ones — must persist or next run breaks).
 
-**2. Build the manifest** for this agent:
+**2. Build the manifest** for this agent. This shape mirrors a known-working production manifest (workspace-scoped Socket Mode bot). Don't add `redirect_urls` — that's for distributed apps and breaks the install-on-team flow:
 
 ```json
 {
@@ -124,6 +124,11 @@ Write the new pair back to `.env` (rotation invalidates the old ones — must pe
     "background_color": "#2c3e50"
   },
   "features": {
+    "app_home": {
+      "home_tab_enabled": false,
+      "messages_tab_enabled": true,
+      "messages_tab_read_only_enabled": false
+    },
     "bot_user": {
       "display_name": "<AGENT_NAME>",
       "always_online": true
@@ -137,15 +142,18 @@ Write the new pair back to `.env` (rotation invalidates the old ones — must pe
         "groups:history", "groups:read", "im:history", "im:read",
         "im:write", "users:read", "files:write"
       ]
-    }
+    },
+    "pkce_enabled": false
   },
   "settings": {
     "event_subscriptions": {
       "bot_events": ["app_mention", "message.channels", "message.groups", "message.im"]
     },
     "interactivity": { "is_enabled": true },
+    "org_deploy_enabled": false,
     "socket_mode_enabled": true,
-    "token_rotation_enabled": false
+    "token_rotation_enabled": false,
+    "is_mcp_enabled": false
   }
 }
 ```
@@ -162,11 +170,15 @@ curl -s -X POST https://slack.com/api/apps.manifest.create \
 
 Capture `app_id` from the response. If `ok: false`, surface the error to the user and abort.
 
-**4. Send the user the install URL.** The response includes `oauth_authorize_url`:
+**4. Send the user the install URL.** Ignore the `oauth_authorize_url` returned by `apps.manifest.create` — that's the distributed-app OAuth flow and it requires `redirect_urls` we deliberately omitted. Use the **app management page's install button** instead:
 
-> *"Click here to install <AGENT_NAME> in <workspace>: `<oauth_authorize_url>` — then click Allow."*
+```
+https://api.slack.com/apps/<APP_ID>/install-on-team
+```
 
-The user must click. Slack does not allow programmatic install.
+> *"Click here to install <AGENT_NAME> in your workspace: `https://api.slack.com/apps/<APP_ID>/install-on-team` — click **Install to Workspace**, then **Allow**."*
+
+The user must click. Slack does not allow programmatic install for workspace-scoped apps. After Allow, they land on the app's OAuth & Permissions page where the bot token is now visible — perfect timing for the next step.
 
 **5. After install, the user manually copies tokens.** Slack does NOT return the bot token in any API response after install. The user has to go fetch it:
 
