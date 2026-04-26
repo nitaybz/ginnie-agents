@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-04-26
+
+The Watcher.
+
+### Added
+
+- **Watcher** — long-running framework watchdog daemon (`listener/src/watcher.ts`). Bolt + Socket Mode, no AI, no Claude tokens. Runs alongside the listener as a second PM2 process (`ginnie-agents-watcher`).
+  - Periodic checks (default hourly): token age, framework update available on `origin/main`, PM2 listener health, disk usage, per-agent memory caps.
+  - DMs the operator only when something fires. 24h cooldown per alert key. Acks/skips persist in `data/watcher-state.json`.
+  - **Interactive buttons** on actionable alerts:
+    - Framework update → `[Update now]` `[Remind tomorrow]` `[Skip this version]`. `[Update now]` shells out to `scripts/update-framework.sh`, streams progress as message edits.
+    - Listener errored → `[View logs]` `[Restart listener]`
+    - Memory cap → `[Ack 24h]` `[Ack 7d]`
+  - **`/watcher` slash command** with subcommands: `help`, `status`, `check`, `pause [hours]`, `resume`, `doctor`.
+- `scripts/update-framework.sh` — deterministic update flow (git pull → conditional docker rebuild → conditional listener rebuild → pm2 restart → doctor). Used by the Watcher's `[Update now]` button and runnable manually.
+- `templates/watcher-slack-manifest.json` — canonical manifest for the Watcher's Slack app (Socket Mode, interactivity, `/watcher` slash command, `chat:write` + `im:write` + `users:read` + `commands` scopes).
+- `setup-watcher` skill — replaces `setup-maintenance-bot`. Walks user through manifest-based Slack app creation, captures bot+app tokens, writes `WATCHER_BOT_TOKEN` / `WATCHER_APP_TOKEN` / `OPERATOR_SLACK_ID` to `.env`.
+
+### Changed
+
+- `ecosystem.config.cjs` — second PM2 app entry `ginnie-agents-watcher` (script `dist/watcher.js`).
+- README + ARCHITECTURE — Watcher replaces the maintenance bot as the canonical bot example. Pattern: bots are deterministic + non-AI, but they can be small Bolt daemons when interactivity matters.
+
+### Removed
+
+- `scripts/maintenance.sh` — the v0.1.0 cron-based maintenance bot. Never publicly used; removed clean rather than deprecated.
+- `.claude/skills/setup-maintenance-bot/` — replaced by `setup-watcher/`.
+
+[0.2.0]: https://github.com/nitaybz/ginnie-agents/releases/tag/v0.2.0
+
 ## [0.1.0] — 2026-04-26
 
 Initial public release. Validated end-to-end via fresh-clone dogfood: setup → create-agent → live Slack DM round-trip with SOUL voice intact + memory written to episodes.

@@ -188,12 +188,12 @@ The framework recognizes two distinct automation shapes and uses different mecha
 | Cost | Claude tokens per turn | Free (host CPU + Slack API) |
 | Latency | ~10–30s cold start | Milliseconds |
 | Examples | personal assistant, ops triage, sales analyst | health watchdog, log scanner, deploy notifier |
-| Skill | `create-agent` | `setup-maintenance-bot` (one canonical bot shipped) |
-| Lives in | `agents/<name>/` | `scripts/<name>.sh` |
+| Skill | `create-agent` | `setup-watcher` (one canonical bot shipped) |
+| Lives in | `agents/<name>/` | `listener/src/watcher.ts` (daemon) or `scripts/<name>.sh` (cron-style) |
 
 Don't mix them up. Wrapping `df` in a Claude Agent container is wasteful (mechanical work doesn't need reasoning). Wrapping an analyst's judgment in a shell script is the wrong shape (reasoning doesn't fit if-elif). Pick the model that matches the work.
 
-The maintenance bot (`scripts/maintenance.sh`) is the framework's canonical bot and the reference template for adding more.
+The framework ships one canonical bot — the **Watcher**. It's a small Node daemon (`listener/src/watcher.ts`) running under PM2 alongside the listener. Uses Bolt + Socket Mode to handle interactive buttons (`Update now`, `Restart listener`, `Ack 24h`, `View logs`) and a `/watcher` slash command. Periodic health checks run on `setInterval`. No AI, no Claude tokens, no Docker per check — but enough Slack runtime to be interactive.
 
 ## What's deliberately NOT in this framework
 
