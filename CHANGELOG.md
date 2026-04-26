@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] — 2026-04-26
+
+Initial public release. Validated end-to-end via fresh-clone dogfood: setup → create-agent → live Slack DM round-trip with SOUL voice intact + memory written to episodes.
+
 ### Added
 
 - Framework extracted from internal deployment.
@@ -48,3 +52,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hardcoded host paths and private network IPs.
 
 [Unreleased]: https://github.com/nitaybz/ginnie-agents/compare/HEAD...HEAD
+[0.1.0]: https://github.com/nitaybz/ginnie-agents/releases/tag/v0.1.0
