@@ -87,6 +87,19 @@ else
   FAIL ".env missing" "cp .env.example .env, then fill in values"
 fi
 
+# ─── Shared config ─────────────────────────────────────────
+SECTION "Shared config"
+
+if [ -f shared/known-users.json ]; then
+  if python3 -c "import json,sys; json.load(open('shared/known-users.json'))" 2>/dev/null; then
+    PASS "shared/known-users.json present and valid JSON"
+  else
+    FAIL "shared/known-users.json invalid JSON" "Fix or reset to: {\"users\":{}}"
+  fi
+else
+  FAIL "shared/known-users.json missing" "Create with: echo '{\"users\":{}}' > shared/known-users.json"
+fi
+
 # ─── Git hooks ─────────────────────────────────────────────
 SECTION "Git hooks"
 
