@@ -29,22 +29,43 @@ If Node is older than 22, point them at https://nodejs.org/.
 
 This is the single most important step. Without it, agents stop running after ~8 hours.
 
-Ask the user to run `claude setup-token` themselves (it's interactive — you can't run it for them). Direct them to copy the printed token.
+The token lives in **`.env` only.** No shell rc edits, no exports needed — the listener loads `.env` directly via dotenv (with override) at startup, so PM2 picks it up automatically every restart.
 
-Then ask them to paste it. Validate format (`sk-ant-oat01-...` or similar long string starting with `sk-ant-`). Write it to `.env`:
+First check whether the user already has a token from a previous `claude setup-token`:
 
 ```bash
-# If .env doesn't exist yet, copy from example
+echo "${CLAUDE_CODE_OAUTH_TOKEN:0:14}"   # prints first 14 chars or empty
+```
+
+If non-empty AND starts with `sk-ant-`, ask the user if they'd like to reuse it. Otherwise:
+
+Ask the user to run `claude setup-token` themselves in another terminal (it's interactive — you cannot run it for them). Direct them to copy the printed token, which starts with `sk-ant-oat01-...`.
+
+Then write it to `.env`:
+
+```bash
 [ -f .env ] || cp .env.example .env
-# Update CLAUDE_CODE_OAUTH_TOKEN in .env (use sed or read+rewrite)
+# Update or add CLAUDE_CODE_OAUTH_TOKEN line in .env
+python3 - <<'PY'
+import re, pathlib
+p = pathlib.Path(".env")
+text = p.read_text()
+token = "<paste-token>"
+if "CLAUDE_CODE_OAUTH_TOKEN=" in text:
+    text = re.sub(r"^CLAUDE_CODE_OAUTH_TOKEN=.*$", f"CLAUDE_CODE_OAUTH_TOKEN={token}", text, flags=re.M)
+else:
+    text += f"\nCLAUDE_CODE_OAUTH_TOKEN={token}\n"
+p.write_text(text)
+PY
 ```
 
-For the user's shell to inherit it on next PM2 start, append:
+Validate format (`sk-ant-oat01-...` or similar long string starting with `sk-ant-`). Confirm it landed:
+
 ```bash
-echo 'export CLAUDE_CODE_OAUTH_TOKEN=<paste>' >> ~/.zshrc   # or ~/.bashrc
+grep '^CLAUDE_CODE_OAUTH_TOKEN=' .env | sed 's/=.*/=<set>/'   # don't print value
 ```
 
-Tell the user to `source ~/.zshrc` before PM2 picks it up.
+That's it — no further shell setup needed. When PM2 restarts the listener, it re-reads `.env`.
 
 ## Step 3 — Pick a timezone
 
@@ -94,30 +115,39 @@ Ask for their Slack workspace URL so we can include it in the agent setup hint l
 ## Step 8 — Start PM2
 
 ```bash
-pm2 start ecosystem.config.cjs --update-env
+pm2 start ecosystem.config.cjs
 pm2 save
 ```
 
-`--update-env` forces PM2 to pick up `CLAUDE_CODE_OAUTH_TOKEN` and `TZ` from the current shell.
+The listener reads `.env` directly via dotenv on every restart — `--update-env` is not needed for `CLAUDE_CODE_OAUTH_TOKEN` or `TZ`.
 
 Verify:
 ```bash
 pm2 logs ginnie-agents-listener --lines 10 --nostream
 ```
 
-Expected output: `⚡ ginnie-agents listener running (Socket Mode, multi-app)` followed by `Started: none` (no agents yet) and `Skipped: none`.
+Expected output: `⚡ ginnie-agents listener running (Socket Mode, multi-app)` followed by `Started: none` and `No agents configured yet. Listener idle — ...`. The listener stays online indefinitely with no agents (a built-in heartbeat keeps the event loop alive); PM2 should show it as `online`, NOT `errored` or rapidly restarting.
 
-If you see `Skipped: <agent> (start failed: …)`, that's expected if there are agents but their tokens aren't set yet.
+If `pm2 status` shows the listener restart-looping or `errored`, something is wrong — check the log for the actual error.
 
 ## Step 9 — Run doctor
 
-Invoke the `doctor` skill. It should report green across the board (except "no agents configured yet" — that's fine for first run).
+Run `bash scripts/doctor.sh` and report any failures. The script handles all the mechanical checks (prerequisites, env, hooks, Docker image, PM2 state, agent configs, memory caps, disk). Use the `doctor` skill if you want to interpret failures or do extra context-aware checks (Slack reachability, etc.).
+
+Expected on a fresh install: every check green except per-agent ones (no agents yet — that's fine).
 
 ## Step 10 — Done
 
 Tell the user:
 1. Setup complete. Listener is running on PM2.
 2. To create your first agent: ask Claude to `create an agent for <role>`.
-3. To check health later: ask Claude to `run doctor`.
+3. To check health later: ask Claude to `run doctor` or just run `bash scripts/doctor.sh`.
 4. To update the framework when new versions land: ask Claude to `update the framework`.
-5. Add `pm2 startup` to launch on host reboot (optional but recommended).
+5. **Optional but recommended:** make PM2 launch on host reboot. Tell the user to run these themselves (the first command requires sudo and the user's password):
+
+   ```bash
+   pm2 startup    # then run the printed sudo command
+   pm2 save
+   ```
+
+   Don't try to run `pm2 startup` from the skill — it requires interactive sudo.

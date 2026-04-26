@@ -5,102 +5,69 @@ description: Health check for ginnie-agents — verifies prerequisites, environm
 
 # Doctor — Health Check
 
-Run all checks, collect results, then print one consolidated report. Don't bail on the first failure — always report everything.
+The mechanical checks live in `scripts/doctor.sh` so they run identically every time, with or without Claude. This skill runs the script and adds the contextual checks (Slack reachability, token-age awareness, `claude setup-token` rotation hint) that benefit from a per-installation read.
 
-For each check, output one of:
-- `✓ <check>` — passed
-- `✗ <check>: <what's wrong> → <how to fix>` — failed
+Run from repo root.
 
-## Prerequisites
+## Step 1 — Run the script
 
 ```bash
-node --version           # need v22+
-docker --version
-docker info >/dev/null   # daemon running
-git --version
-which pm2
+bash scripts/doctor.sh
 ```
 
-## Environment
+Exit code: `0` = all green, `1` = at least one failure.
 
-Check that `.env` exists at the repo root and contains:
-- `CLAUDE_CODE_OAUTH_TOKEN` — non-empty (don't print the value; only confirm presence)
-- `TZ` — set, valid (test by running `TZ=$TZ date` and checking it doesn't error)
+The script's output is already human-readable (✓/✗/!) with fix suggestions. Show it to the user as-is. Don't paraphrase.
 
-If `CLAUDE_CODE_OAUTH_TOKEN` is missing, point user at `claude setup-token` (this is the most common failure).
+If exit code is non-zero, do NOT continue to the contextual checks below until the script's failures are addressed — they're foundational. Tell the user exactly what to fix.
 
-## Git hooks
+## Step 2 — Contextual: Slack reachability
+
+The script doesn't hit Slack (it's a mechanical, network-free check). If the user wants a deeper verification, do this for each agent that has `credentials.json`:
 
 ```bash
-git config --get core.hooksPath  # should print "scripts/hooks"
-test -x scripts/hooks/commit-msg
+for d in agents/*/; do
+  [ -d "$d" ] || continue
+  agent="$(basename "$d")"
+  token="$(jq -r .slack_bot_token "$d/credentials.json" 2>/dev/null)"
+  [ -n "$token" ] && [ "$token" != "null" ] || continue
+  result=$(curl -s -X POST https://slack.com/api/auth.test \
+    -H "Authorization: Bearer $token" | jq -r '"\(.ok) \(.error // "—") \(.team // "—")"')
+  echo "  $agent: $result"
+done
 ```
 
-If `core.hooksPath` is unset, run `bash scripts/hooks/install.sh`.
+Interpret:
+- `true — <Workspace Name>` → token good
+- `false invalid_auth` → token revoked or wrong; regenerate at the agent's Slack app OAuth & Permissions page, update `agents/<n>/credentials.json`, `pm2 restart ginnie-agents-listener`
+- `false token_revoked` → same fix
+- `false account_inactive` → user removed from workspace
+- `false ratelimited` → wait, retry
 
-## Docker image
+## Step 3 — Contextual: token age awareness
+
+`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` lasts ~1 year. There's no API to introspect issuance date from outside the token itself. If a `memory/token-issued-at.txt` file exists in any maintenance agent's memory dir, surface its age:
 
 ```bash
-docker images --format '{{.Repository}}' | grep -q '^ginnie-agent$'
+for f in agents/*/memory/token-issued-at.txt; do
+  [ -f "$f" ] || continue
+  d=$(cat "$f")
+  age=$(( ( $(date +%s) - $(date -j -f '%Y-%m-%d' "$d" +%s 2>/dev/null || date -d "$d" +%s) ) / 86400 ))
+  echo "  $(dirname "$(dirname "$f")") tracker: token aged $age days (cap ~365)"
+done
 ```
 
-If missing, suggest: `docker build -t ginnie-agent -f docker/Dockerfile .`
+If any are >330 days old, recommend `claude setup-token` and refreshing `.env` + the tracker file.
 
-## Listener
+## Step 4 — Final summary
 
-```bash
-pm2 jlist | jq -r '.[] | select(.name=="ginnie-agents-listener") | .pm2_env.status'
-# Should print "online"
-pm2 logs ginnie-agents-listener --lines 5 --nostream
-# Should NOT contain "FATAL" or repeated "Container exited with code"
-```
+If the script exited 0 and Slack is reachable, summarize: **"Healthy — N agents online, all Slack tokens valid, no memory caps near limit."**
 
-If not online, `pm2 start ecosystem.config.cjs --update-env`.
+If anything failed, list the failures + their suggested fixes in priority order:
 
-## Agents
-
-For each `agents/<n>/` directory:
-- `PROMPT.md` exists
-- `SOUL.md` exists
-- `credentials.json` exists with `slack_bot_token` and `slack_app_token` set (don't print values)
-- `slack.json` has `bot_user_id`, `bot_id`, and `channel.id` set
-- `config.json` parses as JSON
-- `memory/rules.md` and `memory/playbook.md` exist (zero-byte is fine)
-
-Report per-agent. Missing optional fields warn rather than fail.
-
-## Memory caps
-
-For each agent, check current line counts:
-```bash
-wc -l agents/*/memory/rules.md         # each should be ≤200
-wc -l agents/*/memory/playbook.md      # each should be ≤300
-```
-
-If any are within 10 lines of the cap, warn that consolidation is overdue.
-
-## Token expiry hint
-
-If you can introspect `CLAUDE_CODE_OAUTH_TOKEN` expiry, do it. Otherwise: report token presence only and tell the user the token expires ~1 year from generation. Recommend running `claude setup-token` annually (the maintenance agent, if installed, alerts 30 days before expiry).
-
-## Disk space
-
-```bash
-df -h .
-```
-
-Warn if <10% free on the filesystem holding the repo.
-
-## Slack reachability (optional)
-
-For each agent with `slack_bot_token`, do an `auth.test`:
-```bash
-curl -s -X POST https://slack.com/api/auth.test \
-  -H "Authorization: Bearer <token>" | jq -r '.ok, .error'
-```
-
-If `ok: false`, the token is revoked or invalid → tell user to regenerate in the Slack app's OAuth & Permissions page and update `agents/<n>/credentials.json`.
-
-## Final report
-
-Print a one-line summary: `<N> checks passed, <M> failed, <K> warnings`. List failures and warnings in priority order (env > hooks > listener > agents > memory > disk > slack).
+1. `.env` / token issues (foundation)
+2. Hooks (data integrity)
+3. Listener / PM2 (runtime)
+4. Per-agent issues (specific to one agent)
+5. Memory caps (background concern)
+6. Disk (background concern)

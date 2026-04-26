@@ -22,8 +22,13 @@ import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./s
 import { getSenderInfo, formatSenderLine } from "./users";
 import { isWithinWorkHours, offHoursNotice } from "./workhours";
 
-// Load env from repo root
-dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
+// Load env from repo root. .env is the authoritative source for
+// CLAUDE_CODE_OAUTH_TOKEN, TZ, etc. — override any stale values that may
+// have leaked from the shell (e.g., an old export in ~/.zshrc).
+dotenv.config({
+	path: path.join(__dirname, "..", "..", ".env"),
+	override: true,
+});
 
 // Initialize thread store
 loadStore();
@@ -517,4 +522,17 @@ function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {
 		loadAgentSchedules(agent, onScheduleFire);
 		watchAgentSchedules(agent, onScheduleFire);
 	}
+
+	// Keep the event loop alive even with zero agents. Without this, a fresh
+	// install (no agents, no Bolt apps, no schedules) would let the loop drain
+	// and Node would exit — PM2 sees that as a crash and restart-loops. The
+	// heartbeat is a no-op; running Bolt apps and schedules already keep the
+	// loop alive on their own, so this only matters in the empty-state case.
+	if (started.length === 0 && skipped.length === 0) {
+		console.log(
+			"   No agents configured yet. Listener idle — create your first agent" +
+			" with the create-agent skill, then `pm2 restart ginnie-agents-listener`.",
+		);
+	}
+	setInterval(() => { /* keep-alive */ }, 60_000);
 })();

@@ -2,10 +2,10 @@
 // Start: pm2 start ecosystem.config.cjs
 // Logs:  pm2 logs ginnie-agents-listener
 //
-// CLAUDE_CODE_OAUTH_TOKEN must be set in the shell that starts/restarts PM2
-// (we read it via process.env so it's not committed to git). Generate with
-// `claude setup-token` (~1 year). After updating it in ~/.zshrc, restart with:
-//   pm2 restart ecosystem.config.cjs --update-env
+// Environment is loaded from .env at the repo root by the listener itself
+// (via dotenv with override=true). You do NOT need to export anything in
+// your shell rc — put CLAUDE_CODE_OAUTH_TOKEN, TZ, and any other config
+// in .env and that's it.
 
 module.exports = {
   apps: [
@@ -19,7 +19,6 @@ module.exports = {
       restart_delay: 5000,
       env: {
         NODE_ENV: "production",
-        CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN || "",
       },
     },
   ],
