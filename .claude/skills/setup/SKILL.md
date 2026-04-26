@@ -106,11 +106,39 @@ cd ..
 
 If `npm run build` fails, paste the error and stop — usually a TypeScript version mismatch worth investigating.
 
-## Step 7 — Slack workspace setup (deferred)
+## Step 7 — Slack workspace + per-agent app strategy
 
-Tell the user: "Slack apps are created per-agent, not framework-wide. We'll set up your first Slack app when you run `create-agent`. Right now we just need somewhere for agents to live."
+Two pieces of Slack setup land here, once per installation. Per-agent apps still get created during `create-agent` — but the workspace identity and the strategy choice live framework-wide.
 
-Ask for their Slack workspace URL so we can include it in the agent setup hint later (saved nowhere yet — it's a UX hint).
+### 7a — Workspace URL
+
+Ask: *"What's your Slack workspace URL?"* (e.g., `acme.slack.com`). Store in `.env` as `SLACK_WORKSPACE_URL=acme.slack.com`.
+
+### 7b — App creation strategy
+
+Ask:
+
+> "When you create new agents later, do you want me to:
+>
+> **(a) Programmatic** — generate the Slack app definition (scopes, events, Socket Mode) automatically via Slack's manifest API. You'll still do ~3 manual clicks per agent (install the app, copy bot token, generate App-Level Token, upload icon). But you skip the ~20 clicks of clicking through scopes and event subscriptions one by one. Requires a one-time admin/owner-level token.
+>
+> **(b) Manual** — you click through every step at api.slack.com yourself. ~20 clicks per agent, no admin token required."
+
+If user picks **(a)**:
+- Direct them to https://api.slack.com/apps → scroll to the **bottom of the page** → look for **"Your App Configuration Tokens"** section → click **Generate Token** → pick the workspace.
+- Two tokens are returned: an **Access Token** (`xoxe.xoxp-…`) and a **Refresh Token** (`xoxe-…`). Both must be admin/owner of the workspace.
+- Ask the user to paste both. Store as `SLACK_CONFIG_TOKEN=xoxe.xoxp-...` and `SLACK_CONFIG_REFRESH_TOKEN=xoxe-...` in `.env`.
+- **Note:** Access tokens expire every 12 hours. The framework auto-refreshes using the refresh token, so the user does this once.
+- Validate by calling:
+  ```bash
+  curl -s -X POST https://slack.com/api/tooling.tokens.rotate \
+    -d "refresh_token=$SLACK_CONFIG_REFRESH_TOKEN" | jq .ok
+  ```
+  If `true`, write the new token + refresh token from the response back into `.env` (rotation invalidates the old ones).
+
+If user picks **(b)**: nothing to store. The `create-agent` skill will fall back to the manual click-through walkthrough.
+
+Either way, this is one-time. After this, `create-agent` reads `.env` and picks the right path automatically.
 
 ## Step 8 — Start PM2
 

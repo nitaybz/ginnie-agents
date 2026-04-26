@@ -34,6 +34,30 @@ Walk the user through these four sections (one at a time, draft as you go):
 
 After drafting, **show the full SOUL.md to the user before writing**. Get explicit approval. Edit on feedback. SOUL is what makes the agent feel like a person; do not rush this.
 
+## Step 2.5 — Avatar (image)
+
+A real Slack avatar makes the agent feel like a person, not a bot. Don't skip this. Slack will use this image everywhere the agent shows up (DMs, @mentions, channel messages, sidebar list).
+
+The framework is image-tool-agnostic. The user picks whichever image AI they prefer — Midjourney, ChatGPT/DALL-E, Gemini, Stable Diffusion, Flux, Adobe Firefly, etc. Your job is to derive a strong prompt from the SOUL.md you just approved and walk them through producing the image.
+
+Derive a prompt from SOUL. For Marlowe (the example) it might be:
+
+> *"Portrait of a calm, 38-year-old gender-neutral person with subtle Manchester/Lisbon background, slight wry expression, natural late-morning light, photographic, square crop, headshot framing, soft neutral background, no text, no logo. Subject looks like someone who walks before coffee, plays bad chess, reads two books at once."*
+
+Show the user:
+1. The derived prompt (let them edit it).
+2. Required spec: square aspect ratio, ≥512×512 px, PNG or JPG. Slack auto-crops to a circle, so the subject should be centered.
+3. Tell them to run it through their image AI of choice and save the result as `agents/<slug>/avatar.png`.
+
+If the user has a preferred image-creation skill installed (e.g., a `media-pipeline` or similar), suggest they invoke it with the derived prompt — but don't assume it exists.
+
+Wait for the user to confirm `avatar.png` is saved before moving on. Verify:
+```bash
+test -f agents/<slug>/avatar.png && file agents/<slug>/avatar.png
+```
+
+You'll upload it to the Slack app in Step 6 (manual click — Slack doesn't expose a bot-icon-set API).
+
 ## Step 3 — Mission (PROMPT.md)
 
 Start from `templates/agent/PROMPT.md`. Substitute:
@@ -65,30 +89,122 @@ From the template `config.json`. Customize:
 
 ## Step 6 — Slack app
 
-Each agent has its own Slack app. Walk the user:
+Each agent has its own Slack app. Two paths — pick automatically based on `.env`:
+
+```bash
+# Read .env once at the start of Step 6
+grep -E '^(SLACK_CONFIG_TOKEN|SLACK_CONFIG_REFRESH_TOKEN|SLACK_WORKSPACE_URL)=' .env
+```
+
+If `SLACK_CONFIG_TOKEN` and `SLACK_CONFIG_REFRESH_TOKEN` are both set → **programmatic path (6A)**. Otherwise → **manual path (6B)**.
+
+### Step 6A — Programmatic (when config tokens are configured)
+
+This path generates the Slack app with all 13 scopes, Socket Mode, and 4 event subscriptions in one API call. The user then does ~3 manual clicks (install, copy bot token, generate App-Level Token, upload icon). Saves ~17 clicks compared to manual.
+
+**1. Refresh the config token** (it expires every 12h):
+
+```bash
+RESP=$(curl -s -X POST https://slack.com/api/tooling.tokens.rotate \
+  -d "refresh_token=$SLACK_CONFIG_REFRESH_TOKEN")
+NEW_TOKEN=$(echo "$RESP" | jq -r .token)
+NEW_REFRESH=$(echo "$RESP" | jq -r .refresh_token)
+[ "$NEW_TOKEN" = "null" ] && echo "Rotation failed: $RESP" && exit 1
+```
+
+Write the new pair back to `.env` (rotation invalidates the old ones — must persist or next run breaks).
+
+**2. Build the manifest** for this agent:
+
+```json
+{
+  "display_information": {
+    "name": "<AGENT_NAME>",
+    "description": "<one-line role from Step 1>",
+    "background_color": "#2c3e50"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "<AGENT_NAME>",
+      "always_online": true
+    }
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read", "chat:write", "chat:write.customize",
+        "chat:write.public", "channels:history", "channels:read",
+        "groups:history", "groups:read", "im:history", "im:read",
+        "im:write", "users:read", "files:write"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": ["app_mention", "message.channels", "message.groups", "message.im"]
+    },
+    "interactivity": { "is_enabled": true },
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}
+```
+
+**3. Create the app via manifest:**
+
+```bash
+curl -s -X POST https://slack.com/api/apps.manifest.create \
+  -H "Authorization: Bearer $NEW_TOKEN" \
+  -H "Content-Type: application/json; charset=utf-8" \
+  -d "{\"manifest\": $(cat manifest.json | jq -c .)}" \
+  | tee /tmp/manifest-resp.json
+```
+
+Capture `app_id` from the response. If `ok: false`, surface the error to the user and abort.
+
+**4. Send the user the install URL.** The response includes `oauth_authorize_url`:
+
+> *"Click here to install <AGENT_NAME> in <workspace>: `<oauth_authorize_url>` — then click Allow."*
+
+The user must click. Slack does not allow programmatic install.
+
+**5. After install, the user manually copies tokens.** Slack does NOT return the bot token in any API response after install. The user has to go fetch it:
+
+> *"Once installed, go to https://api.slack.com/apps/<APP_ID>/oauth — copy the **Bot User OAuth Token** (`xoxb-…`) and paste it here."*
+
+> *"Then go to https://api.slack.com/apps/<APP_ID>/general — scroll to **App-Level Tokens** → click **Generate Token and Scopes**. Name: `<AGENT_NAME>-socket`. Scope: `connections:write`. Click Generate. Copy the `xapp-…` token and paste it here."*
+
+**6. Upload the icon.** Slack does not expose a bot-icon-set API:
+
+> *"Final step: go to https://api.slack.com/apps/<APP_ID>/general → **Display Information** → click **Add App Icon** → upload `agents/<slug>/avatar.png` → Save Changes."*
+
+### Step 6B — Manual (when config tokens are not configured)
+
+Walk the user through the full click-flow:
 
 1. Go to https://api.slack.com/apps → "Create New App" → "From scratch."
 2. App Name: the agent's name (Step 1). Workspace: the user's.
-3. **Socket Mode** → Enable.
-4. **OAuth & Permissions** → add bot scopes: `app_mentions:read`, `chat:write`, `chat:write.customize`, `chat:write.public`, `channels:history`, `channels:read`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `users:read`, `files:write`. (See `templates/agent/slack.json` for the canonical list.)
-5. **Event Subscriptions** → Enable. Subscribe to `app_mention`, `message.channels`, `message.groups`, `message.im`.
-6. **Install to Workspace.**
-7. **Copy the Bot User OAuth Token** (`xoxb-…`) from OAuth & Permissions.
-8. **Generate App-Level Token** (`xapp-…`, scope `connections:write`) at App's General page → App-Level Tokens.
-9. Paste both tokens here.
+3. **Socket Mode** → Enable. Generate App-Level Token (scope `connections:write`) — copy the `xapp-…` token. Save.
+4. **OAuth & Permissions** → add bot scopes: `app_mentions:read`, `chat:write`, `chat:write.customize`, `chat:write.public`, `channels:history`, `channels:read`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `users:read`, `files:write`. (Canonical list also in `templates/agent/slack.json`.)
+5. **Event Subscriptions** → Enable. Subscribe to bot events: `app_mention`, `message.channels`, `message.groups`, `message.im`. Save.
+6. **Basic Information** → **Display Information** → upload `agents/<slug>/avatar.png` as the App Icon. Save.
+7. **Install to Workspace** → Allow.
+8. After install, **OAuth & Permissions** → copy the **Bot User OAuth Token** (`xoxb-…`).
+9. Paste both tokens (`xoxb-…` and `xapp-…`) here.
 
-Verify the Bot token works:
+### After both paths — validate and capture IDs
+
 ```bash
 curl -s -X POST https://slack.com/api/auth.test \
-  -H "Authorization: Bearer $BOT_TOKEN" | jq
+  -H "Authorization: Bearer <xoxb-...>" | jq
 ```
 
-Should return `ok: true` with `user_id`, `bot_id`, `team_id`. Capture `user_id` (= `bot_user_id`, U…) and `bot_id` (B…).
+Should return `ok: true` with `user_id` and `bot_id`. Capture `user_id` (= `bot_user_id`, `U…`) and `bot_id` (`B…`).
 
-For the channel: have the user `/invite` the bot to the channel, then look up the channel ID:
+For the channel: have the user `/invite` the bot to the agent's channel, then look up its ID:
 ```bash
 curl -s -X POST https://slack.com/api/conversations.list \
-  -H "Authorization: Bearer $BOT_TOKEN" -d 'types=public_channel,private_channel' \
+  -H "Authorization: Bearer <xoxb-...>" -d 'types=public_channel,private_channel' \
   | jq -r '.channels[] | "\(.id) \(.name)"' | grep '<channel_name>'
 ```
 
@@ -100,6 +216,7 @@ Now you have everything. Create `agents/<slug>/` and write:
 agents/<slug>/
 ├── PROMPT.md                    # from Step 3
 ├── SOUL.md                      # from Step 2
+├── avatar.png                   # from Step 2.5 (already saved by user)
 ├── config.json                  # from Step 5
 ├── credentials.json             # gitignored — slack tokens + any role-specific keys
 ├── slack.json                   # bot_user_id, bot_id, channel.id, app_id
