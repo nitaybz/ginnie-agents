@@ -94,7 +94,16 @@ To check health later: **"doctor"**. To pull framework updates: **"update the fr
 - `manage-routines` — view/add/edit/disable schedules
 - `manage-work-hours` — set work hours and off-hours behavior
 - `logs` — tail / search / download
-- `create-maintenance-agent` — scaffold a self-monitoring agent
+- `setup-maintenance-bot` — wire up the optional script-based maintenance bot (cron + Slack DM, no AI)
+
+## Agents vs. bots
+
+The framework distinguishes two kinds of automation:
+
+- **Agents** (AI, conversational) — `agents/<name>/` directories. Live in Slack via Socket Mode. Have a SOUL (personality), a PROMPT (mission), three-tier memory. You DM them, they reason. Spend Claude tokens. Use when the work benefits from judgment.
+- **Bots** (scripts, deterministic) — under `scripts/`. Run via cron or PM2. Post to Slack via webhooks/REST. No AI, no SDK, no rate-limit cost. Use for mechanical checks (`df`, `wc -l`, `git fetch`).
+
+The maintenance bot is the canonical example. Don't wrap shell scripts in an agent; don't wrap reasoning in a script.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and [CHANGELOG.md](CHANGELOG.md) for the release notes.
 

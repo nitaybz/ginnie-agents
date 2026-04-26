@@ -174,6 +174,27 @@ pm2 restart ecosystem.config.cjs --update-env
 # run doctor
 ```
 
+## Agents vs. bots
+
+The framework recognizes two distinct automation shapes and uses different mechanisms for each:
+
+| | **Agent** | **Bot** |
+|---|---|---|
+| Purpose | Conversational, judgment-driven work | Mechanical, deterministic checks |
+| Code | AI-driven via Claude Agent SDK | Plain shell script |
+| Runtime | Per-session Docker container, spawned by listener | Cron / PM2 cron-restart, fire-and-forget |
+| Slack | Socket Mode (listens + posts) | Webhook/REST (posts only) |
+| Identity | Has SOUL, PROMPT, memory, personality | Just a script |
+| Cost | Claude tokens per turn | Free (host CPU + Slack API) |
+| Latency | ~10–30s cold start | Milliseconds |
+| Examples | personal assistant, ops triage, sales analyst | health watchdog, log scanner, deploy notifier |
+| Skill | `create-agent` | `setup-maintenance-bot` (one canonical bot shipped) |
+| Lives in | `agents/<name>/` | `scripts/<name>.sh` |
+
+Don't mix them up. Wrapping `df` in a Claude Agent container is wasteful (mechanical work doesn't need reasoning). Wrapping an analyst's judgment in a shell script is the wrong shape (reasoning doesn't fit if-elif). Pick the model that matches the work.
+
+The maintenance bot (`scripts/maintenance.sh`) is the framework's canonical bot and the reference template for adding more.
+
 ## What's deliberately NOT in this framework
 
 - **Multi-LLM**: Claude Code + Max only. No OpenAI, no Gemini, no API SDK.

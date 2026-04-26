@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `manage-routines` — view/add/edit/disable schedules
   - `manage-work-hours` — set work hours and off-hours behavior
   - `logs` — tail/search/download listener and per-agent logs
-  - `create-maintenance-agent` — scaffold a self-monitoring agent (token expiry, framework updates, container health, error patterns, disk, memory caps)
+  - `setup-maintenance-bot` — wire up the optional script-based maintenance bot. Replaces the original `create-maintenance-agent` skill, which wrapped purely-mechanical checks (`df`, `git fetch`, `wc -l`) in a full Claude Agent SDK container per scan. The bot is now `scripts/maintenance.sh` — runs via cron or PM2 cron-restart, deterministic, free, and fast. Same checks (token expiry, framework updates, listener health, disk, memory caps) as before, plus a 24h-per-key cooldown system to keep Slack quiet. ARCHITECTURE.md formalizes the agent-vs-bot distinction.
 
 ### Changed
 
