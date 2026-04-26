@@ -2,7 +2,7 @@
 
 > Open-source framework for building autonomous multi-agent Slack teams on Claude Code + Max.
 
-⚠️ **Pre-release (v0.1.0 in progress).** Core framework code is functional and identical to the internal deployment it was extracted from, but the user-facing setup skills are not yet written. See [Status](#status) below.
+**v0.1.0** — feature-complete pending dogfood validation on a fresh clone. See [CHANGELOG](CHANGELOG.md) for what's in this release.
 
 ## What it is
 
@@ -53,27 +53,50 @@ A framework for running a team of autonomous AI agents that:
 - A Claude Code subscription (Max recommended for daemon use — get a 1-year token via `claude setup-token`)
 - A Slack workspace where you can create apps
 
-## Status
+## Quickstart
 
-What works today:
-- ✅ Listener with multi-app Slack Socket Mode
-- ✅ Scheduler reading per-agent `schedules.json`
-- ✅ Three-tier memory model with git-hook enforcement
-- ✅ Docker isolation per agent
-- ✅ Auto-injected team directory + sender identity resolution
-- ✅ SOUL.md auto-injection
+```bash
+git clone https://github.com/nitaybz/ginnie-agents
+cd ginnie-agents
+```
 
-What's not done yet (tracked toward v0.1.0):
-- ⏳ `setup` skill — guided first-run setup
-- ⏳ `create-agent` skill — scaffold a new agent end-to-end
-- ⏳ `update-framework` / `doctor` / `manage-known-users` / `manage-routines` / `manage-work-hours` / `logs` skills
-- ⏳ `create-maintenance-agent` template
-- ⏳ Selective agent visibility (shared∪local known-users merge)
-- ⏳ Boundaries enforcement (read-only / write declarations in `config.json`)
-- ⏳ ARCHITECTURE.md
-- ⏳ Worked examples in README
+Open the directory in Claude Code and ask: **"set me up"**. The `setup` skill walks through:
+- `claude setup-token` for a 1-year OAuth token
+- Timezone and `.env` scaffolding
+- Git hook installation (memory cap enforcement)
+- Docker image build
+- Listener build + PM2 start
 
-Until the setup skill ships, see the internal Ginnie deployment for a reference setup.
+When that's done, ask Claude to **"create an agent for &lt;role&gt;"** and the `create-agent` skill takes you through Slack app creation, SOUL writing, schedule, boundaries, and registration end-to-end.
+
+To check health later: **"doctor"**. To pull framework updates: **"update the framework"**.
+
+## What's in v0.1.0
+
+**Runtime:**
+- Multi-app Slack Socket Mode listener (one Bolt app per agent, separate identities)
+- Scheduler with per-agent `schedules.json` and live file watching
+- Docker container isolation per agent
+- Three-tier memory model (rules / playbook / episodes) with git-hook enforcement
+- `merge=union` git attribute on memory paths to prevent silent merge loss
+- Auto-injected team directory + per-message sender identity resolution
+- SOUL.md auto-injection between team directory and operational layer
+- Known-users shared ∪ local merge with selective agent visibility
+- Boundaries (read-only / write) enforced at the SDK layer
+- Work hours config with off-hours behaviors (ignore / deferred_response)
+
+**Skills (`.claude/skills/`):**
+- `setup` — first-run guided setup
+- `create-agent` — full agent scaffolding flow
+- `update-framework` — pull updates and rebuild
+- `doctor` — health check
+- `manage-known-users` — add/edit/remove humans and agents with visibility tree
+- `manage-routines` — view/add/edit/disable schedules
+- `manage-work-hours` — set work hours and off-hours behavior
+- `logs` — tail / search / download
+- `create-maintenance-agent` — scaffold a self-monitoring agent
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design and [CHANGELOG.md](CHANGELOG.md) for the release notes.
 
 ## License
 

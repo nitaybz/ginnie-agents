@@ -10,5 +10,13 @@
     "WebSearch",
     "WebFetch"
   ],
+  "boundaries": "write",
+  "work_hours": {
+    "enabled": false,
+    "start": "09:00",
+    "end": "18:00",
+    "days": ["mon", "tue", "wed", "thu", "fri"],
+    "off_hours_behavior": "queue"
+  },
   "model": "claude-sonnet-4-6"
 }

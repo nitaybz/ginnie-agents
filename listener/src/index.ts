@@ -20,6 +20,7 @@ import { loadStore, getThread, setThread } from "./store";
 import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
 import { getSenderInfo, formatSenderLine } from "./users";
+import { isWithinWorkHours, offHoursNotice } from "./workhours";
 
 // Load env from repo root
 dotenv.config({ path: path.join(__dirname, "..", "..", ".env") });
@@ -140,6 +141,38 @@ async function drainQueue(key: string): Promise<void> {
 	}
 }
 
+// ─── Off-hours guard ───────────────────────────────────────
+//
+// Scheduled routines always fire (the schedule itself decides timing).
+// Inbound user messages, however, respect the agent's work_hours config.
+// Returns true if the message should proceed; false if the listener handled it.
+async function passesWorkHours(
+	agent: AgentConfig,
+	app: App,
+	channel: string,
+	threadTs: string,
+): Promise<boolean> {
+	if (isWithinWorkHours(agent.workHours)) return true;
+	const behavior = agent.workHours.off_hours_behavior;
+	if (behavior === "ignore") {
+		console.log(`[${agent.name}] off-hours: ignoring inbound message`);
+		return false;
+	}
+	// "queue" and "deferred_response" both fall through to a posted notice.
+	// True deferred queueing across PM2 restarts is a v0.2 concern.
+	try {
+		await app.client.chat.postMessage({
+			token: agent.slackBotToken,
+			channel,
+			thread_ts: threadTs,
+			text: offHoursNotice(agent.workHours),
+		});
+	} catch (err) {
+		console.error(`[${agent.name}] off-hours notice failed:`, err);
+	}
+	return false;
+}
+
 // ─── Per-agent event wiring ────────────────────────────────
 // Each agent gets its own Bolt App. Events from that app's Slack workspace
 // are scoped to that agent automatically — no cross-agent routing needed.
@@ -154,7 +187,9 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		const messageText = (event.text || "").replace(/<@[A-Z0-9]+>/g, "").trim();
 		if (!messageText) return;
 
-		const sender = await getSenderInfo(app, event.user);
+		if (!(await passesWorkHours(agent, app, channel, threadTs))) return;
+
+		const sender = await getSenderInfo(app, event.user, agent);
 		const senderLine = formatSenderLine(sender);
 
 		console.log(`[@mention] Agent: ${agent.name}, From: ${sender.name} (${sender.role}), Channel: ${channel}, Thread: ${threadTs}`);
@@ -182,12 +217,13 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 
 		if (!messageText) return;
 
-		const sender = await getSenderInfo(app, event.user);
+		const sender = await getSenderInfo(app, event.user, agent);
 		const senderLine = formatSenderLine(sender);
 
 		// ── DM ──
 		if (event.channel_type === "im") {
 			const threadTs = event.thread_ts || event.ts;
+			if (!(await passesWorkHours(agent, app, channel, threadTs))) return;
 			console.log(`[DM] Agent: ${agent.name}, From: ${sender.name} (${sender.role}), Thread: ${threadTs}`);
 			enqueueOrProcess({
 				agent, channel, threadTs, message: messageText,
@@ -248,7 +284,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		// Only handle if this agent posted the message
 		if (botId && botId !== agent.slackBotMsgId) return;
 
-		const sender = await getSenderInfo(app, userId);
+		const sender = await getSenderInfo(app, userId, agent);
 		const senderLine = formatSenderLine(sender);
 
 		// Pull the human-readable label of what was clicked

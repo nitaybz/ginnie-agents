@@ -16,16 +16,30 @@ import path from "path";
 const AGENTS_DIR = path.join(__dirname, "..", "..", "agents");
 const DOCKER_IMAGE = "ginnie-agent";
 
+export type AgentBoundaries = "read-only" | "write";
+
+export type OffHoursBehavior = "queue" | "ignore" | "deferred_response";
+
+export interface AgentWorkHours {
+	enabled: boolean;
+	start: string;     // "HH:MM" 24h, in container TZ
+	end: string;       // "HH:MM" 24h, in container TZ
+	days: string[];    // ["mon","tue","wed","thu","fri"]
+	off_hours_behavior: OffHoursBehavior;
+}
+
 export interface AgentConfig {
 	name: string;
 	dir: string;
-	slackBotId: string;   // bot_user_id (U...) — used for @mention matching
-	slackBotMsgId: string; // bot_id (B...) — used for matching messages posted by the bot
+	slackBotId: string;
+	slackBotMsgId: string;
 	slackChannel: string;
-	slackBotToken: string; // xoxb-... — from agent's credentials.json (or root .env fallback)
-	slackAppToken: string; // xapp-... — from agent's credentials.json (or root .env fallback)
+	slackBotToken: string;
+	slackAppToken: string;
 	maxTurns: number;
 	allowedTools: string[];
+	boundaries: AgentBoundaries;
+	workHours: AgentWorkHours;
 	model?: string;
 }
 
@@ -34,7 +48,30 @@ interface AgentManifest {
 	slack_channel?: string;
 	max_turns?: number;
 	allowed_tools?: string[];
+	boundaries?: AgentBoundaries;
+	work_hours?: Partial<AgentWorkHours>;
 	model?: string;
+}
+
+// Read-only agents are restricted to a tool set that cannot mutate the
+// container filesystem or invoke shell-level write operations. The runner
+// enforces this by overriding allowed_tools at spawn time, regardless of
+// what the agent's config.json declares.
+const READ_ONLY_TOOLS = ["Read", "Grep", "Glob", "WebSearch", "WebFetch"];
+
+function applyBoundaries(
+	declaredTools: string[],
+	boundaries: AgentBoundaries,
+): string[] {
+	if (boundaries === "read-only") {
+		// Intersect declared with allowlist — never expand beyond READ_ONLY_TOOLS.
+		const allowSet = new Set(READ_ONLY_TOOLS);
+		const restricted = declaredTools.filter((t) => allowSet.has(t));
+		// If config declared an empty/unhelpful set, fall back to the full
+		// read-only allowlist so the agent isn't crippled.
+		return restricted.length ? restricted : READ_ONLY_TOOLS;
+	}
+	return declaredTools;
 }
 
 // ─── Auto-discover agents from agents/ directory ───────────
@@ -88,6 +125,20 @@ export function loadAgents(): AgentConfig[] {
 		if (!slackBotToken) slackBotToken = process.env.SLACK_BOT_TOKEN || "";
 		if (!slackAppToken) slackAppToken = process.env.SLACK_APP_TOKEN || "";
 
+		const boundaries: AgentBoundaries = manifest.boundaries === "read-only"
+			? "read-only"
+			: "write";
+		const declaredTools = manifest.allowed_tools || [
+			"Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch",
+		];
+		const wh = manifest.work_hours || {};
+		const workHours: AgentWorkHours = {
+			enabled: wh.enabled === true,
+			start: wh.start || "09:00",
+			end: wh.end || "18:00",
+			days: wh.days || ["mon", "tue", "wed", "thu", "fri"],
+			off_hours_behavior: wh.off_hours_behavior || "queue",
+		};
 		discovered.push({
 			name: entry.name,
 			dir: agentDir,
@@ -97,9 +148,9 @@ export function loadAgents(): AgentConfig[] {
 			slackBotToken,
 			slackAppToken,
 			maxTurns: manifest.max_turns || 50,
-			allowedTools: manifest.allowed_tools || [
-				"Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch",
-			],
+			allowedTools: applyBoundaries(declaredTools, boundaries),
+			boundaries,
+			workHours,
 			model: manifest.model,
 		});
 	}
@@ -234,6 +285,14 @@ function spawnContainer(
 		const skillsDir = path.join(agent.dir, "skills");
 		if (existsSync(skillsDir)) {
 			dockerArgs.push("-v", `${skillsDir}:/workspace/skills:ro`);
+		}
+
+		// Per-agent known-users (read-only, if exists). The entrypoint merges
+		// this with /workspace/.shared/known-users.json — same key in both,
+		// local wins for that entry; otherwise union.
+		const localKnownUsersPath = path.join(agent.dir, "known-users.json");
+		if (existsSync(localKnownUsersPath)) {
+			dockerArgs.push("-v", `${localKnownUsersPath}:/workspace/known-users.json:ro`);
 		}
 
 		// Shared platform context (team directory, optional foundation, user-defined

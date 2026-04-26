@@ -61,48 +61,70 @@ if (!message) {
 // The .shared and .framework mounts are read-only. Agents don't need to (and
 // shouldn't) reference these files from PROMPT.md — they're already prepended.
 
-function renderTeamDirectory(knownUsersPath) {
-	if (!existsSync(knownUsersPath)) return "";
+function loadUsers(filePath) {
+	if (!existsSync(filePath)) return {};
 	try {
-		const data = JSON.parse(readFileSync(knownUsersPath, "utf-8"));
-		const users = data.users || {};
-		const lines = ["## Team Directory (generated)", ""];
-		// Humans first
-		const humans = [];
-		const agents = [];
-		for (const [slackId, u] of Object.entries(users)) {
-			if (u.kind === "human") humans.push([slackId, u]);
-			else if (u.kind === "agent") agents.push([slackId, u]);
-		}
-		if (humans.length) {
-			lines.push("### Humans");
-			for (const [slackId, u] of humans) {
-				lines.push(`- **${u.short_name || u.name}** (${u.title || u.role}) — slack \`${slackId}\`${u.email ? `, email \`${u.email}\`` : ""}${u.supabase_id ? `, supabase \`${u.supabase_id}\`` : ""}`);
-				if (u.responsibilities) lines.push(`  - ${u.responsibilities}`);
-				if (u.authority) lines.push(`  - **Authority:** ${u.authority}`);
-				if (u.tone) lines.push(`  - **Tone:** ${u.tone}`);
-			}
-			lines.push("");
-		}
-		if (agents.length) {
-			lines.push("### Agents");
-			for (const [slackId, u] of agents) {
-				lines.push(`- **${u.short_name || u.name}** (${u.title || u.role}) — slack \`${slackId}\`${u.channel ? `, channel ${u.channel}` : ""}`);
-				if (u.responsibilities) lines.push(`  - ${u.responsibilities}`);
-				if (u.authority) lines.push(`  - **Authority:** ${u.authority}`);
-			}
-			lines.push("");
-		}
-		return lines.join("\n");
+		const data = JSON.parse(readFileSync(filePath, "utf-8"));
+		return data.users || {};
 	} catch (e) {
-		console.error(`[${agentName}] Warning: failed to render team directory:`, e);
-		return "";
+		console.error(`[${agentName}] Warning: failed to read ${filePath}:`, e);
+		return {};
 	}
+}
+
+function mergeUsers(sharedUsers, localUsers) {
+	// shared ∪ local with per-entry override: same key in both → local wins
+	// for that key only. Never whole-file replacement.
+	const merged = { ...sharedUsers };
+	for (const [slackId, u] of Object.entries(localUsers)) {
+		if (merged[slackId]) {
+			console.error(
+				`[${agentName}] Notice: known-user \`${slackId}\` defined in both shared and local; local wins.`,
+			);
+		}
+		merged[slackId] = u;
+	}
+	return merged;
+}
+
+function renderTeamDirectory(sharedKnownUsersPath, localKnownUsersPath) {
+	const shared = loadUsers(sharedKnownUsersPath);
+	const local = loadUsers(localKnownUsersPath);
+	const users = mergeUsers(shared, local);
+	if (!Object.keys(users).length) return "";
+	const lines = ["## Team Directory (generated)", ""];
+	const humans = [];
+	const agents = [];
+	for (const [slackId, u] of Object.entries(users)) {
+		if (u.kind === "human") humans.push([slackId, u]);
+		else if (u.kind === "agent") agents.push([slackId, u]);
+	}
+	if (humans.length) {
+		lines.push("### Humans");
+		for (const [slackId, u] of humans) {
+			lines.push(`- **${u.short_name || u.name}** (${u.title || u.role}) — slack \`${slackId}\`${u.email ? `, email \`${u.email}\`` : ""}${u.supabase_id ? `, supabase \`${u.supabase_id}\`` : ""}`);
+			if (u.responsibilities) lines.push(`  - ${u.responsibilities}`);
+			if (u.authority) lines.push(`  - **Authority:** ${u.authority}`);
+			if (u.tone) lines.push(`  - **Tone:** ${u.tone}`);
+		}
+		lines.push("");
+	}
+	if (agents.length) {
+		lines.push("### Agents");
+		for (const [slackId, u] of agents) {
+			lines.push(`- **${u.short_name || u.name}** (${u.title || u.role}) — slack \`${slackId}\`${u.channel ? `, channel ${u.channel}` : ""}`);
+			if (u.responsibilities) lines.push(`  - ${u.responsibilities}`);
+			if (u.authority) lines.push(`  - **Authority:** ${u.authority}`);
+		}
+		lines.push("");
+	}
+	return lines.join("\n");
 }
 
 let systemPrompt = undefined;
 const foundationPath = "/workspace/.shared/foundation.md";
-const knownUsersPath = "/workspace/.shared/known-users.json";
+const sharedKnownUsersPath = "/workspace/.shared/known-users.json";
+const localKnownUsersPath = "/workspace/known-users.json";
 const soulPath = "/workspace/SOUL.md";
 const memorySkillPath = "/workspace/.framework/skills/memory-curation/SKILL.md";
 const promptPath = "/workspace/PROMPT.md";
@@ -111,7 +133,7 @@ const playbookPath = "/workspace/memory/playbook.md";
 
 const parts = [];
 if (existsSync(foundationPath)) parts.push(readFileSync(foundationPath, "utf-8"));
-const teamDir = renderTeamDirectory(knownUsersPath);
+const teamDir = renderTeamDirectory(sharedKnownUsersPath, localKnownUsersPath);
 if (teamDir) parts.push(teamDir);
 
 // Soul — who the agent is (backstory, voice, quirks). Sits between the team
