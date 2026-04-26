@@ -1,0 +1,11 @@
+{
+  "schedules": [
+    {
+      "id": "daily-report",
+      "cron": "0 9 * * *",
+      "message": "{{DEFAULT_DAILY_MESSAGE}}",
+      "description": "Daily run at 09:00 (container TZ)",
+      "enabled": true
+    }
+  ]
+}

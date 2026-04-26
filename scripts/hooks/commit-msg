@@ -1,0 +1,133 @@
+#!/bin/bash
+# commit-msg hook: enforce the three-tier memory model.
+#
+# Why commit-msg and not pre-commit: we need to read the commit message to
+# honor the "memory-consolidate:" opt-in for episode shrinks. pre-commit
+# runs before COMMIT_EDITMSG is populated (especially for -m commits), so
+# it can't see the message. commit-msg gets the final message as $1 and
+# still has access to the staged diff via `git diff --cached`.
+#
+# Memory layout per agent (agents/<name>/memory/):
+#   - rules.md            ≤ 200 lines (always-loaded user-stated rules)
+#   - playbook.md         ≤ 300 lines (always-loaded settled patterns)
+#   - episodes/*.md       append-only raw journal (lazy-loaded)
+#   - _archive/*.md       no protection (pre-migration safety net)
+#
+# Rules:
+#   1. rules.md / playbook.md must NOT exceed their hard line caps.
+#      These files are always injected into the agent's system prompt, so
+#      unbounded growth directly bloats context. Distill via the nightly
+#      consolidation routine before the cap.
+#   2. episodes/*.md are append-only. A commit that reduces line count is
+#      almost always accidental data loss (merge mistake, stash pop,
+#      manual overwrite). The only legitimate shrink is the quarterly
+#      consolidation routine — which must start its commit message with
+#      "memory-consolidate:" to opt in.
+#
+# Install: scripts/hooks/install.sh
+# Bypass (use sparingly): git commit --no-verify ...
+
+set -u
+
+RULES_CAP=200
+PLAYBOOK_CAP=300
+
+changed=$(git diff --cached --name-only --diff-filter=AMDR \
+  | grep -E '^agents/[^/]+/memory/.*\.md$' || true)
+[ -z "$changed" ] && exit 0
+
+msg_file="${1:-$(git rev-parse --git-path COMMIT_EDITMSG)}"
+msg=$(cat "$msg_file" 2>/dev/null || true)
+is_consolidate=0
+if [[ "$msg" =~ ^memory-consolidate: ]]; then
+  is_consolidate=1
+fi
+
+cap_violations=""
+shrink_violations=""
+
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+
+  # _archive/ is a safety net for legacy content — no enforcement here
+  if [[ "$file" == *"/memory/_archive/"* ]]; then
+    continue
+  fi
+
+  basename="${file##*/}"
+
+  # Current STAGED line count — read the index blob, not the working tree.
+  # This matters because a user can stage a shrink, then continue editing the
+  # working tree, then `git commit` without re-adding. Reading the working
+  # tree would let that shrink commit through silently. The staged blob is
+  # authoritative for what the commit will actually record.
+  staged_blob=$(git show ":$file" 2>/dev/null || true)
+  if [ -n "$staged_blob" ]; then
+    new_lines=$(printf '%s\n' "$staged_blob" | wc -l | tr -d ' ')
+  elif [ -f "$file" ]; then
+    # File was staged for add but is empty; or the ":" path failed. Fall back
+    # to working tree only if the file actually exists.
+    new_lines=$(wc -l < "$file" | tr -d ' ')
+  else
+    new_lines=0   # deleted
+  fi
+
+  # Rule 1: hard line caps on the always-loaded files
+  if [[ "$basename" == "rules.md" ]]; then
+    if [ "$new_lines" -gt "$RULES_CAP" ]; then
+      cap_violations+=$'\n'"  - $file: $new_lines lines (cap $RULES_CAP)"
+    fi
+    continue
+  fi
+  if [[ "$basename" == "playbook.md" ]]; then
+    if [ "$new_lines" -gt "$PLAYBOOK_CAP" ]; then
+      cap_violations+=$'\n'"  - $file: $new_lines lines (cap $PLAYBOOK_CAP)"
+    fi
+    continue
+  fi
+
+  # Rule 2: append-only on episodes/ (and any other legacy memory file that
+  # still exists during migration). Skipped when intentional consolidation.
+  if [ "$is_consolidate" -eq 1 ]; then
+    continue
+  fi
+
+  if git ls-files --error-unmatch "$file" >/dev/null 2>&1; then
+    old_lines=$(git show "HEAD:$file" 2>/dev/null | wc -l | tr -d ' ')
+  else
+    old_lines=0
+  fi
+
+  if [ "$new_lines" -lt "$old_lines" ]; then
+    shrink_violations+=$'\n'"  - $file: $old_lines → $new_lines lines (lost $((old_lines - new_lines)))"
+  fi
+done <<< "$changed"
+
+fail=0
+
+if [ -n "$cap_violations" ]; then
+  echo ""
+  echo "❌ Refusing commit: memory file(s) exceed their hard cap:$cap_violations"
+  echo ""
+  echo "rules.md and playbook.md are auto-loaded into every agent session."
+  echo "Unbounded growth bloats the system prompt."
+  echo ""
+  echo "Fix: run the nightly consolidation routine to distill the file, or"
+  echo "     merge duplicate/superseded lines manually. See the memory-curation"
+  echo "     skill at shared/skills/memory-curation/SKILL.md."
+  fail=1
+fi
+
+if [ -n "$shrink_violations" ]; then
+  echo ""
+  echo "❌ Refusing commit: episode file(s) would shrink:$shrink_violations"
+  echo ""
+  echo "Episodes are append-only. If this shrink is an intentional quarterly"
+  echo "consolidation, start the commit message with 'memory-consolidate:'."
+  echo "If it's accidental, recover the missing entries first"
+  echo "(git log, git stash reflog, or git show <sha>:<file>)."
+  fail=1
+fi
+
+[ $fail -ne 0 ] && { echo ""; exit 1; }
+exit 0

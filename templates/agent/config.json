@@ -1,0 +1,14 @@
+{
+  "max_turns": 50,
+  "allowed_tools": [
+    "Bash",
+    "Read",
+    "Write",
+    "Edit",
+    "Glob",
+    "Grep",
+    "WebSearch",
+    "WebFetch"
+  ],
+  "model": "claude-sonnet-4-6"
+}

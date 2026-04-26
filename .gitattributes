@@ -1,0 +1,7 @@
+# Memory files are either raw logs (episodes) or curated, bounded files
+# (rules, playbook). In either case, if git ever has to merge them we keep
+# BOTH sides' lines — never choose one side, never silently lose content.
+# Duplicates are cheaper than data loss; the nightly consolidation routine
+# dedupes cleanly.
+agents/*/memory/*.md merge=union
+agents/*/memory/**/*.md merge=union

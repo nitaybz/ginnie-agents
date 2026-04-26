@@ -1,0 +1,31 @@
+{
+  "app_name": "{{AGENT_NAME}}",
+  "app_id": "",
+  "bot_user_id": "",
+  "bot_id": "",
+  "channel": {
+    "name": "#{{CHANNEL_NAME}}",
+    "id": "{{CHANNEL_ID}}"
+  },
+  "scopes": [
+    "app_mentions:read",
+    "chat:write",
+    "chat:write.customize",
+    "chat:write.public",
+    "channels:history",
+    "channels:read",
+    "groups:history",
+    "groups:read",
+    "im:history",
+    "im:read",
+    "im:write",
+    "users:read",
+    "files:write"
+  ],
+  "events": [
+    "app_mention",
+    "message.channels",
+    "message.groups",
+    "message.im"
+  ]
+}
