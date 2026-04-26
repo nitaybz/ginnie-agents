@@ -114,7 +114,9 @@ NEW_REFRESH=$(echo "$RESP" | jq -r .refresh_token)
 
 Write the new pair back to `.env` (rotation invalidates the old ones — must persist or next run breaks).
 
-**2. Build the manifest** for this agent. This shape mirrors a known-working production manifest (workspace-scoped Socket Mode bot). Don't add `redirect_urls` — that's for distributed apps and breaks the install-on-team flow:
+**2. Build the manifest** for this agent. The canonical shape lives in `templates/agent/slack-manifest.json` — substitute `{{AGENT_NAME}}` and `{{ROLE_DESCRIPTION}}` and you're done. Mirrored from a known-working production manifest. **Don't add `redirect_urls`** — that switches the app into the distributed-OAuth flow and breaks the workspace install-on-team button.
+
+For reference, the manifest the skill writes:
 
 ```json
 {
@@ -184,7 +186,7 @@ The user must click. Slack does not allow programmatic install for workspace-sco
 
 > *"Once installed, go to https://api.slack.com/apps/<APP_ID>/oauth — copy the **Bot User OAuth Token** (`xoxb-…`) and paste it here."*
 
-> *"Then go to https://api.slack.com/apps/<APP_ID>/general — scroll to **App-Level Tokens** → click **Generate Token and Scopes**. Name: `<AGENT_NAME>-socket`. Scope: `connections:write`. Click Generate. Copy the `xapp-…` token and paste it here."*
+> *"Then go to https://api.slack.com/apps/<APP_ID>/general — scroll to **App-Level Tokens** → click **Generate Token and Scopes**. Name: `<AGENT_NAME>-socket`. Add **all three** scopes: **`connections:write`** (Socket Mode — required), **`authorizations:read`**, and **`app_configurations:write`** (forward-compat for future framework features that may inspect installations or update app config). Click Generate. Copy the `xapp-…` token and paste it here."*
 
 **6. Upload the icon.** Slack does not expose a bot-icon-set API:
 
@@ -196,7 +198,7 @@ Walk the user through the full click-flow:
 
 1. Go to https://api.slack.com/apps → "Create New App" → "From scratch."
 2. App Name: the agent's name (Step 1). Workspace: the user's.
-3. **Socket Mode** → Enable. Generate App-Level Token (scope `connections:write`) — copy the `xapp-…` token. Save.
+3. **Socket Mode** → Enable. Generate App-Level Token — name `<AGENT_NAME>-socket`. Add **all three** scopes: `connections:write` (Socket Mode), `authorizations:read`, `app_configurations:write` (forward-compat). Click Generate. Copy the `xapp-…` token. Save.
 4. **OAuth & Permissions** → add bot scopes: `app_mentions:read`, `chat:write`, `chat:write.customize`, `chat:write.public`, `channels:history`, `channels:read`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `users:read`, `files:write`. (Canonical list also in `templates/agent/slack.json`.)
 5. **Event Subscriptions** → Enable. Subscribe to bot events: `app_mention`, `message.channels`, `message.groups`, `message.im`. Save.
 6. **Basic Information** → **Display Information** → upload `agents/<slug>/avatar.png` as the App Icon. Save.

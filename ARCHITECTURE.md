@@ -1,6 +1,15 @@
 # Architecture
 
-ginnie-agents is a multi-agent framework that runs each agent as an isolated Docker container, talking to humans (and to each other) through Slack, with shared persistent memory and a curated team directory.
+ginnie-agents is a multi-agent framework that runs each agent as an isolated Docker container, talking to humans (and to each other) through Slack via **Socket Mode** (WebSocket), with shared persistent memory and a curated team directory.
+
+## Slack transport: Socket Mode (not webhooks)
+
+The framework uses Slack's [Socket Mode](https://api.slack.com/apis/connections/socket) for all bot-to-Slack communication. Each agent's `@slack/bolt` App opens a persistent WebSocket connection to Slack. There are **no public webhook URLs**; the framework does not need an inbound HTTP server, reverse proxy, or static IP — it works behind NAT, on a laptop, on a home server, anywhere with outbound TCP.
+
+Implications:
+- The required Slack scopes include `connections:write` on each agent's App-Level Token (the `xapp-…` token).
+- The bot's "Event Subscriptions" must be **enabled in Slack** but the **Request URL field stays empty** — events flow over the WebSocket, not to a URL.
+- Each agent owns its own connection — agents do not share a Slack identity. The framework's listener spawns one Bolt app per agent so message routing is handled natively by Slack.
 
 ## Topology
 

@@ -8,7 +8,7 @@
 
 A framework for running a team of autonomous AI agents that:
 
-- Live in **Slack** (one Slack app per agent — separate identity, channel, role)
+- Live in **Slack** via **Socket Mode** — one Slack app per agent, separate identity, separate WebSocket. No webhook URL or public IP required; works behind NAT, on a laptop, on a home server.
 - Run in **isolated Docker containers** via the Claude Agent SDK
 - Authenticate with your **Claude Code Max subscription** (no API key billing)
 - Maintain **persistent three-tier memory** (rules, playbook, episodes) with hard caps and append-only enforcement
