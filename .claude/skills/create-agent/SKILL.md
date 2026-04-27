@@ -46,17 +46,24 @@ Derive a prompt from SOUL. For Marlowe (the example) it might be:
 
 Show the user:
 1. The derived prompt (let them edit it).
-2. Required spec: square aspect ratio, ≥512×512 px, PNG or JPG. Slack auto-crops to a circle, so the subject should be centered.
-3. Tell them to run it through their image AI of choice and save the result as `agents/<slug>/avatar.png`.
+2. Required spec: square 1024×1024 PNG. Slack auto-crops to a circle, so the subject should be centered.
+3. Tell them to run it through their image AI of choice (Midjourney, DALL-E, Gemini, Flux, …). The output is rarely already square.
 
-If the user has a preferred image-creation skill installed (e.g., a `media-pipeline` or similar), suggest they invoke it with the derived prompt — but don't assume it exists.
+If the user has a preferred image-creation skill installed (e.g., `media-pipeline`), suggest they invoke it with the derived prompt — but don't assume it exists.
 
-Wait for the user to confirm `avatar.png` is saved before moving on. Verify:
+**Resize + square-crop with ImageMagick** (works on any non-square input):
+
 ```bash
-test -f agents/<slug>/avatar.png && file agents/<slug>/avatar.png
+# Requires: brew install imagemagick   (macOS)   or   apt-get install imagemagick   (Linux)
+magick "/path/to/your-image.png" -resize 1024x1024^ -gravity center -extent 1024x1024 "agents/<slug>/avatar.png"
 ```
 
-You'll upload it to the Slack app in Step 6 (manual click — Slack doesn't expose a bot-icon-set API).
+Verify:
+```bash
+test -f "agents/<slug>/avatar.png" && magick identify "agents/<slug>/avatar.png"
+```
+
+You'll upload `agents/<slug>/avatar.png` to the Slack app's icon in Step 6 (manual drag-and-drop — Slack doesn't expose a bot-icon-set API).
 
 ## Step 3 — Mission (PROMPT.md)
 
@@ -164,9 +171,9 @@ For reference, the manifest the skill writes:
 
 ```bash
 curl -s -X POST https://slack.com/api/apps.manifest.create \
-  -H "Authorization: Bearer $NEW_TOKEN" \
+  -H "Authorization: Bearer $ACCESS" \
   -H "Content-Type: application/json; charset=utf-8" \
-  -d "{\"manifest\": $(cat manifest.json | jq -c .)}" \
+  -d "{\"manifest\": $(cat manifest.json | jq -c 'del(._comment)')}" \
   | tee /tmp/manifest-resp.json
 ```
 

@@ -21,17 +21,20 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO"
 
 echo "==> git fetch"
-git fetch origin --quiet || { echo "fetch failed"; exit 1; }
+UPSTREAM="${FRAMEWORK_UPSTREAM:-origin/main}"
+REMOTE="${UPSTREAM%%/*}"
+git fetch "$REMOTE" --quiet || { echo "fetch failed"; exit 1; }
 
-AHEAD=$(git rev-list --count HEAD..origin/main 2>/dev/null || echo 0)
+AHEAD=$(git rev-list --count "HEAD..${UPSTREAM}" 2>/dev/null || echo 0)
 if [ "$AHEAD" -eq 0 ]; then
   echo "Already up to date."
   exit 0
 fi
 
 PREV_HEAD=$(git rev-parse HEAD)
-echo "==> git pull --ff-only origin main"
-git pull --ff-only origin main || {
+BRANCH="${UPSTREAM#*/}"
+echo "==> git pull --ff-only $REMOTE $BRANCH"
+git pull --ff-only "$REMOTE" "$BRANCH" || {
   echo "pull failed (likely divergent history) — see git status"
   exit 1
 }
@@ -60,6 +63,12 @@ if pm2 jlist 2>/dev/null | grep -q '"name":"ginnie-agents-watcher"'; then
   echo "==> pm2 restart watcher"
   pm2 restart ginnie-agents-watcher --update-env || true
 fi
+
+echo "==> record deployed framework version"
+mkdir -p data
+git rev-parse "$UPSTREAM" > data/framework-version.txt 2>/dev/null || \
+  git rev-parse HEAD > data/framework-version.txt
+echo "    data/framework-version.txt = $(cat data/framework-version.txt)"
 
 echo "==> doctor"
 bash scripts/doctor.sh

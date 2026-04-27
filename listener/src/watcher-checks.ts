@@ -52,37 +52,82 @@ export function checkTokenAge(): CheckResult | null {
 }
 
 // ─── Framework update available ────────────────────────────
-export function checkFrameworkUpdate(): CheckResult | null {
+//
+// FRAMEWORK_UPSTREAM names the ref the operator wants tracked. For fresh
+// adopters who cloned this repo directly, that's `origin/main`. For
+// fork-and-track installs (private origin, public framework on `upstream`),
+// set FRAMEWORK_UPSTREAM=upstream/main in .env.
+//
+// The "deployed framework version" is recorded in data/framework-version.txt
+// (just a sha). update-framework.sh writes it after every successful pull.
+// We compare that sha to the upstream HEAD — so even when the local repo's
+// git HEAD points at unrelated private history, the comparison works.
+//
+// If data/framework-version.txt is missing, we fall back to git HEAD —
+// correct for direct-clone installs whose HEAD always equals the deployed
+// framework version.
+const FRAMEWORK_UPSTREAM = process.env.FRAMEWORK_UPSTREAM || "origin/main";
+const FRAMEWORK_VERSION_FILE = "data/framework-version.txt";
+
+function deployedSha(): string {
 	try {
-		execSync("git fetch origin --quiet", { cwd: REPO, stdio: "ignore" });
+		const f = path.join(REPO, FRAMEWORK_VERSION_FILE);
+		if (existsSync(f)) {
+			const s = readFileSync(f, "utf-8").trim();
+			if (/^[0-9a-f]{7,40}$/.test(s)) return s;
+		}
+	} catch { /* fall through */ }
+	try {
+		return execSync("git rev-parse HEAD", { cwd: REPO, encoding: "utf-8" }).trim();
 	} catch {
-		return null; // no remote, no remote/main, or fetch failed — silent
+		return "";
 	}
-	let ahead = 0;
-	let titles = "";
+}
+
+export function checkFrameworkUpdate(): CheckResult | null {
+	const slash = FRAMEWORK_UPSTREAM.indexOf("/");
+	if (slash <= 0) return null;
+	const remote = FRAMEWORK_UPSTREAM.slice(0, slash);
+	try {
+		execSync(`git fetch ${remote} --quiet`, { cwd: REPO, stdio: "ignore" });
+	} catch {
+		return null; // no such remote, fetch failed — silent (not actionable)
+	}
+	const base = deployedSha();
+	if (!base) return null;
 	let targetSha = "";
 	try {
+		targetSha = execSync(`git rev-parse ${FRAMEWORK_UPSTREAM}`, {
+			cwd: REPO,
+			encoding: "utf-8",
+		}).trim();
+	} catch {
+		return null;
+	}
+	if (!targetSha || targetSha === base) return null;
+	let ahead = 0;
+	let titles = "";
+	try {
 		ahead = parseInt(
-			execSync("git rev-list --count HEAD..origin/main", {
+			execSync(`git rev-list --count ${base}..${FRAMEWORK_UPSTREAM}`, {
 				cwd: REPO,
 				encoding: "utf-8",
 			}).trim(),
 			10,
 		) || 0;
 		if (ahead > 0) {
-			titles = execSync("git log HEAD..origin/main --oneline", {
+			titles = execSync(`git log ${base}..${FRAMEWORK_UPSTREAM} --oneline`, {
 				cwd: REPO,
 				encoding: "utf-8",
 			})
 				.split("\n")
 				.slice(0, 10)
 				.join("\n");
-			targetSha = execSync("git rev-parse origin/main", {
-				cwd: REPO,
-				encoding: "utf-8",
-			}).trim();
 		}
 	} catch {
+		// `base` may be unreachable from upstream (e.g., user forced a reset
+		// of the framework version file to a commit that's no longer in the
+		// upstream history). Stay silent rather than alerting wrongly.
 		return null;
 	}
 	if (ahead === 0) return null;
@@ -90,7 +135,7 @@ export function checkFrameworkUpdate(): CheckResult | null {
 		key: `framework-update:${targetSha.slice(0, 7)}`,
 		severity: "info",
 		message:
-			`🔄 *${ahead} framework update${ahead === 1 ? "" : "s"} available* on origin/main:\n` +
+			`🔄 *${ahead} framework update${ahead === 1 ? "" : "s"} available* on ${FRAMEWORK_UPSTREAM}:\n` +
 			"```\n" + titles + "\n```",
 		actions: [
 			{ type: "update_framework", label: "Update now", style: "primary", value: targetSha },

@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-04-27
+
+Polish from first real install on a private fork: stop alerting on the wrong remote, eliminate the recurring "I lost the rotated config token" footgun, and make avatar prep and manifest creation reliable.
+
+### Added
+
+- `scripts/rotate-slack-config-token.sh` — atomic helper. Rotates `SLACK_CONFIG_TOKEN` + `SLACK_CONFIG_REFRESH_TOKEN` and persists the new pair to `.env` via temp-write-and-rename before returning the new access token. Skills must call this instead of hitting `tooling.tokens.rotate` directly. Closes the recurring bug where a rotation would succeed but the new pair would never make it to disk, leaving the install locked out.
+- `FRAMEWORK_UPSTREAM` env var (default `origin/main`) — names the git ref the Watcher and `update-framework.sh` treat as "the framework upstream." Fork-and-track installs (private origin, public framework on `upstream`) set `FRAMEWORK_UPSTREAM=upstream/main`.
+- `data/framework-version.txt` — records the public sha currently deployed. `update-framework.sh` writes it after every successful pull. The Watcher's `checkFrameworkUpdate` reads it as the comparison base, so installs whose git HEAD points at unrelated private history don't get every public commit alerted as a "framework update."
+- Avatar preparation step in both `setup-watcher` and `create-agent` skills. ImageMagick one-liner to resize + center-crop input images to a Slack-ready 1024×1024 PNG. Anchored documentation since the wrong gravity (default center) chops the head off any portrait whose subject is in the upper half — use `-gravity north` for top-anchored crops.
+
+### Changed
+
+- Manifest API calls in skills now strip the `_comment` field via `jq -c 'del(._comment)'` before sending. Slack's manifest API rejects unknown top-level fields; the `_comment` annotation in `templates/*-slack-manifest.json` is documentation only and must not be sent.
+- `setup-watcher` skill now uses `bash scripts/rotate-slack-config-token.sh` instead of an inline curl + python rewrite. Same for `create-agent`.
+
+### Notes for upgrades from v0.2.0
+
+If you're already running v0.2.0 with a private origin (the fork-and-track shape), you'll want to:
+1. Add the public framework as an upstream remote: `git remote add upstream git@github.com:nitaybz/ginnie-agents.git`
+2. Set `FRAMEWORK_UPSTREAM=upstream/main` in `.env`
+3. Pin the deployed version: `git fetch upstream && git rev-parse upstream/main > data/framework-version.txt`
+4. Restart the Watcher: `pm2 restart ginnie-agents-watcher --update-env`
+
+[0.2.1]: https://github.com/nitaybz/ginnie-agents/releases/tag/v0.2.1
+
 ## [0.2.0] — 2026-04-26
 
 The Watcher.

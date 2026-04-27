@@ -36,19 +36,19 @@ If `missing`: ask the user to generate config tokens at https://api.slack.com/ap
 
 If config tokens are present but stale, the next step will fail with `invalid_refresh_token` — instruct the user to regenerate at the same URL.
 
-## Step 2 — Refresh the config token
+## Step 2 — Rotate the config token (atomic)
+
+Use the framework's helper. It rotates the pair and persists the new pair to `.env` atomically (write-temp-and-rename) so a crash mid-rotation cannot leave you with a dead token. Echoes only the new access token to stdout — clean to capture in a shell var:
 
 ```bash
-ACCESS=$(grep -E '^SLACK_CONFIG_TOKEN=' .env | cut -d= -f2-)
-REFRESH=$(grep -E '^SLACK_CONFIG_REFRESH_TOKEN=' .env | cut -d= -f2-)
-ROTATED=$(curl -s -X POST https://slack.com/api/tooling.tokens.rotate -d "refresh_token=$REFRESH")
-NEW_ACCESS=$(echo "$ROTATED" | jq -r .token)
-NEW_REFRESH=$(echo "$ROTATED" | jq -r .refresh_token)
-[ "$NEW_ACCESS" = "null" ] && echo "rotation failed: $ROTATED" && exit 1
-# Persist new pair into .env (overwrite both lines)
+ACCESS=$(bash scripts/rotate-slack-config-token.sh) || {
+  echo "rotation failed — see stderr above. If error was invalid_refresh_token,"
+  echo "regenerate at https://api.slack.com/apps (bottom of page) and update .env."
+  exit 1
+}
 ```
 
-Use a small `python3` rewrite to update `.env` (preserves other lines).
+**Never call `tooling.tokens.rotate` directly inside this skill** — every direct call is a chance to forget to persist the new pair, and that locks you out of the config-token API entirely. The helper exists to remove that footgun.
 
 ## Step 3 — Pick a name
 
@@ -56,17 +56,32 @@ Default: **`Watcher`**. You can also use a branded name like `Ginnie Watcher`. D
 
 Ask the user to confirm or override.
 
+## Step 3.5 — Prepare the avatar (optional but recommended)
+
+Slack auto-crops bot icons to a circle. Most input images aren't square. Use ImageMagick to resize + center-crop:
+
+```bash
+# Requires: brew install imagemagick   (macOS)   or   apt-get install imagemagick   (Linux)
+magick "/path/to/your-input-image.png" -resize 1024x1024^ -gravity center -extent 1024x1024 "/tmp/watcher-avatar.png"
+```
+
+`-resize 1024x1024^` scales the image so the smaller dimension is at least 1024. `-gravity center -extent 1024x1024` then center-crops to a square 1024×1024 PNG.
+
+If the user has no image yet, suggest generating one with whatever image AI they prefer. Sample prompt: *"Square portrait, illustrative style, an unseen-but-vigilant watchful presence, eye motif, neutral background, 1024×1024, no text"* — but tool-agnostic, the user picks.
+
+Save to a path the user can drag from Finder/Files later (e.g. `/tmp/watcher-avatar.png` on macOS). The upload itself is manual in Step 6 — Slack has no API for setting bot icons.
+
 ## Step 4 — Create the Watcher's Slack app via manifest
 
-Read `templates/watcher-slack-manifest.json`, substitute `{{WATCHER_NAME}}`, POST to `apps.manifest.create`:
+Read `templates/watcher-slack-manifest.json`, substitute `{{WATCHER_NAME}}`, **strip the `_comment` field** (Slack's manifest API rejects unknown top-level fields), POST to `apps.manifest.create`:
 
 ```bash
 NAME="<chosen name>"
-MANIFEST=$(cat templates/watcher-slack-manifest.json | sed "s/{{WATCHER_NAME}}/$NAME/g")
+MANIFEST=$(sed "s/{{WATCHER_NAME}}/$NAME/g" templates/watcher-slack-manifest.json | jq -c 'del(._comment)')
 RESP=$(curl -s -X POST https://slack.com/api/apps.manifest.create \
-  -H "Authorization: Bearer $NEW_ACCESS" \
+  -H "Authorization: Bearer $ACCESS" \
   -H "Content-Type: application/json; charset=utf-8" \
-  -d "{\"manifest\": $(echo "$MANIFEST" | jq -c .)}")
+  -d "{\"manifest\": $MANIFEST}")
 APP_ID=$(echo "$RESP" | jq -r .app_id)
 [ "$APP_ID" = "null" ] && echo "manifest.create failed: $RESP" && exit 1
 echo "Created Watcher app: $APP_ID"
