@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Threat model in `ARCHITECTURE.md` extended with the rationale for not pursuing per-agent `CLAUDE_CODE_OAUTH_TOKEN` isolation (one of the four deferred items from the v0.2.2 audit, #3). `claude setup-token` mints account-wide tokens with no per-app scope, so per-agent splitting doesn't reduce blast radius — it just creates N equivalent leak surfaces on the same host. The defense against token exfil lives in the dispatch gate, future `--read-only` rootfs, and rotation discipline. Documented as won't-fix-by-design.
+
 ## [0.2.3] — 2026-04-28
 
 Continuation of the security-hardening track from issue #3. Closes two of the four deferred items from v0.2.2 (sender-identity enforcement at dispatch; signed-tag check on framework updates). The remaining two — `--read-only` Docker rootfs and per-agent token isolation — are still open.
