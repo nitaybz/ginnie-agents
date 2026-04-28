@@ -220,8 +220,18 @@ function spawnContainer(
 			// Resource limits
 			"--memory", "1g",
 			"--cpus", "2",
+			"--pids-limit", "512",
 			// Network access for API calls
 			"--network", "bridge",
+			// Hardening: drop all Linux capabilities + block new privileges.
+			// The agent runs as the unprivileged `node` user inside the
+			// container; these two flags prevent capability-based escape and
+			// privilege escalation via setuid binaries even if a payload makes
+			// it past the SDK's allowed-tools filter. --read-only of the root
+			// filesystem is a separate (deeper) change that needs explicit
+			// tmpfs + per-mount review and is on the v0.2.x roadmap.
+			"--cap-drop=ALL",
+			"--security-opt=no-new-privileges",
 			// Timezone — defaults to UTC, override via TZ env var
 			"-e", `TZ=${process.env.TZ || "UTC"}`,
 			"-e", `AGENT_MESSAGE=${message}`,

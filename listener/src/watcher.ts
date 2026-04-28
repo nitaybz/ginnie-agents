@@ -150,8 +150,23 @@ async function runChecks(): Promise<void> {
 }
 
 // ─── Action handlers ──────────────────────────────────────
+//
+// SECURITY: every Watcher action (button click) and slash command must be
+// gated to OPERATOR_SLACK_ID. The bot only DMs the operator, so most of the
+// time only the operator can see (and click) the buttons in the first place
+// — but defense-in-depth means we still check, in case a button somehow
+// reaches another user (forwarded message, shared screen recording, etc.).
+function isOperator(userId?: string): boolean {
+	return Boolean(userId) && userId === OPERATOR;
+}
+
 app.action(/^watcher::/, async ({ ack, body, action, client }: any) => {
 	await ack();
+	if (!isOperator(body.user?.id)) {
+		// Silently ignore — don't reveal that the action exists.
+		console.warn(`[watcher] denied action from non-operator ${body.user?.id}`);
+		return;
+	}
 	const id = action.action_id as string;
 	const { type, key, value } = decodeActionId(id);
 	const messageTs = body.message?.ts;
@@ -234,6 +249,14 @@ app.action(/^watcher::/, async ({ ack, body, action, client }: any) => {
 // ─── Slash command: /watcher ──────────────────────────────
 app.command("/watcher", async ({ command, ack, respond }) => {
 	await ack();
+	if (!isOperator(command.user_id)) {
+		await respond({
+			response_type: "ephemeral",
+			text: "Watcher commands are restricted to the configured operator.",
+		});
+		console.warn(`[watcher] denied /watcher command from non-operator ${command.user_id}`);
+		return;
+	}
 	const args = (command.text || "").trim().split(/\s+/).filter(Boolean);
 	const sub = args[0] || "help";
 	const state = loadState();

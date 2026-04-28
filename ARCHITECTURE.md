@@ -103,7 +103,7 @@ Each agent's `config.json` declares `"boundaries": "read-only"` or `"write"` (de
 - `read-only` → tool set restricted to `["Read", "Grep", "Glob", "WebSearch", "WebFetch"]`. No `Write`, no `Edit`, no `Bash`.
 - `write` → no override; agent gets the declared tools.
 
-This is not a sandbox — agents still run as their declared identity in their container — but it's a hard guarantee at the SDK layer that read-only agents cannot call write tools, regardless of what their prompt says.
+This is not a sandbox. Agents still run as their declared identity in their container, and `read-only` does not prevent outbound data exfiltration: a read-only agent can `Read` files and `WebFetch` them out of the container. What `read-only` does guarantee is that the agent cannot *mutate* state — no `Bash`, no `Write`, no `Edit` regardless of what the prompt says. Use it to contain blast radius from agent misbehavior, not as a leak-proof barrier. See [Threat model](#threat-model) below for what each layer protects against.
 
 ## Work hours
 
@@ -194,6 +194,39 @@ The framework recognizes two distinct automation shapes and uses different mecha
 Don't mix them up. Wrapping `df` in a Claude Agent container is wasteful (mechanical work doesn't need reasoning). Wrapping an analyst's judgment in a shell script is the wrong shape (reasoning doesn't fit if-elif). Pick the model that matches the work.
 
 The framework ships one canonical bot — the **Watcher**. It's a small Node daemon (`listener/src/watcher.ts`) running under PM2 alongside the listener. Uses Bolt + Socket Mode to handle interactive buttons (`Update now`, `Restart listener`, `Ack 24h`, `View logs`) and a `/watcher` slash command. Periodic health checks run on `setInterval`. No AI, no Claude tokens, no Docker per check — but enough Slack runtime to be interactive.
+
+## Threat model
+
+Honest about what the framework protects against and what it doesn't, so operators know what they're trusting.
+
+### What the framework assumes
+
+- **The Slack workspace is trusted.** All channel members and DM senders are people you'd trust to talk to a teammate. Agents respond to messages from the workspace; if a hostile actor can post in a channel or DM the bot, they have the same surface as a trusted teammate.
+- **The host is trusted.** The listener and Watcher run on the operator's host with the operator's `CLAUDE_CODE_OAUTH_TOKEN`, the operator's git, the operator's PM2. Anyone with shell access to the host can already do anything the framework can do.
+- **The framework's git remote is trusted.** `update-framework.sh` does `git pull --ff-only` from `FRAMEWORK_UPSTREAM` and rebuilds; whoever has push access to that remote can ship code that runs on every install on the next update click. Pin a tag, not `main`, if that trust isn't acceptable for your install.
+
+### What the framework protects against
+
+- **Other agents on the same host.** Per-agent Docker containers with separate token / credential / memory mounts; one agent cannot read another's credentials, mutate another's memory, or invoke another's skills.
+- **The host's globally-installed Claude Code plugins, skills, MCP servers, dotfiles, and shell history bleeding into agent runs.** Agents see only what's mounted into their container.
+- **Agent runaway via tool misuse.** Container resource limits (`--memory`, `--cpus`, `--pids-limit`), capability drop (`--cap-drop=ALL`), and `no-new-privileges` keep an agent's blast radius bounded to its container.
+- **Hostile filenames in Slack file uploads.** Filenames are sanitized before being interpolated into the agent's prompt or the curl command the agent runs.
+- **Unauthorized Watcher control.** The `/watcher` slash command and Watcher button clicks are gated to the configured `OPERATOR_SLACK_ID` regardless of who posts them.
+
+### What the framework does NOT protect against
+
+- **Prompt injection from a Slack message that the agent processes.** The agent runs with `bypassPermissions` and has access to its tools (`Bash`, `WebFetch`, etc.) and its `CLAUDE_CODE_OAUTH_TOKEN` (passed as an env var into the container). A successful injection from a Slack message — for example, a teammate's account compromised by an external attacker, or a hostile message in a channel the agent is in — can in principle exfiltrate the token to an attacker-controlled URL. Mitigations: keep the workspace tight, treat `unknown`/`external` senders cautiously in PROMPT.md, prefer `boundaries: read-only` for agents whose work doesn't need write tools, rotate the OAuth token regularly. Framework-level enforcement of sender identity (refusing dispatch from `unknown` senders for write-capable agents) is on the v0.2.x roadmap.
+- **Outbound data exfiltration by a `read-only` agent.** As above: `read-only` prevents mutation, not exfil. A read-only agent with `Read` + `WebFetch` can still POST file contents outbound.
+- **A compromised host.** If an attacker reaches the host shell, they have the listener's access, the operator's `.env`, and the host's Claude Code session. The framework is not designed to defend against host compromise; protect the host itself with normal host hygiene (SSH keys, firewall, no-shared-account).
+- **A malicious framework upstream.** As above: `update-framework` trusts whoever owns the upstream remote. If that trust is in question, pin to a verified tag rather than tracking `main`.
+
+### Reducing the blast radius in practice
+
+- Default new agents to `boundaries: "write"` only after they've earned it; start with `read-only` and promote when the work demands it.
+- Set `WATCHER_CHECK_INTERVAL_MIN` aggressively if you want fast token-expiry warnings; the Watcher is the framework's one persistent eye on the install.
+- Treat the `CLAUDE_CODE_OAUTH_TOKEN` as a high-value credential. Rotate annually (or sooner) via `claude setup-token`; the Watcher's token-age check warns 30 days before the typical 1-year expiry.
+- Limit which channels each agent's Slack app is invited to. Agents only see messages in channels they're members of; smaller surface = smaller injection surface.
+- When in doubt, use the Watcher's `[Restart listener]` button or set `boundaries: "read-only"` on a misbehaving agent's `config.json` — the next container spawn enforces the new config.
 
 ## Cross-agent conflict resolution
 

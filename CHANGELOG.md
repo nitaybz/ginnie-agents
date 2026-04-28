@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-04-28
+
+Security hardening from a community audit (issue #3, thanks @gabiudrescu). Closes the immediate easy wins; the deeper architectural items (sender-identity enforcement, `--read-only` filesystem, supply-chain trust controls) are scoped for a later release and tracked in #3.
+
+### Added
+
+- **Threat model** section in `ARCHITECTURE.md` that names what the framework assumes (trusted Slack workspace, trusted host, trusted upstream remote), what it protects against, and what it does NOT protect against (prompt-injection-driven token exfil, outbound data exfil from a `read-only` agent, host compromise, malicious framework upstream). Names the assumption rather than leaving it implicit.
+
+### Changed
+
+- **`boundaries: "read-only"` framing corrected** in both `README.md` and `ARCHITECTURE.md`. Previous wording ("hard SDK-level guarantee") was overclaiming. New wording: prevents *local mutation* (no `Bash`/`Write`/`Edit`), does not prevent *outbound data exfiltration* (a read-only agent can still `Read` and `WebFetch`).
+
+### Fixed
+
+- **Slack file-upload filename injection** (`listener/src/index.ts`). Filenames in Slack file uploads were interpolated raw into both the agent's prompt and the curl shell command the agent then executed. A crafted filename could inject arbitrary shell commands or prompt instructions. Now: filename used in the shell `curl -o` path is sanitized to an alphanumeric/`._-` allowlist; filename appearing in the prompt is `JSON.stringify`'d so injection-shaped names render as escaped string literals; only files served from `https://files.slack.com/` are accepted.
+- **Watcher `/watcher` slash command and button handlers gated to `OPERATOR_SLACK_ID`** (`listener/src/watcher.ts`). Previous version accepted slash commands from any user in the workspace (and button clicks from any user who could see the message), so anyone could `/watcher pause 168` to silence alerts for a week. Defense-in-depth on top of DM scoping.
+- **Container hardening flags added** (`listener/src/runner.ts`): `--cap-drop=ALL`, `--security-opt=no-new-privileges`, `--pids-limit=512`. Prevents capability-based escape, privilege escalation via setuid, and fork-bomb-style PID exhaustion. The `--read-only` filesystem flag is NOT yet added; it requires explicit tmpfs + per-mount review and is on the next round.
+
+### Known limitations (deferred to a later release)
+
+- Prompt-injection-driven token exfiltration via Slack messages remains an architectural risk; the framework documents the threat in ARCHITECTURE.md but does not yet enforce sender-identity at the dispatch level. Framework-level "refuse to dispatch from `unknown`/`external` senders for write-capable agents" is on the v0.2.x roadmap.
+- `--read-only` Docker filesystem with explicit tmpfs/RW mounts is on the same roadmap.
+- Signed-tag requirement for `update-framework.sh` (supply-chain trust) is on the same roadmap.
+
+[0.2.2]: https://github.com/nitaybz/ginnie-agents/releases/tag/v0.2.2
+
 ## [0.2.1] — 2026-04-27
 
 Polish from first real install on a private fork: stop alerting on the wrong remote, eliminate the recurring "I lost the rotated config token" footgun, and make avatar prep and manifest creation reliable.

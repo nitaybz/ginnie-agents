@@ -170,7 +170,7 @@ Same key in both, the local entry wins for that key only. Otherwise union. This 
 
 Each agent's `config.json` declares it as `"boundaries": "read-only"` or `"write"`. The runner enforces this by overriding `allowed_tools` at spawn time:
 
-- **`read-only`** restricts the toolkit to `Read`, `Grep`, `Glob`, `WebSearch`, `WebFetch`. No `Bash`, no `Write`, no `Edit`. Hard SDK-level guarantee, regardless of what the prompt says.
+- **`read-only`** restricts the toolkit to `Read`, `Grep`, `Glob`, `WebSearch`, `WebFetch`. No `Bash`, no `Write`, no `Edit`. Enforced at the SDK layer regardless of what the prompt says. **Note:** this prevents the agent from *mutating* state (writing files, running shell commands), but it does not prevent *outbound data exfiltration* (a read-only agent can still `Read` secrets and `WebFetch` them out). Use `read-only` to contain blast radius from misbehavior, not as a guarantee against a compromised agent leaking data; the threat-model section in [ARCHITECTURE.md](ARCHITECTURE.md) is explicit about what each layer does and does not protect against.
 - **`write`** is the default; agent gets the full toolkit it declared.
 
 Useful for analyst agents that should never accidentally mutate state, or for any agent you're not yet ready to give shell access to.

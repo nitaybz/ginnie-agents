@@ -211,13 +211,43 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		const channel = event.channel;
 		let messageText = event.text || "";
 
-		// Handle file attachments
+		// Handle file attachments.
+		//
+		// SECURITY: filenames in Slack file uploads are user-controlled. Earlier
+		// versions of this code interpolated `f.name` raw into both the agent's
+		// prompt and into a curl shell command the agent then executed. That
+		// allowed (a) shell injection via crafted filenames and (b) prompt
+		// injection via filename text. We now:
+		//   - reject any file whose `url_private` doesn't come from
+		//     files.slack.com (defends against spoofed events)
+		//   - sanitize the local filename used in the shell command to a safe
+		//     allowlist (alphanumerics, dot, underscore, hyphen)
+		//   - JSON-stringify the original filename when it appears in the
+		//     prompt body, so prompt-injection-shaped filenames render as
+		//     escaped string literals rather than freestanding text
 		if (event.files && event.files.length > 0) {
-			const fileDescriptions = event.files.map((f: any) => {
-				const desc = `[File: ${f.name || "unnamed"} (${f.mimetype || "unknown type"}, ${f.size ? Math.round(f.size / 1024) + "KB" : "unknown size"})]`;
-				return `${desc}\nDownload: curl -s -H "Authorization: Bearer $SLACK_BOT_TOKEN" "${f.url_private}" -o "/workspace/${f.name || "file"}"`;
+			const fileDescriptions = event.files.flatMap((f: any) => {
+				const url = String(f.url_private || "");
+				if (!/^https:\/\/files\.slack\.com\//.test(url)) return [];
+				const id = String(f.id || "").replace(/[^A-Za-z0-9_-]/g, "");
+				const rawName = String(f.name || "file");
+				const safeName = (rawName
+					.replace(/[^A-Za-z0-9._-]/g, "_")
+					.replace(/^\.+/, "")
+					.slice(0, 80)) || "file";
+				const safeMime = String(f.mimetype || "unknown")
+					.replace(/[^A-Za-z0-9._/+-]/g, "_");
+				const sizeKB = f.size ? Math.round(f.size / 1024) + "KB" : "unknown size";
+				const localPath = `/workspace/uploads/${id || "file"}_${safeName}`;
+				return [
+					`[File: name=${JSON.stringify(rawName)} (mime: ${safeMime}, size: ${sizeKB})]\n` +
+					`Saved-as: ${localPath}\n` +
+					`Download: mkdir -p /workspace/uploads && curl -fsSL -H "Authorization: Bearer $SLACK_BOT_TOKEN" "${url}" -o "${localPath}"`,
+				];
 			});
-			messageText = (messageText ? messageText + "\n\n" : "") + "Attached files:\n" + fileDescriptions.join("\n\n");
+			if (fileDescriptions.length > 0) {
+				messageText = (messageText ? messageText + "\n\n" : "") + "Attached files:\n" + fileDescriptions.join("\n\n");
+			}
 		}
 
 		if (!messageText) return;
