@@ -195,6 +195,18 @@ Don't mix them up. Wrapping `df` in a Claude Agent container is wasteful (mechan
 
 The framework ships one canonical bot — the **Watcher**. It's a small Node daemon (`listener/src/watcher.ts`) running under PM2 alongside the listener. Uses Bolt + Socket Mode to handle interactive buttons (`Update now`, `Restart listener`, `Ack 24h`, `View logs`) and a `/watcher` slash command. Periodic health checks run on `setInterval`. No AI, no Claude tokens, no Docker per check — but enough Slack runtime to be interactive.
 
+## Cross-agent conflict resolution
+
+The framework does not handle factual disagreements between agents at the framework level. Each agent's memory tiers are private to that agent, and the team directory establishes identity and ownership but not primacy on any factual surface. When two agents reach different conclusions about a shared customer or asset, both flags surface in Slack and the human operator picks the answer.
+
+This is the right shape at the framework's stated audience: small teams, non-overlapping agent domains, single operator in the loop. It works as long as the human can keep up with the cadence of conflicts.
+
+It does NOT scale to teams where multiple agents claim authority over the same factual surface. The canonical failure mode is the retention-vs-sales overlap: a customer flagged as at-risk by the retention agent and as ready-to-cross-sell by the sales agent, both flags surfacing the same morning, no merge rule beyond operator judgment. At small scale this is one Slack message. At ten conflicts a day across five overlapping agents this is the operator's full-time job.
+
+Operators who hit this at scale can adopt their own per-install convention — typically a shared file with merge rules, queried by agents at session start. The framework deliberately doesn't pick one. That's a per-team policy decision, not a framework concern.
+
+Whether the framework should grow this layer into core or stay where it is, is a real design question. For now, the framework's stance is: not handled at framework level, scope acknowledged, escalation path is human-in-the-Slack-loop.
+
 ## What's deliberately NOT in this framework
 
 - **Multi-LLM**: Claude Code + Max only. No OpenAI, no Gemini, no API SDK.
