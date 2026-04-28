@@ -11,6 +11,7 @@
     "WebFetch"
   ],
   "boundaries": "write",
+  "allow_unverified_senders": false,
   "work_hours": {
     "enabled": false,
     "start": "09:00",

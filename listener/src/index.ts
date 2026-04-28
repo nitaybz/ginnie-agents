@@ -19,7 +19,7 @@ import path from "path";
 import { loadStore, getThread, setThread } from "./store";
 import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
-import { getSenderInfo, formatSenderLine } from "./users";
+import { getSenderInfo, formatSenderLine, type SenderInfo } from "./users";
 import { isWithinWorkHours, offHoursNotice } from "./workhours";
 
 // Load env from repo root. .env is the authoritative source for
@@ -146,6 +146,25 @@ async function drainQueue(key: string): Promise<void> {
 	}
 }
 
+// Refuse, at dispatch time, to wake a write-capable agent for an
+// uncurated sender. role === "external" means Slack returned a real
+// user but they're not in known-users.json; "unknown" means the lookup
+// failed. Silent drop, not a posted reply — see ARCHITECTURE.md threat
+// model for reasoning. Read-only agents and `allow_unverified_senders`
+// opt out.
+function passesSenderPolicy(agent: AgentConfig, sender: SenderInfo): boolean {
+	if (agent.boundaries === "read-only") return true;
+	if (agent.allowUnverifiedSenders) return true;
+	if (sender.role === "unknown" || sender.role === "external") {
+		console.log(
+			`[${agent.name}] dispatch refused: unverified sender ${sender.userId || "(no id)"}` +
+			` (role: ${sender.role}, name: ${sender.name})`,
+		);
+		return false;
+	}
+	return true;
+}
+
 // ─── Off-hours guard ───────────────────────────────────────
 //
 // Scheduled routines always fire (the schedule itself decides timing).
@@ -195,6 +214,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		if (!(await passesWorkHours(agent, app, channel, threadTs))) return;
 
 		const sender = await getSenderInfo(app, event.user, agent);
+		if (!passesSenderPolicy(agent, sender)) return;
 		const senderLine = formatSenderLine(sender);
 
 		console.log(`[@mention] Agent: ${agent.name}, From: ${sender.name} (${sender.role}), Channel: ${channel}, Thread: ${threadTs}`);
@@ -253,6 +273,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		if (!messageText) return;
 
 		const sender = await getSenderInfo(app, event.user, agent);
+		if (!passesSenderPolicy(agent, sender)) return;
 		const senderLine = formatSenderLine(sender);
 
 		// ── DM ──
@@ -320,6 +341,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		if (botId && botId !== agent.slackBotMsgId) return;
 
 		const sender = await getSenderInfo(app, userId, agent);
+		if (!passesSenderPolicy(agent, sender)) return;
 		const senderLine = formatSenderLine(sender);
 
 		// Pull the human-readable label of what was clicked

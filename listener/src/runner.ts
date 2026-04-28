@@ -40,6 +40,7 @@ export interface AgentConfig {
 	allowedTools: string[];
 	boundaries: AgentBoundaries;
 	workHours: AgentWorkHours;
+	allowUnverifiedSenders: boolean;
 	model?: string;
 }
 
@@ -50,6 +51,7 @@ interface AgentManifest {
 	allowed_tools?: string[];
 	boundaries?: AgentBoundaries;
 	work_hours?: Partial<AgentWorkHours>;
+	allow_unverified_senders?: boolean;
 	model?: string;
 }
 
@@ -151,6 +153,7 @@ export function loadAgents(): AgentConfig[] {
 			allowedTools: applyBoundaries(declaredTools, boundaries),
 			boundaries,
 			workHours,
+			allowUnverifiedSenders: manifest.allow_unverified_senders === true,
 			model: manifest.model,
 		});
 	}
