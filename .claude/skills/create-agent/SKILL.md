@@ -40,9 +40,9 @@ A real Slack avatar makes the agent feel like a person, not a bot. Don't skip th
 
 The framework is image-tool-agnostic. The user picks whichever image AI they prefer — Midjourney, ChatGPT/DALL-E, Gemini, Stable Diffusion, Flux, Adobe Firefly, etc. Your job is to derive a strong prompt from the SOUL.md you just approved and walk them through producing the image.
 
-Derive a prompt from SOUL. For Marlowe (the example) it might be:
+Derive a prompt from SOUL. The exact wording depends on the agent, but the shape is: subject description (age, gender presentation, vibe), framing (square crop, headshot, centered subject because Slack auto-crops to a circle), style notes (photographic vs. illustrative, lighting), and constraints (no text, no logo, no watermark). Pull concrete details from `SOUL.md` so the picture matches the personality, e.g.:
 
-> *"Portrait of a calm, 38-year-old gender-neutral person with subtle Manchester/Lisbon background, slight wry expression, natural late-morning light, photographic, square crop, headshot framing, soft neutral background, no text, no logo. Subject looks like someone who walks before coffee, plays bad chess, reads two books at once."*
+> *"Portrait of a calm 30-something gender-neutral person, slight wry expression, natural late-morning light, photographic, square crop, headshot framing, soft neutral background, no text, no logo. Subject looks like someone who walks before coffee and plays bad chess on weekends."*
 
 Show the user:
 1. The derived prompt (let them edit it).
