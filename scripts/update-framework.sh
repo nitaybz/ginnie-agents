@@ -23,12 +23,35 @@ cd "$REPO"
 echo "==> git fetch"
 UPSTREAM="${FRAMEWORK_UPSTREAM:-origin/main}"
 REMOTE="${UPSTREAM%%/*}"
-git fetch "$REMOTE" --quiet || { echo "fetch failed"; exit 1; }
+git fetch "$REMOTE" --tags --quiet || { echo "fetch failed"; exit 1; }
 
 AHEAD=$(git rev-list --count "HEAD..${UPSTREAM}" 2>/dev/null || echo 0)
 if [ "$AHEAD" -eq 0 ]; then
   echo "Already up to date."
   exit 0
+fi
+
+# Supply-chain trust gate. When enabled, refuse to apply an update unless
+# the upstream tip is a git tag signed by a key in the operator's gpg
+# keyring. Default off for backward compat (anyone tracking `main` keeps
+# the prior trust-the-remote model). Set FRAMEWORK_REQUIRE_SIGNED_TAG=true
+# to opt in, and point FRAMEWORK_UPSTREAM at a branch where releases are
+# always tagged (or at a specific tag ref). See ARCHITECTURE.md threat
+# model.
+if [ "${FRAMEWORK_REQUIRE_SIGNED_TAG:-false}" = "true" ]; then
+  echo "==> verifying signed tag at $UPSTREAM"
+  TAG=$(git describe --exact-match --tags "$UPSTREAM" 2>/dev/null || true)
+  if [ -z "$TAG" ]; then
+    echo "FRAMEWORK_REQUIRE_SIGNED_TAG=true but no tag points at $UPSTREAM — refusing to update."
+    echo "  Either point FRAMEWORK_UPSTREAM at a release tag, or wait for a signed release on this branch."
+    exit 1
+  fi
+  if ! git verify-tag "$TAG" 2>&1; then
+    echo "FRAMEWORK_REQUIRE_SIGNED_TAG=true but tag $TAG is not signed by a trusted key — refusing to update."
+    echo "  Import the upstream signing key into your gpg keyring and re-run."
+    exit 1
+  fi
+  echo "    verified signed tag: $TAG"
 fi
 
 PREV_HEAD=$(git rev-parse HEAD)
