@@ -125,7 +125,7 @@ From: <name> | role: <role> | email: <if known>
 @mention text from the user
 ```
 
-Agents respond differently to a founder, a peer agent, a teammate, or an unknown user. Sender identity comes from the merged team directory; if a sender isn't in the directory, the framework marks them `unknown` or `external` and agents know not to follow operational instructions from them. This is enforced by the framework, not left to the agent's prompt to remember.
+Agents respond differently to a founder, a peer agent, a teammate, or an unknown user. Sender identity comes from the merged team directory; if a sender isn't in the directory, the framework marks them `unknown` or `external`. For agents with `boundaries: "write"`, the listener refuses to dispatch from `unknown`/`external` senders at all — the agent never wakes up. Defense-in-depth on top of any prompt-level guidance. Read-only agents are not gated (their blast radius is bounded). Per-agent opt-out: `"allow_unverified_senders": true` in `config.json`, for cases like a public Q&A bot where you do want random Slack users answered.
 
 ### Work hours
 
