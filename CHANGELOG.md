@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] — 2026-04-28
+
+Continuation of the security-hardening track from issue #3. Closes two of the four deferred items from v0.2.2 (sender-identity enforcement at dispatch; signed-tag check on framework updates). The remaining two — `--read-only` Docker rootfs and per-agent token isolation — are still open.
+
+### Added
+
+- **Sender-identity dispatch gate** (`listener/src/index.ts`, `listener/src/runner.ts`). For agents with `boundaries: "write"`, the listener now refuses to dispatch messages from senders whose resolved role is `unknown` (Slack API lookup failed) or `external` (real Slack user not in the merged `shared/known-users.json` ∪ per-agent `known-users.json`). Curated users pass through regardless of the role string they were curated with; other workspace bots (`role: bot`) also pass through. Read-only agents are not gated. Refusals are logged as `[<agent>] dispatch refused: unverified sender …`. Defense-in-depth: `PROMPT.md` already tells agents to be cautious with unknown senders, but a successful injection bypasses prompt-level guidance — this gate keeps the agent from waking up at all. Per-agent opt-out: `"allow_unverified_senders": true` in `config.json` (e.g. for a `read-only` Q&A bot in a public channel where random Slack users should be answered, or for an operator who'd rather rely on prompt-level filtering).
+- **Signed-tag verification in `scripts/update-framework.sh`.** Default off for backward compat; opt in by setting `FRAMEWORK_REQUIRE_SIGNED_TAG=true` in `.env`. When enabled, `update-framework.sh` requires the upstream tip (`FRAMEWORK_UPSTREAM`) to point at a git tag, AND requires that tag to be signed by a key in the operator's `gpg` keyring. The check happens after `git fetch` and before `git pull`; on failure the script exits non-zero without applying any change. Operators who want this protection should pin `FRAMEWORK_UPSTREAM` at a release branch where each release is tagged-and-signed, or at a specific tag ref. Closes the prior trust model where push access to the upstream remote alone was enough to ship code that runs on every install.
+
+### Changed
+
+- Threat model in `ARCHITECTURE.md` updated to reflect both new defenses (`What the framework protects against` gains the sender-identity gate; `A malicious framework upstream` now names `FRAMEWORK_REQUIRE_SIGNED_TAG` as the trust knob).
+- `templates/agent/config.json` includes `"allow_unverified_senders": false` for visibility, so new agents created via the `create-agent` skill see the field and the default.
+
 ## [0.2.2] — 2026-04-28
 
 Security hardening from a community audit (issue #3, thanks @gabiudrescu). Closes the immediate easy wins; the deeper architectural items (sender-identity enforcement, `--read-only` filesystem, supply-chain trust controls) are scoped for a later release and tracked in #3.
@@ -31,6 +45,7 @@ Security hardening from a community audit (issue #3, thanks @gabiudrescu). Close
 - `--read-only` Docker filesystem with explicit tmpfs/RW mounts is on the same roadmap.
 - Signed-tag requirement for `update-framework.sh` (supply-chain trust) is on the same roadmap.
 
+[0.2.3]: https://github.com/nitaybz/ginnie-agents/releases/tag/v0.2.3
 [0.2.2]: https://github.com/nitaybz/ginnie-agents/releases/tag/v0.2.2
 
 ## [0.2.1] — 2026-04-27
