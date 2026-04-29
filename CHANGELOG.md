@@ -7,9 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] — 2026-04-29
+
+Surfaces Anthropic's [authentication policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use) and adds a fully-supported alternative auth path for operators whose use case doesn't fit "ordinary individual use of Claude Code by the subscriber." Subscription OAuth tokens (`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`) remain the default for personal/internal automation; `ANTHROPIC_API_KEY` is now first-class for automation, products, and multi-user scenarios.
+
+### Added
+
+- **`ANTHROPIC_API_KEY` as a first-class auth mode.** The runner (`listener/src/runner.ts`) accepts either env var and prefers `ANTHROPIC_API_KEY` when both are set (explicit > inherited). The chosen credential is injected into every container; the host `~/.claude/.credentials.json` mount only kicks in when neither env var is set. `templates/agent/run.sh` carries the matching precedence in bash form.
+- **Authentication and cost section in README.md.** Lays out both options side-by-side, names the policy risk on Option A explicitly (token revocation / account suspension if the install routes requests on behalf of other users), and recommends Option B for any use case that looks like a hosted product or external-customer-facing agent.
+- **New `Auth` section on the website** (`ginnie-agents-website` repo) mirroring the README split, with a link to Anthropic's policy.
+- **`setup` skill branches on the auth choice.** Step 2 of `.claude/skills/setup/SKILL.md` presents both options with the policy disclosure verbatim and routes through the chosen branch (each branch clears the other env var so the resulting `.env` is single-mode).
+
 ### Changed
 
-- Threat model in `ARCHITECTURE.md` extended with the rationale for not pursuing per-agent `CLAUDE_CODE_OAUTH_TOKEN` isolation (one of the four deferred items from the v0.2.2 audit, #3). `claude setup-token` mints account-wide tokens with no per-app scope, so per-agent splitting doesn't reduce blast radius — it just creates N equivalent leak surfaces on the same host. The defense against token exfil lives in the dispatch gate, future `--read-only` rootfs, and rotation discipline. Documented as won't-fix-by-design.
+- **`scripts/doctor.sh`** passes if either `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN` is set with a plausible format, and labels the active mode in the output.
+- **`listener/src/watcher-checks.ts` `checkTokenAge`** skips when API key is the active auth — API keys don't expire on a fixed schedule, so the day-counting alert has no signal there.
+- **`.claude/skills/doctor/SKILL.md`** and **`.claude/skills/setup-watcher/SKILL.md`** gate token-age and token-issued-at marker steps on Option A.
+- **`.env.example`, `docker/entrypoint.mjs`, `CLAUDE.md`, `ARCHITECTURE.md`** updated to document both modes; the auth-flow and threat-model sections in `ARCHITECTURE.md` no longer assume a single credential type.
+- **README hero subtitle** dropped the "No API keys" claim; eligibility list and Quickstart prereqs no longer assume a Max subscription.
+- Threat model in `ARCHITECTURE.md` extended (carried over from late-v0.2.3 work) with the rationale for not pursuing per-agent `CLAUDE_CODE_OAUTH_TOKEN` isolation (one of the four deferred items from the v0.2.2 audit, #3). `claude setup-token` mints account-wide tokens with no per-app scope, so per-agent splitting doesn't reduce blast radius — it just creates N equivalent leak surfaces on the same host. Documented as won't-fix-by-design; the same reasoning generalizes to API keys.
+
+### Migration
+
+- **No breaking changes for existing installs.** Operators on Option A (the prior default) keep their `CLAUDE_CODE_OAUTH_TOKEN` and continue working. Operators who want to switch can: generate a key at console.anthropic.com → set `ANTHROPIC_API_KEY=<key>` in `.env` → restart the listener (`pm2 restart ginnie-agents-listener`). When both env vars are set, the API key wins; clear `CLAUDE_CODE_OAUTH_TOKEN=` afterwards to keep `.env` single-mode.
 
 ## [0.2.3] — 2026-04-28
 
@@ -49,6 +69,7 @@ Security hardening from a community audit (issue #3, thanks @gabiudrescu). Close
 - `--read-only` Docker filesystem with explicit tmpfs/RW mounts is on the same roadmap.
 - Signed-tag requirement for `update-framework.sh` (supply-chain trust) is on the same roadmap.
 
+[0.2.4]: https://github.com/nitaybz/ginnie-agents/releases/tag/v0.2.4
 [0.2.3]: https://github.com/nitaybz/ginnie-agents/releases/tag/v0.2.3
 [0.2.2]: https://github.com/nitaybz/ginnie-agents/releases/tag/v0.2.2
 
