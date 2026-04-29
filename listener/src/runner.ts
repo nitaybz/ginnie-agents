@@ -201,14 +201,26 @@ function spawnContainer(
 		if (!existsSync(episodesDir)) mkdirSync(episodesDir, { recursive: true });
 		if (!existsSync(sessionsDir)) mkdirSync(sessionsDir, { recursive: true });
 
-		// Auth: prefer the long-lived OAuth token from `claude setup-token`
-		// (env var, ~1 year). Falls back to mounting the host's regular
-		// ~/.claude/.credentials.json (8h OAuth, can't be refreshed inside the
-		// read-only container) only if the long-lived token isn't set.
+		// Auth: two supported modes.
+		//
+		// Option A — Long-lived OAuth token (CLAUDE_CODE_OAUTH_TOKEN) from
+		//   `claude setup-token`. ~1y, tied to a Claude subscription. Per
+		//   Anthropic's usage policy this is for ordinary individual use of
+		//   Claude Code by the subscriber — not for serving other users.
+		// Option B — Anthropic API key (ANTHROPIC_API_KEY) from
+		//   console.anthropic.com. Per-token billing, fully supported for
+		//   automation and multi-user scenarios.
+		//
+		// If both are set, ANTHROPIC_API_KEY wins (explicit > inherited).
+		// If neither is set, fall back to mounting the host's
+		// ~/.claude/.credentials.json (8h OAuth, can't refresh inside the
+		// read-only container — last resort).
+		const apiKey = process.env.ANTHROPIC_API_KEY || "";
 		const longLivedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || "";
-		if (!longLivedToken && !process.env.HOME) {
+		if (!apiKey && !longLivedToken && !process.env.HOME) {
 			throw new Error(
-				"Neither CLAUDE_CODE_OAUTH_TOKEN nor HOME is set; cannot locate Claude credentials.",
+				"No auth available: set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, " +
+				"or ensure HOME is set so host credentials can be mounted.",
 			);
 		}
 		const hostCredentials = path.join(
@@ -243,7 +255,9 @@ function spawnContainer(
 			"-e", `ALLOWED_TOOLS=${agent.allowedTools.join(",")}`,
 		];
 
-		if (longLivedToken) {
+		if (apiKey) {
+			dockerArgs.push("-e", `ANTHROPIC_API_KEY=${apiKey}`);
+		} else if (longLivedToken) {
 			dockerArgs.push("-e", `CLAUDE_CODE_OAUTH_TOKEN=${longLivedToken}`);
 		}
 
@@ -256,13 +270,13 @@ function spawnContainer(
 		}
 
 		// Mount agent's .claude directory (session persistence, settings).
-		// Only overlay host credentials.json when no long-lived token is set —
-		// the env var takes precedence and avoids the 8h OAuth refresh problem.
+		// Only overlay host credentials.json when neither auth env var is set —
+		// the env vars take precedence and avoid the 8h OAuth refresh problem.
 		const claudeDir = path.join(agent.dir, "sessions");
 		dockerArgs.push(
 			"-v", `${claudeDir}:/home/node/.claude`,
 		);
-		if (!longLivedToken && existsSync(hostCredentials)) {
+		if (!apiKey && !longLivedToken && existsSync(hostCredentials)) {
 			dockerArgs.push("-v", `${hostCredentials}:/home/node/.claude/.credentials.json:ro`);
 		}
 

@@ -3,8 +3,17 @@
  * Uses the Claude Agent SDK to execute the agent's task in isolation.
  *
  * Environment variables:
- *   CLAUDE_CODE_OAUTH_TOKEN — Long-lived (1y) token from `claude setup-token`.
- *                             Recommended. Falls back to mounted host credentials.
+ *   ANTHROPIC_API_KEY      — Anthropic API key (console.anthropic.com).
+ *                             Per-token billing, fully supported for automation
+ *                             and multi-user use. If both this and
+ *                             CLAUDE_CODE_OAUTH_TOKEN are set, this wins.
+ *   CLAUDE_CODE_OAUTH_TOKEN — Long-lived (~1y) OAuth token from
+ *                             `claude setup-token`, tied to a Claude
+ *                             subscription. Per Anthropic's usage policy,
+ *                             intended for ordinary individual use of Claude
+ *                             Code by the subscriber — not for serving other
+ *                             users. If neither env var is set, falls back to
+ *                             mounted host credentials (8h, non-refreshable).
  *   AGENT_MESSAGE          — The prompt/task for the agent
  *   AGENT_NAME             — Agent name (for logging + system prompt headers)
  *   RESUME_SESSION_ID      — Optional: session ID to resume
@@ -37,8 +46,10 @@ if (!message) {
 	process.exit(1);
 }
 
-// Auth: uses Max subscription via mounted ~/.claude/.credentials.json
-// Falls back to ANTHROPIC_API_KEY env var if set
+// Auth: the SDK reads ANTHROPIC_API_KEY (Option B) or CLAUDE_CODE_OAUTH_TOKEN
+// (Option A) from process.env directly. If neither is set, it falls back to
+// the mounted host ~/.claude/.credentials.json. The runner injects whichever
+// the operator chose; nothing to do here.
 
 // Read system prompt.
 //

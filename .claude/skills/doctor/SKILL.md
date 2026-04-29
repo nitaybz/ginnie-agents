@@ -46,7 +46,15 @@ Interpret:
 
 ## Step 3 — Contextual: token age awareness
 
-`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` lasts ~1 year. There's no API to introspect issuance date from outside the token itself. If a `memory/token-issued-at.txt` file exists in any maintenance agent's memory dir, surface its age:
+Only relevant when the operator is on **Option A** (`CLAUDE_CODE_OAUTH_TOKEN`). Skip this step for **Option B** (`ANTHROPIC_API_KEY`) — API keys don't expire on a fixed schedule, so there's nothing for the framework to count days against.
+
+Detect mode:
+
+```bash
+grep -qE '^ANTHROPIC_API_KEY=sk-ant-' .env && echo "mode=B (skip token-age check)" || echo "mode=A (run token-age check)"
+```
+
+If mode A: `CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token` lasts ~1 year. There's no API to introspect issuance date from outside the token itself. If a `memory/token-issued-at.txt` file exists in any maintenance agent's memory dir, surface its age:
 
 ```bash
 for f in agents/*/memory/token-issued-at.txt; do

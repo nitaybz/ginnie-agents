@@ -128,9 +128,19 @@ Scheduled routines fire regardless of work hours — the schedule itself decides
 
 ## Auth flow
 
-Strongly preferred: a long-lived (~1 year) OAuth token from `claude setup-token`, exposed as `CLAUDE_CODE_OAUTH_TOKEN`. PM2 reads it from the launching shell's environment, the runner forwards it into each container, and the SDK uses it directly.
+Two supported modes. The runner reads `.env` on every container spawn and injects whichever auth env var is set into the container.
 
-Fallback: if `CLAUDE_CODE_OAUTH_TOKEN` is not set, the runner mounts the host's `~/.claude/.credentials.json` read-only into the container. This works but only for ~8 hours — the OAuth token can't be refreshed inside a read-only mount, so daemon use will eventually fail. Use `claude setup-token` for any production deployment.
+**Option A — OAuth token from a Claude subscription** (`CLAUDE_CODE_OAUTH_TOKEN`)
+A long-lived (~1 year) token from `claude setup-token`. Cheap (flat subscription cost), zero per-call billing. Per [Anthropic's usage policy][aup], OAuth is intended for *ordinary individual use of Claude Code by the subscriber* — not for routing requests on behalf of other users. Appropriate for personal/internal automation by the subscriber, in sane volume. Risky (token revocation / account suspension) for hosted products, customer-facing agents, or volume that materially exceeds one developer's usage.
+
+**Option B — Anthropic API key** (`ANTHROPIC_API_KEY`)
+Generated at console.anthropic.com. Per-token billing. Fully supported by Anthropic's terms for automation, products, and multi-user scenarios. Higher cost than Option A but no authentication risk.
+
+If both env vars are set, `ANTHROPIC_API_KEY` wins (explicit > inherited). The runner forwards the chosen var into each container; the Claude Agent SDK uses whichever is present.
+
+**Fallback:** if neither env var is set, the runner mounts the host's `~/.claude/.credentials.json` read-only into the container. Works for ~8 hours only — the OAuth token can't be refreshed inside a read-only mount, so daemon use will eventually fail. Don't rely on this for any production deployment.
+
+[aup]: https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use
 
 ## Mount layout (inside the container)
 
@@ -202,7 +212,7 @@ Honest about what the framework protects against and what it doesn't, so operato
 ### What the framework assumes
 
 - **The Slack workspace is trusted.** All channel members and DM senders are people you'd trust to talk to a teammate. Agents respond to messages from the workspace; if a hostile actor can post in a channel or DM the bot, they have the same surface as a trusted teammate.
-- **The host is trusted.** The listener and Watcher run on the operator's host with the operator's `CLAUDE_CODE_OAUTH_TOKEN`, the operator's git, the operator's PM2. Anyone with shell access to the host can already do anything the framework can do.
+- **The host is trusted.** The listener and Watcher run on the operator's host with the operator's auth credential (`CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`), the operator's git, the operator's PM2. Anyone with shell access to the host can already do anything the framework can do.
 - **The framework's git remote is trusted.** `update-framework.sh` does `git pull --ff-only` from `FRAMEWORK_UPSTREAM` and rebuilds; whoever has push access to that remote can ship code that runs on every install on the next update click. Pin a tag, not `main`, if that trust isn't acceptable for your install.
 
 ### What the framework protects against
@@ -217,9 +227,9 @@ Honest about what the framework protects against and what it doesn't, so operato
 
 ### What the framework does NOT protect against
 
-- **Prompt injection from a Slack message that the agent processes.** The agent runs with `bypassPermissions` and has access to its tools (`Bash`, `WebFetch`, etc.) and its `CLAUDE_CODE_OAUTH_TOKEN` (passed as an env var into the container). A successful injection from a Slack message — for example, a teammate's account compromised by an external attacker, or a hostile message from a curated sender — can in principle exfiltrate the token to an attacker-controlled URL. The dispatch gate (above) shrinks the surface to *curated senders only* for write-capable agents, but does not eliminate the risk: any account in `known-users.json` is still effectively trusted at dispatch time. Mitigations remain: keep the workspace tight, keep `known-users.json` tight, prefer `boundaries: read-only` for agents whose work doesn't need write tools, rotate the OAuth token regularly.
+- **Prompt injection from a Slack message that the agent processes.** The agent runs with `bypassPermissions` and has access to its tools (`Bash`, `WebFetch`, etc.) and the active auth credential — `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` — passed as an env var into the container. A successful injection from a Slack message — for example, a teammate's account compromised by an external attacker, or a hostile message from a curated sender — can in principle exfiltrate the credential to an attacker-controlled URL. The dispatch gate (above) shrinks the surface to *curated senders only* for write-capable agents, but does not eliminate the risk: any account in `known-users.json` is still effectively trusted at dispatch time. Mitigations remain: keep the workspace tight, keep `known-users.json` tight, prefer `boundaries: read-only` for agents whose work doesn't need write tools, rotate the auth credential regularly. Note: API keys (Option B) can be revoked instantly from the Console; OAuth tokens (Option A) require running `claude setup-token` again.
 
-  Per-agent token isolation was considered as a mitigation and rejected. `claude setup-token` mints OAuth tokens against the operator's Max account with no per-app or per-scope restriction — every token grants the same blanket access. Splitting one shared token into N per-agent tokens doesn't shrink the blast radius of a single exfil; it just creates N equivalent leak surfaces on the same host, all bound to the same account. The only operational benefit would be revoking one token without rotating the others, but in practice any sign of compromise on any agent triggers rotating the master credential anyway. The real defense against this threat lives in the dispatch gate, the future `--read-only` rootfs, and rotation discipline — not in token cardinality.
+  Per-agent credential isolation was considered as a mitigation and rejected. Both auth modes mint credentials against the operator's account with no per-app or per-scope restriction — every credential grants the same blanket access. Splitting one shared credential into N per-agent ones doesn't shrink the blast radius of a single exfil; it just creates N equivalent leak surfaces on the same host, all bound to the same account. The only operational benefit would be revoking one without rotating the others, but in practice any sign of compromise on any agent triggers rotating the master credential anyway. The real defense against this threat lives in the dispatch gate, the future `--read-only` rootfs, and rotation discipline — not in credential cardinality.
 - **Outbound data exfiltration by a `read-only` agent.** As above: `read-only` prevents mutation, not exfil. A read-only agent with `Read` + `WebFetch` can still POST file contents outbound.
 - **A compromised host.** If an attacker reaches the host shell, they have the listener's access, the operator's `.env`, and the host's Claude Code session. The framework is not designed to defend against host compromise; protect the host itself with normal host hygiene (SSH keys, firewall, no-shared-account).
 - **A malicious framework upstream** (by default). Without `FRAMEWORK_REQUIRE_SIGNED_TAG=true`, `update-framework.sh` trusts whoever owns the upstream remote. With the flag on, the upstream tip must be a tag signed by a key in your `gpg` keyring or the update is refused. If you don't trust the public upstream, set the flag in `.env` and pin `FRAMEWORK_UPSTREAM` to a tag.
@@ -228,7 +238,7 @@ Honest about what the framework protects against and what it doesn't, so operato
 
 - Default new agents to `boundaries: "write"` only after they've earned it; start with `read-only` and promote when the work demands it.
 - Set `WATCHER_CHECK_INTERVAL_MIN` aggressively if you want fast token-expiry warnings; the Watcher is the framework's one persistent eye on the install.
-- Treat the `CLAUDE_CODE_OAUTH_TOKEN` as a high-value credential. Rotate annually (or sooner) via `claude setup-token`; the Watcher's token-age check warns 30 days before the typical 1-year expiry.
+- Treat the auth credential as high-value. For Option A: rotate annually (or sooner) via `claude setup-token`; the Watcher's token-age check warns 30 days before the typical 1-year expiry. For Option B: rotate on a schedule that matches your security posture, and revoke immediately from the Console at any sign of compromise.
 - Limit which channels each agent's Slack app is invited to. Agents only see messages in channels they're members of; smaller surface = smaller injection surface.
 - When in doubt, use the Watcher's `[Restart listener]` button or set `boundaries: "read-only"` on a misbehaving agent's `config.json` — the next container spawn enforces the new config.
 

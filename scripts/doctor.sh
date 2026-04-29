@@ -64,14 +64,21 @@ SECTION "Environment"
 
 if [ -f .env ]; then
   PASS ".env present"
-  if grep -qE '^CLAUDE_CODE_OAUTH_TOKEN=sk-ant-' .env; then
-    PASS "CLAUDE_CODE_OAUTH_TOKEN looks valid (starts with sk-ant-)"
-  elif grep -qE '^CLAUDE_CODE_OAUTH_TOKEN=' .env; then
+  # Auth: pass if ANTHROPIC_API_KEY (Option B) OR CLAUDE_CODE_OAUTH_TOKEN
+  # (Option A) is set with a plausible format. Either is sufficient.
+  if grep -qE '^ANTHROPIC_API_KEY=sk-ant-' .env; then
+    PASS "ANTHROPIC_API_KEY set (Option B — Console / per-token billing)"
+  elif grep -qE '^CLAUDE_CODE_OAUTH_TOKEN=sk-ant-' .env; then
+    PASS "CLAUDE_CODE_OAUTH_TOKEN set (Option A — subscription / OAuth)"
+  elif grep -qE '^ANTHROPIC_API_KEY=.+' .env; then
+    FAIL "ANTHROPIC_API_KEY present but format suspect" \
+      "Generate at https://console.anthropic.com/ → API Keys → Create Key"
+  elif grep -qE '^CLAUDE_CODE_OAUTH_TOKEN=.+' .env; then
     FAIL "CLAUDE_CODE_OAUTH_TOKEN present but format suspect" \
       "Run \`claude setup-token\` and paste the new token into .env"
   else
-    FAIL "CLAUDE_CODE_OAUTH_TOKEN missing in .env" \
-      "Run \`claude setup-token\` and add CLAUDE_CODE_OAUTH_TOKEN=<token> to .env"
+    FAIL "no auth set in .env (need ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)" \
+      "Pick Option A (subscription) or Option B (Console) — see .env.example for both."
   fi
   if grep -qE '^TZ=' .env; then
     tz="$(grep -E '^TZ=' .env | head -1 | cut -d= -f2-)"

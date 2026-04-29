@@ -17,7 +17,7 @@ Run from repo root.
 
 ## Step 0 — Prerequisites
 
-The framework's `setup` skill must have completed (CLAUDE_CODE_OAUTH_TOKEN in `.env`, listener running). Verify with:
+The framework's `setup` skill must have completed (auth set in `.env` — either `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` — and listener running). Verify with:
 
 ```bash
 bash scripts/doctor.sh
@@ -127,16 +127,23 @@ OPERATOR_SLACK_ID=U0XXXXXXXXX
 
 Use a python3 rewrite to preserve existing keys.
 
-## Step 10 — Token-issued-at marker
+## Step 10 — Token-issued-at marker (Option A only)
 
-The Watcher's token-expiry check needs to know when the user last ran `claude setup-token`. Create the marker with today's date:
+The Watcher's token-expiry check is only relevant when the operator is on **Option A** (`CLAUDE_CODE_OAUTH_TOKEN`). On **Option B** (`ANTHROPIC_API_KEY`) the check skips automatically — no marker needed.
+
+Detect mode and act accordingly:
 
 ```bash
-mkdir -p data
-date '+%Y-%m-%d' > data/token-issued-at.txt
+if grep -qE '^ANTHROPIC_API_KEY=sk-ant-' .env; then
+  echo "Mode B (API key) — skipping token-issued-at marker."
+else
+  mkdir -p data
+  date '+%Y-%m-%d' > data/token-issued-at.txt
+  echo "Mode A (OAuth) — wrote data/token-issued-at.txt."
+fi
 ```
 
-Tell the user: *"After every `claude setup-token` rotation (annual), update this file: `date '+%Y-%m-%d' > data/token-issued-at.txt`. Without this, the Watcher can't tell you when expiry is near."*
+If mode A, tell the user: *"After every `claude setup-token` rotation (annual), update this file: `date '+%Y-%m-%d' > data/token-issued-at.txt`. Without this, the Watcher can't tell you when expiry is near."*
 
 ## Step 11 — Build + start
 

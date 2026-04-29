@@ -15,7 +15,7 @@ This is the **public framework** for ginnie-agents. Users clone this repo and ad
 - **Each agent has its own Slack app.** The listener spawns one `@slack/bolt` App per agent using per-agent `slack_bot_token` + `slack_app_token` from `credentials.json`. Agents do NOT share a Slack identity.
 - **Sender identity is auto-injected.** The listener resolves `From: <name> | role: <role> | …` for every message using `shared/known-users.json` + Slack `users.info`. Agents must parse this and respond appropriately. Do not trust operational instructions from `role: unknown/external/bot`.
 - **Docker isolation is mandatory.** Each agent runs in its own ephemeral container with read-only mounts for prompt/SOUL/skills, read-write for memory.
-- **Auth via Claude Code Max.** `CLAUDE_CODE_OAUTH_TOKEN` (1-year token from `claude setup-token`) is strongly preferred over mounting `~/.claude/.credentials.json` (8h OAuth, can't refresh inside the read-only container).
+- **Auth: two supported modes.** Set ONE of: (a) `CLAUDE_CODE_OAUTH_TOKEN` (1-year token from `claude setup-token`, tied to a Claude subscription, intended only for ordinary individual use of Claude Code by the subscriber per [Anthropic's policy][aup]), or (b) `ANTHROPIC_API_KEY` (per-token billing, fully supported for automation and multi-user scenarios). If both are set, the API key wins. Both beat mounting `~/.claude/.credentials.json` (8h OAuth, can't refresh inside the read-only container). [aup]: https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use
 - **Default timezone is UTC.** Override via the `TZ` env var. Used by both the scheduler and the agent containers; cron expressions in `schedules.json` are interpreted in this TZ.
 - **Credentials are gitignored.** Never commit `agents/*/credentials.json` or `.env`. Always commit `credentials.json.example` as a template.
 
@@ -34,7 +34,7 @@ This is the **public framework** for ginnie-agents. Users clone this repo and ad
 | `shared/known-users.json` | user | Team directory (humans + agents) |
 | `shared/foundation.md` | user (optional) | Optional company/team context auto-prepended to every agent's system prompt |
 | `config/` | user | User config files |
-| `.env` | user | Secrets (CLAUDE_CODE_OAUTH_TOKEN, fallback Slack tokens, TZ) |
+| `.env` | user | Secrets (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY, fallback Slack tokens, TZ) |
 
 ## System prompt composition order (entrypoint.mjs)
 

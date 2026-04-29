@@ -32,7 +32,14 @@ export interface CheckResult {
 const REPO = path.resolve(__dirname, "..", "..");
 
 // ─── Token expiry ──────────────────────────────────────────
+//
+// Only relevant for Option A (CLAUDE_CODE_OAUTH_TOKEN). Option B
+// (ANTHROPIC_API_KEY) doesn't expire on a fixed schedule — rotation cadence
+// there is the operator's call, not a clock the framework can read.
 export function checkTokenAge(): CheckResult | null {
+	// Skip when API key is the active auth — token-age has no meaning.
+	if (process.env.ANTHROPIC_API_KEY) return null;
+	if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) return null;
 	const tsFile = path.join(REPO, "data", "token-issued-at.txt");
 	if (!existsSync(tsFile)) return null;
 	const issued = readFileSync(tsFile, "utf-8").trim();

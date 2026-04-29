@@ -15,7 +15,9 @@ mkdir -p "$AGENT_DIR/memory" "$AGENT_DIR/sessions" "$AGENT_DIR/logs"
 echo "[$(date)] Starting $AGENT_NAME in Docker container..."
 
 DOCKER_AUTH_ARGS=()
-if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  DOCKER_AUTH_ARGS+=(-e "ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY")
+elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
   DOCKER_AUTH_ARGS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
 else
   DOCKER_AUTH_ARGS+=(-v "$HOME/.claude/.credentials.json:/home/node/.claude/.credentials.json:ro")

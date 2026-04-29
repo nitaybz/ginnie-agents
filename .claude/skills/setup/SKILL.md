@@ -1,6 +1,6 @@
 ---
 name: setup
-description: First-run setup for ginnie-agents — verifies prerequisites, generates a long-lived Claude Code OAuth token, scaffolds .env, installs git hooks, builds the Docker image, builds the listener, and starts PM2. Use when the user clones the repo and says "set up", "set me up", "first run", "install", or invokes this directly.
+description: First-run setup for ginnie-agents — verifies prerequisites, asks the user to pick an auth mode (subscription OAuth or Anthropic API key) and configures it, scaffolds .env, installs git hooks, builds the Docker image, builds the listener, and starts PM2. Use when the user clones the repo and says "set up", "set me up", "first run", "install", or invokes this directly.
 ---
 
 # Setup — First-run
@@ -25,11 +25,30 @@ If `docker info` fails, the daemon isn't running — tell the user to start Dock
 
 If Node is older than 22, point them at https://nodejs.org/.
 
-## Step 2 — Long-lived Claude Code token
+## Step 2 — Authentication
 
-This is the single most important step. Without it, agents stop running after ~8 hours.
+This is the single most important step. Without auth configured, agents can't talk to Claude.
 
-The token lives in **`.env` only.** No shell rc edits, no exports needed — the listener loads `.env` directly via dotenv (with override) at startup, so PM2 picks it up automatically every restart.
+The framework supports two modes. **You must present the choice to the user — do not silently default.** Paste the disclosure below verbatim, then ask which option they want.
+
+> **Auth modes — pick one:**
+>
+> **Option A — OAuth token from a Claude subscription** (Free / Pro / Max / Team / Enterprise)
+> - Long-lived (~1 year), flat subscription cost, no per-call billing.
+> - **IMPORTANT — per [Anthropic's usage policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use), OAuth is intended for ordinary individual use of Claude Code by the subscriber.** Anthropic does NOT permit routing requests through subscription credentials on behalf of other users.
+> - Appropriate when: you are the subscriber, agents are your personal/internal automation, volume stays in a sane range for one human's usage.
+> - **Not appropriate** (risks token revocation / account suspension) when: agents serve external customers, your team beyond yourself, or anything resembling a hosted product.
+>
+> **Option B — Anthropic API key from Console**
+> - Per-token billing. Fully supported by Anthropic's terms for automation, products, and multi-user scenarios.
+> - Higher cost than Option A, but no authentication risk.
+> - Appropriate when: agents serve other users (teammates, customers), or volume is high, or you're operating ginnie-agents as a service.
+>
+> **Which one fits your use case — A or B?**
+
+Wait for the user's answer before proceeding.
+
+### If the user picks Option A — OAuth token
 
 First check whether the user already has a token from a previous `claude setup-token`:
 
@@ -45,7 +64,7 @@ Then write it to `.env`:
 
 ```bash
 [ -f .env ] || cp .env.example .env
-# Update or add CLAUDE_CODE_OAUTH_TOKEN line in .env
+# Update or add CLAUDE_CODE_OAUTH_TOKEN line in .env, and ensure ANTHROPIC_API_KEY is blank
 python3 - <<'PY'
 import re, pathlib
 p = pathlib.Path(".env")
@@ -55,6 +74,8 @@ if "CLAUDE_CODE_OAUTH_TOKEN=" in text:
     text = re.sub(r"^CLAUDE_CODE_OAUTH_TOKEN=.*$", f"CLAUDE_CODE_OAUTH_TOKEN={token}", text, flags=re.M)
 else:
     text += f"\nCLAUDE_CODE_OAUTH_TOKEN={token}\n"
+# Make sure API key is not also set — Option A means Option A.
+text = re.sub(r"^ANTHROPIC_API_KEY=.*$", "ANTHROPIC_API_KEY=", text, flags=re.M)
 p.write_text(text)
 PY
 ```
@@ -63,6 +84,36 @@ Validate format (`sk-ant-oat01-...` or similar long string starting with `sk-ant
 
 ```bash
 grep '^CLAUDE_CODE_OAUTH_TOKEN=' .env | sed 's/=.*/=<set>/'   # don't print value
+```
+
+### If the user picks Option B — Anthropic API key
+
+Direct the user to https://console.anthropic.com/ → **API Keys** → **Create Key**. Ask them to paste the key (it starts with `sk-ant-api03-...` or similar `sk-ant-` prefix).
+
+Then write it to `.env`:
+
+```bash
+[ -f .env ] || cp .env.example .env
+# Update or add ANTHROPIC_API_KEY line in .env, and clear CLAUDE_CODE_OAUTH_TOKEN
+python3 - <<'PY'
+import re, pathlib
+p = pathlib.Path(".env")
+text = p.read_text()
+key = "<paste-key>"
+if "ANTHROPIC_API_KEY=" in text:
+    text = re.sub(r"^ANTHROPIC_API_KEY=.*$", f"ANTHROPIC_API_KEY={key}", text, flags=re.M)
+else:
+    text += f"\nANTHROPIC_API_KEY={key}\n"
+# Clear OAuth token if previously set — keeping the env clean to one mode.
+text = re.sub(r"^CLAUDE_CODE_OAUTH_TOKEN=.*$", "CLAUDE_CODE_OAUTH_TOKEN=", text, flags=re.M)
+p.write_text(text)
+PY
+```
+
+Validate format (starts with `sk-ant-`). Confirm it landed:
+
+```bash
+grep '^ANTHROPIC_API_KEY=' .env | sed 's/=.*/=<set>/'   # don't print value
 ```
 
 That's it — no further shell setup needed. When PM2 restarts the listener, it re-reads `.env`.
