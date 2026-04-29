@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5] — 2026-04-29
+
+Plumbing fix for Slack file uploads + matching template guidance so agents actually do something with the file once it lands.
+
+### Fixed
+
+- **`listener/src/index.ts`: file uploads no longer silently dropped.** The message handler returned early on any event with a `subtype`, which killed Slack's `file_share` events before the existing file-attachment formatter further down the same handler could ever run. Now `file_share` falls through; everything else (`channel_join`, `bot_message`, edits, etc.) still bails as before.
+
+### Changed
+
+- **`templates/agent/PROMPT.md`: spell out three rules agents kept missing.**
+  - **Threading.** The listener has always prepended `Slack message (channel: X, thread: Y): ... Reply in Slack channel X, thread Y.` to inbound messages, but the previous template only mentioned `thread_ts` as a buried afterthought after a `chat.postMessage` example that *omitted* it. Agents copied the example. The default postMessage example now *is* the threaded form, with an explicit "extract THREAD_TS, default to including it" rule.
+  - **File attachments.** The listener already appends `Attached files:` blocks with a pre-built `Download:` curl command, but the template never told agents what to do with them. Agents ignored uploads or claimed they couldn't see them. Added a step-by-step: run the download, process by mimetype (`Read` for text/images, dedicated skill for PDFs, honest "I can't read this" for binaries), and quote what you read back so the user knows you actually parsed it.
+  - **Tabular data.** Slack does not render markdown tables; pipes-and-dashes show up as raw text. Agents kept producing them. Added explicit guidance: code-block monospace alignment, Block Kit `section.fields` for label/value cards, file upload for big tables, and a strong default to prefer prose with bold numbers.
+
+No code changes outside the listener fix and the template prose. New agents created via `/create-agent` inherit the better defaults; existing agents can copy the relevant sections into their own `PROMPT.md`.
+
 ## [0.2.4] — 2026-04-29
 
 Surfaces Anthropic's [authentication policy](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use) and adds a fully-supported alternative auth path for operators whose use case doesn't fit "ordinary individual use of Claude Code by the subscriber." Subscription OAuth tokens (`CLAUDE_CODE_OAUTH_TOKEN` from `claude setup-token`) remain the default for personal/internal automation; `ANTHROPIC_API_KEY` is now first-class for automation, products, and multi-user scenarios.
