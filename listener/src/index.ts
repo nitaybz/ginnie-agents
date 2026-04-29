@@ -226,7 +226,13 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 
 	// Message handler (DMs + channel thread replies)
 	app.event("message", async ({ event }: any) => {
-		if (event.bot_id || event.subtype) return;
+		if (event.bot_id) return;
+		// Allow message-with-file subtypes to fall through to the file-attachment
+		// handler below. Slack sends file uploads as `subtype: "file_share"`
+		// (legacy) or as a regular message with `files: [...]`. Without this,
+		// every file upload was silently dropped.
+		const ALLOWED_SUBTYPES = new Set(["file_share"]);
+		if (event.subtype && !ALLOWED_SUBTYPES.has(event.subtype)) return;
 
 		const channel = event.channel;
 		let messageText = event.text || "";
