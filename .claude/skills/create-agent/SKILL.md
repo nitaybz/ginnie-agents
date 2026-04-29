@@ -149,7 +149,7 @@ For reference, the manifest the skill writes:
         "app_mentions:read", "chat:write", "chat:write.customize",
         "chat:write.public", "channels:history", "channels:read",
         "groups:history", "groups:read", "im:history", "im:read",
-        "im:write", "users:read", "files:write"
+        "im:write", "users:read", "files:read", "files:write"
       ]
     },
     "pkce_enabled": false
@@ -206,7 +206,7 @@ Walk the user through the full click-flow:
 1. Go to https://api.slack.com/apps → "Create New App" → "From scratch."
 2. App Name: the agent's name (Step 1). Workspace: the user's.
 3. **Socket Mode** → Enable. Generate App-Level Token — name `<AGENT_NAME>-socket`. Add **all three** scopes: `connections:write` (Socket Mode), `authorizations:read`, `app_configurations:write` (forward-compat). Click Generate. Copy the `xapp-…` token. Save.
-4. **OAuth & Permissions** → add bot scopes: `app_mentions:read`, `chat:write`, `chat:write.customize`, `chat:write.public`, `channels:history`, `channels:read`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `users:read`, `files:write`. (Canonical list also in `templates/agent/slack.json`.)
+4. **OAuth & Permissions** → add bot scopes: `app_mentions:read`, `chat:write`, `chat:write.customize`, `chat:write.public`, `channels:history`, `channels:read`, `groups:history`, `groups:read`, `im:history`, `im:read`, `im:write`, `users:read`, `files:read`, `files:write`. (Canonical list also in `templates/agent/slack.json`.)
 5. **Event Subscriptions** → Enable. Subscribe to bot events: `app_mention`, `message.channels`, `message.groups`, `message.im`. Save.
 6. **Basic Information** → **Display Information** → upload `agents/<slug>/avatar.png` as the App Icon. Save.
 7. **Install to Workspace** → Allow.
