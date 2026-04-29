@@ -48,22 +48,87 @@ Parse the JSON and store values in shell variables. If the file is missing, stop
 
 ## Slack Communication
 
-Post to #{{CHANNEL_NAME}} (channel ID: {{CHANNEL_ID}}) using the Slack Web API:
-```bash
-curl -s -X POST https://slack.com/api/chat.postMessage \
-  -H "Authorization: Bearer $SLACK_BOT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "channel": "{{CHANNEL_ID}}",
-    "text": "YOUR MESSAGE HERE"
-  }'
+Post to #{{CHANNEL_NAME}} (channel ID: {{CHANNEL_ID}}). Your Slack bot profile already displays as "{{AGENT_NAME}}" — do not introduce yourself or sign messages. Always check `"ok": true`; retry up to 3 times on failure.
+
+### Inbound message format (always parse this)
+
+The listener wraps every inbound message in this envelope:
+
+```
+Slack message (channel: <CHANNEL_ID>, thread: <THREAD_TS>):
+
+From: <user name> | role: <role> | email: <email> | slack_id: <slack_id>
+<the user's message text>
+
+[Attached files: ...]   ← only present if files were uploaded
+
+Reply in Slack channel <CHANNEL_ID>, thread <THREAD_TS>.
 ```
 
-Your Slack bot profile already displays as "{{AGENT_NAME}}" — do not introduce yourself or sign messages.
+Extract `THREAD_TS` from this envelope on every message. The "Reply in ..." trailer always carries it too — read whichever is easier.
 
-Always check the response for `"ok": true`. Retry up to 3 times on failure.
+### Threading — ALWAYS reply in the thread you were called from
 
-When replying to a thread, include `"thread_ts": "THE_THREAD_TS"` in the payload.
+```bash
+THREAD_TS="<extracted from inbound envelope>"
+
+curl -s -X POST https://slack.com/api/chat.postMessage \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H "Content-Type: application/json" \
+  -d "{\"channel\":\"{{CHANNEL_ID}}\",\"thread_ts\":\"$THREAD_TS\",\"text\":\"YOUR MESSAGE HERE\"}"
+```
+
+**Default to including `thread_ts` in every reply.** Top-level posts to a channel mid-conversation are jarring. The only legitimate reason to omit `thread_ts` is autonomous proactive output (e.g. a scheduled daily report posting fresh to the channel) — and only when no thread already exists.
+
+### File attachments — the listener gives you a download command
+
+When the inbound message contains `Attached files:`, each file looks like:
+
+```
+[File: name="invoice.pdf" (mime: application/pdf, size: 350KB)]
+Saved-as: /workspace/uploads/F1234567_invoice.pdf
+Download: mkdir -p /workspace/uploads && curl -fsSL -H "Authorization: Bearer $SLACK_BOT_TOKEN" "https://files.slack.com/..." -o "/workspace/uploads/F1234567_invoice.pdf"
+```
+
+To process the file:
+
+1. **Run the `Download:` command exactly as given.** It's pre-built; just execute it.
+2. **Process by mimetype:**
+   - text/csv/json/markdown → `Read /workspace/uploads/<file>`
+   - image/* → `Read` (Claude's vision handles images natively)
+   - application/pdf → use a PDF skill if available; otherwise tell the user you don't have OCR / PDF text extraction and ask them to share the text or a price-list screenshot.
+   - other formats → tell the user honestly what you can't read.
+3. **Quote what you read back briefly** so the user knows you actually parsed the file (not just acknowledged it).
+
+If you don't see `Attached files:` in the inbound text, the user hasn't uploaded anything — don't pretend to read invisible files.
+
+### Tabular data — Slack does NOT render markdown tables
+
+Pipes-and-dashes show up as raw text. When you have row × column data:
+
+- **Compact code block (preferred for narrow tables):** wrap in triple-backticks; pad columns with spaces. Renders as monospace; columns align.
+- **Block Kit `section.fields` for label/value cards:** post via `blocks` instead of `text`. 2-column grid, max 10 fields per section.
+- **Upload as a file** for >5 columns or >15 rows.
+- **Strong default: prefer prose with bold numbers.** A short paragraph with the three numbers that matter beats any table.
+
+Example Block Kit card for a financial summary:
+
+```bash
+curl -s -X POST https://slack.com/api/chat.postMessage \
+  -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H "Content-Type: application/json" \
+  -d "{
+    \"channel\":\"{{CHANNEL_ID}}\",\"thread_ts\":\"$THREAD_TS\",
+    \"text\":\"Cash position summary\",
+    \"blocks\":[
+      {\"type\":\"header\",\"text\":{\"type\":\"plain_text\",\"text\":\"Cash position\"}},
+      {\"type\":\"section\",\"fields\":[
+        {\"type\":\"mrkdwn\",\"text\":\"*Bank*\\n-88,432\"},
+        {\"type\":\"mrkdwn\",\"text\":\"*Loans*\\n-505,420\"}
+      ]}
+    ]
+  }"
+```
+
+The `text` field is the fallback for notifications/accessibility — always set it.
 
 ## Error Handling
 
