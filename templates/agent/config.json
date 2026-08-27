@@ -19,5 +19,6 @@
     "days": ["mon", "tue", "wed", "thu", "fri"],
     "off_hours_behavior": "queue"
   },
-  "model": "claude-sonnet-4-6"
+  "model": "claude-sonnet-4-6",
+  "button_ttl_hours": 48
 }

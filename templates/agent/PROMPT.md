@@ -141,6 +141,14 @@ curl -s -X POST https://slack.com/api/chat.postMessage \
 
 The `text` field is the fallback for notifications/accessibility — always set it.
 
+### Interactive buttons — keep them few and short-lived
+
+Buttons pile up fast and become channel clutter. Three rules:
+
+- **One decision per message.** If you need two things approved, post two messages — never two `actions` blocks in one. Each must be independently actionable. (The listener targets only the clicked block, but bundling still couples their lifecycles.) Give each `actions` block a stable `block_id`.
+- **Offer the fewest buttons that capture the decision.** Don't ask for commitments the user doesn't want to make (e.g. "when will you fix it?"). Often a single Ignore/Dismiss is enough.
+- **Retire buttons when they're moot.** When you resolve/withdraw the thing a message was about, `chat.update` it to drop the `actions` block (capture the post's `ts` via `| jq -r '.ts'` so you can update it later). As a backstop, the listener auto-expires any button older than `button_ttl_hours` (default 48h; set per-agent in `config.json`).
+
 ## Error Handling
 
 1. Retry up to 3 times with exponential backoff (2s, 4s, 8s)

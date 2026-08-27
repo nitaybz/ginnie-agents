@@ -20,8 +20,8 @@ import { loadStore, getThread, setThread } from "./store";
 import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
 import { getSenderInfo, formatSenderLine, type SenderInfo } from "./users";
-import { isWithinWorkHours, offHoursNotice } from "./workhours";
 import { isAudioMime, transcribeAudio } from "./transcribe";
+import { startButtonSweep } from "./button-sweep";
 
 // Load env from repo root. .env is the authoritative source for
 // CLAUDE_CODE_OAUTH_TOKEN, TZ, etc. — override any stale values that may
@@ -50,16 +50,21 @@ interface QueuedMessage {
 }
 
 const DEBOUNCE_MS = 20_000; // Wait 20s for additional messages before processing
-// Delay before deleting the "Working on it..." status so Slack has time to
-// fan out the agent's reply to the user's client. Without this, the delete
-// event can race ahead of the reply event and the user sees the status
-// disappear before the answer lands.
+// Delay before clearing the "is thinking…" status so Slack has time to fan out
+// the agent's reply to the user's client. Without this, the clear event can race
+// ahead of the reply event and the user sees the shimmer disappear before the
+// answer lands.
 const STATUS_DELETE_DELAY_MS = 1500;
+// Slack auto-clears an assistant status ~2min after it was last set. Agent runs
+// routinely exceed that, so re-assert the "is thinking…" status on this cadence
+// (comfortably under 2min) until the run completes — otherwise the shimmer
+// vanishes while the user is still waiting for the reply.
+const STATUS_HEARTBEAT_MS = 90_000;
 
 const activeThreads = new Set<string>(); // threads currently being processed
 const messageQueues = new Map<string, QueuedMessage[]>(); // pending messages per thread
 const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>(); // debounce timers
-const threadStatusMsgs = new Map<string, string>(); // thread-key -> active status msg ts
+const activeStatusThreads = new Set<string>(); // thread-keys with an active "thinking" shimmer
 
 // One Bolt App per agent (keyed by agent name)
 const apps = new Map<string, App>();
@@ -76,13 +81,15 @@ function enqueueOrProcess(msg: QueuedMessage): void {
 	queue.push(msg);
 	messageQueues.set(key, queue);
 
-	// Post "Working on it..." immediately on first arrival — before the debounce
-	// window closes — so the user sees acknowledgement within ~200ms instead of
-	// 20s. Fire-and-forget; processMessage picks up the result via threadStatusMsgs.
-	if (queue.length === 1 && !threadStatusMsgs.has(key)) {
-		ackMessage(msg.agent, msg.channel, msg.threadTs)
-			.then((ts) => { if (ts) threadStatusMsgs.set(key, ts); })
-			.catch(() => {});
+	// Show the "is thinking…" shimmer immediately on first arrival — before the
+	// debounce window closes — so the user sees acknowledgement within ~200ms
+	// instead of 20s. Optimistically mark active to dedupe concurrent arrivals;
+	// the call is idempotent, so a rare double-set is harmless.
+	if (queue.length === 1 && !activeStatusThreads.has(key)) {
+		activeStatusThreads.add(key);
+		setThinking(msg.agent, msg.channel, msg.threadTs)
+			.then((ok) => { if (!ok) activeStatusThreads.delete(key); })
+			.catch(() => { activeStatusThreads.delete(key); });
 	}
 
 	if (activeThreads.has(key)) {
@@ -166,37 +173,15 @@ function passesSenderPolicy(agent: AgentConfig, sender: SenderInfo): boolean {
 	return true;
 }
 
-// ─── Off-hours guard ───────────────────────────────────────
+// ─── Work hours ────────────────────────────────────────────
 //
-// Scheduled routines always fire (the schedule itself decides timing).
-// Inbound user messages, however, respect the agent's work_hours config.
-// Returns true if the message should proceed; false if the listener handled it.
-async function passesWorkHours(
-	agent: AgentConfig,
-	app: App,
-	channel: string,
-	threadTs: string,
-): Promise<boolean> {
-	if (isWithinWorkHours(agent.workHours)) return true;
-	const behavior = agent.workHours.off_hours_behavior;
-	if (behavior === "ignore") {
-		console.log(`[${agent.name}] off-hours: ignoring inbound message`);
-		return false;
-	}
-	// "queue" and "deferred_response" both fall through to a posted notice.
-	// True deferred queueing across PM2 restarts is a v0.2 concern.
-	try {
-		await app.client.chat.postMessage({
-			token: agent.slackBotToken,
-			channel,
-			thread_ts: threadTs,
-			text: offHoursNotice(agent.workHours),
-		});
-	} catch (err) {
-		console.error(`[${agent.name}] off-hours notice failed:`, err);
-	}
-	return false;
-}
+// work_hours is intentionally NOT enforced on inbound messages. Its purpose is
+// to stop an agent from *proactively* bothering the user outside hours — and
+// that's already governed by each routine's own cron in schedules.json (some
+// agents legitimately schedule routines outside their nominal work hours, e.g.
+// a Friday digest on Sun–Thu work-days). Anyone can reach an agent 24/7; the
+// agent answers whenever it's spoken to. The `work_hours` config block is kept
+// for backwards-compat but no longer gates inbound dispatch.
 
 // ─── Per-agent event wiring ────────────────────────────────
 // Each agent gets its own Bolt App. Events from that app's Slack workspace
@@ -214,8 +199,6 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		// A voice-only @mention has no text after stripping the mention.
 		// Drop messages that have neither text nor any attached file.
 		if (!baseText && !hasFiles) return;
-
-		if (!(await passesWorkHours(agent, app, channel, threadTs))) return;
 
 		const sender = await getSenderInfo(app, event.user, agent);
 		if (!passesSenderPolicy(agent, sender)) return;
@@ -275,7 +258,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			// ack messages we'll later silently drop.
 			if (event.channel_type === "im" && hasAudioAttachment(event.files)) {
 				const sender = await getSenderInfo(app, event.user, agent);
-				if (passesSenderPolicy(agent, sender) && isWithinWorkHours(agent.workHours)) {
+				if (passesSenderPolicy(agent, sender)) {
 					const earlyThreadTs = event.thread_ts || event.ts;
 					await postEarlyAudioAck(agent, channel, earlyThreadTs);
 				}
@@ -293,7 +276,6 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		// ── DM ──
 		if (event.channel_type === "im") {
 			const threadTs = event.thread_ts || event.ts;
-			if (!(await passesWorkHours(agent, app, channel, threadTs))) return;
 			console.log(`[DM] Agent: ${agent.name}, From: ${sender.name} (${sender.role}), Thread: ${threadTs}`);
 			enqueueOrProcess({
 				agent, channel, threadTs, message: messageText,
@@ -370,24 +352,39 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			label = String(action.value || action.action_id || action.type);
 		}
 
-		// Immediate visual feedback: rewrite the message to remove the actions
-		// block and append a confirmation context line. Fixes the "no feedback,
-		// I clicked it three times" problem — Slack's default click animation
-		// is a tiny spinner that doesn't disable the buttons.
+		// Immediate visual feedback: rewrite the message to retire ONLY the
+		// actions block that was clicked, replacing it in-place with a
+		// confirmation context line. Fixes the "no feedback, I clicked it three
+		// times" problem — Slack's default click animation is a tiny spinner that
+		// doesn't disable the buttons — without wiping sibling actions blocks
+		// (e.g. a message carrying two independent proposals: acting on one must
+		// leave the other's buttons live).
 		try {
 			const originalBlocks = body.message?.blocks || [];
-			const newBlocks = originalBlocks.filter((b: any) => b.type !== "actions");
 			const tz = process.env.TZ || "UTC";
 			const time = new Date().toLocaleTimeString("en-GB", {
 				hour: "2-digit", minute: "2-digit", timeZone: tz,
 			});
-			newBlocks.push({
+			const ackBlock = {
 				type: "context",
 				elements: [{
 					type: "mrkdwn",
 					text: `✓ <@${userId}> · *${label}* · ${time} ${tz} · ${agent.name} processing…`,
 				}],
-			});
+			};
+			// Slack tells us which block the clicked element lives in. Retire just
+			// that one. If block_id is somehow absent, fall back to the old
+			// behaviour (strip all actions blocks) so a click never goes silent.
+			const clickedBlockId = action.block_id;
+			let newBlocks: any[];
+			if (clickedBlockId && originalBlocks.some((b: any) => b.type === "actions" && b.block_id === clickedBlockId)) {
+				newBlocks = originalBlocks.map((b: any) =>
+					(b.type === "actions" && b.block_id === clickedBlockId) ? ackBlock : b,
+				);
+			} else {
+				newBlocks = originalBlocks.filter((b: any) => b.type !== "actions");
+				newBlocks.push(ackBlock);
+			}
 			await app.client.chat.update({
 				token: agent.slackBotToken,
 				channel,
@@ -427,14 +424,15 @@ function hasAudioAttachment(files: any[] | undefined): boolean {
 	);
 }
 
-// Pre-post the "Working on it…" status before a slow operation (transcription)
-// so the user sees feedback in <200ms. Stored in threadStatusMsgs so the later
-// enqueueOrProcess call reuses it instead of posting a second status.
+// Show the "is thinking…" status before a slow operation (transcription) so the
+// user sees feedback in <200ms. Marked active so the later enqueueOrProcess call
+// reuses it instead of re-setting the status.
 async function postEarlyAudioAck(agent: AgentConfig, channel: string, threadTs: string): Promise<void> {
 	const key = threadKey(channel, threadTs);
-	if (threadStatusMsgs.has(key)) return;
-	const ts = await ackMessage(agent, channel, threadTs);
-	if (ts) threadStatusMsgs.set(key, ts);
+	if (activeStatusThreads.has(key)) return;
+	activeStatusThreads.add(key);
+	const ok = await setThinking(agent, channel, threadTs);
+	if (!ok) activeStatusThreads.delete(key);
 }
 
 // Expand Slack file attachments into agent-readable text. Audio files are
@@ -494,31 +492,65 @@ async function expandFileAttachments(
 }
 
 // ─── Status indicators (scoped to agent) ───────────────────
-async function ackMessage(agent: AgentConfig, channel: string, ts: string): Promise<string | null> {
+// Slack's native assistant "is thinking…" shimmer (assistant.threads.setStatus).
+// It's bound to (channel, thread_ts) — there is no message ts to track or delete.
+// In regular channel threads it does NOT auto-clear on reply (only in the
+// dedicated Assistant pane), so clearThinking() must be called explicitly.
+async function setThinking(agent: AgentConfig, channel: string, threadTs: string): Promise<boolean> {
 	const app = apps.get(agent.name);
-	if (!app) return null;
+	if (!app) return false;
 	try {
-		const result = await app.client.chat.postMessage({
+		await app.client.assistant.threads.setStatus({
 			token: agent.slackBotToken,
-			channel,
-			thread_ts: ts,
-			text: "⏳ Working on it...",
+			channel_id: channel,
+			thread_ts: threadTs,
+			status: "is thinking…",
 		});
-		return (result.ts as string) || null;
+		return true;
 	} catch (_e) {
-		return null;
+		return false;
 	}
 }
 
-async function markDone(agent: AgentConfig, channel: string, statusMsgTs?: string | null): Promise<void> {
-	if (!statusMsgTs) return;
+// Post a fallback reply when an agent run errored before posting anything of
+// its own (container crash, API rejection, etc.). Without this the user sees
+// the status spinner vanish and gets no answer at all.
+async function postRunFailure(
+	agent: AgentConfig,
+	channel: string,
+	threadTs: string,
+	rawError: string,
+): Promise<void> {
+	const app = apps.get(agent.name);
+	if (!app) return;
+	const err = String(rawError || "");
+	let text = "⚠️ Sorry — I hit an error processing that and couldn't finish a reply. Mind trying again?";
+	// Give a useful, specific hint for the most common cause we've seen.
+	if (/could not process image|invalid_request_error.*image|image.*invalid/i.test(err)) {
+		text = "⚠️ I couldn't read that image — it may be an unsupported shape, format, or size for me to view. A standard screenshot or photo (not an extreme thin/wide crop) usually works. Want to describe what's in it, or resend a different version?";
+	}
+	try {
+		await app.client.chat.postMessage({
+			token: agent.slackBotToken,
+			channel,
+			thread_ts: threadTs,
+			text,
+		});
+		console.log(`[${agent.name}] Posted run-failure fallback to thread ${threadTs}`);
+	} catch (e) {
+		console.error(`[${agent.name}] Failed to post run-failure fallback:`, e);
+	}
+}
+
+async function clearThinking(agent: AgentConfig, channel: string, threadTs: string): Promise<void> {
 	const app = apps.get(agent.name);
 	if (!app) return;
 	try {
-		await app.client.chat.delete({
+		await app.client.assistant.threads.setStatus({
 			token: agent.slackBotToken,
-			channel,
-			ts: statusMsgTs,
+			channel_id: channel,
+			thread_ts: threadTs,
+			status: "",
 		});
 	} catch (_e) {}
 }
@@ -556,21 +588,17 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 	const { agent, channel, threadTs, message, isThreadReply } = msg;
 	const key = threadKey(channel, threadTs);
 
-	// Resolve the status message that was posted up-front in enqueueOrProcess.
-	// If the ack post is still in-flight, wait briefly. If it never shows
-	// (API error on first try, or we're re-draining a second cycle where the
-	// previous status was already deleted), post a fresh one here.
-	let statusMsgTs: string | null = threadStatusMsgs.get(key) || null;
-	if (!statusMsgTs) {
-		for (let i = 0; i < 30 && !threadStatusMsgs.has(key); i++) {
-			await new Promise((r) => setTimeout(r, 100));
-		}
-		statusMsgTs = threadStatusMsgs.get(key) || null;
-	}
-	if (!statusMsgTs) {
-		statusMsgTs = await ackMessage(agent, channel, threadTs);
-		if (statusMsgTs) threadStatusMsgs.set(key, statusMsgTs);
-	}
+	// Re-assert the "is thinking…" shimmer at processing start. setStatus is
+	// idempotent, so this is safe whether or not enqueueOrProcess already set it,
+	// and it guards against Slack's ~2min status auto-timeout if this message
+	// waited in a long debounce/queue window.
+	activeStatusThreads.add(key);
+	await setThinking(agent, channel, threadTs);
+	// Keep the shimmer alive across the whole run — Slack expires it ~2min after
+	// the last set, and runs frequently take longer than that.
+	const heartbeat = setInterval(() => {
+		void setThinking(agent, channel, threadTs);
+	}, STATUS_HEARTBEAT_MS);
 
 	try {
 		if (isThreadReply) {
@@ -578,7 +606,8 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 			if (existing && existing.agentName === agent.name) {
 				console.log(`[${agent.name}] Resuming session for thread ${threadTs}`);
 				const agentMessage = `Slack reply (channel: ${channel}, thread: ${threadTs}):\n\n${message}\n\nReply in Slack channel ${channel}, thread ${threadTs}.`;
-				await resumeAgent(agent, existing.sessionId, agentMessage);
+				const r = await resumeAgent(agent, existing.sessionId, agentMessage);
+				if (r.isError) await postRunFailure(agent, channel, threadTs, r.result);
 				return;
 			}
 		}
@@ -592,19 +621,26 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 		}
 
 		const agentMessage = `Slack message (channel: ${channel}, thread: ${threadTs}):${threadContext}\n\n${message}\n\nReply in Slack channel ${channel}, thread ${threadTs}.`;
-		const sessionId = await runAgent(agent, agentMessage);
+		const { sessionId, isError, result } = await runAgent(agent, agentMessage);
+
+		// The agent posts its own reply during the run. If the run errored, it
+		// crashed before posting anything — surface a fallback so the user is
+		// never left with a vanished spinner and silence.
+		if (isError) {
+			await postRunFailure(agent, channel, threadTs, result);
+		}
 
 		setThread(channel, threadTs, sessionId, agent.name);
 		console.log(`[${agent.name}] New session stored for thread ${threadTs}`);
 	} finally {
-		if (statusMsgTs) {
-			// Let Slack fan the agent's reply out to clients before we delete
-			// the status — otherwise the delete event can win the race and the
-			// user sees the spinner vanish before the answer lands.
-			await new Promise((r) => setTimeout(r, STATUS_DELETE_DELAY_MS));
-			await markDone(agent, channel, statusMsgTs);
-			threadStatusMsgs.delete(key);
-		}
+		clearInterval(heartbeat);
+		// Let Slack fan the agent's reply out to clients before we clear the
+		// shimmer — otherwise the clear can win the race and the user sees it
+		// vanish before the answer lands. In channel threads the status does not
+		// auto-clear on reply, so this explicit clear is required.
+		await new Promise((r) => setTimeout(r, STATUS_DELETE_DELAY_MS));
+		await clearThinking(agent, channel, threadTs);
+		activeStatusThreads.delete(key);
 	}
 }
 
@@ -664,6 +700,9 @@ function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {
 		loadAgentSchedules(agent, onScheduleFire);
 		watchAgentSchedules(agent, onScheduleFire);
 	}
+
+	// Periodically retire stale, never-clicked buttons from agent messages.
+	if (started.length) startButtonSweep(apps, agents);
 
 	// Keep the event loop alive even with zero agents. Without this, a fresh
 	// install (no agents, no Bolt apps, no schedules) would let the loop drain

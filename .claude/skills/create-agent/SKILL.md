@@ -109,17 +109,16 @@ If `SLACK_CONFIG_TOKEN` and `SLACK_CONFIG_REFRESH_TOKEN` are both set → **prog
 
 This path generates the Slack app with all 13 scopes, Socket Mode, and 4 event subscriptions in one API call. The user then does ~3 manual clicks (install, copy bot token, generate App-Level Token, upload icon). Saves ~17 clicks compared to manual.
 
-**1. Refresh the config token** (it expires every 12h):
+**1. Get a valid access token via the rotation helper.**
 
 ```bash
-RESP=$(curl -s -X POST https://slack.com/api/tooling.tokens.rotate \
-  -d "refresh_token=$SLACK_CONFIG_REFRESH_TOKEN")
-NEW_TOKEN=$(echo "$RESP" | jq -r .token)
-NEW_REFRESH=$(echo "$RESP" | jq -r .refresh_token)
-[ "$NEW_TOKEN" = "null" ] && echo "Rotation failed: $RESP" && exit 1
+ACCESS=$(bash scripts/rotate-slack-config-token.sh) || exit 1
+# stderr from the script tells you what failed; if it's "invalid_refresh_token",
+# the chain is broken — regenerate the pair at https://api.slack.com/apps
+# (bottom of page → "Your App Configuration Tokens") and update .env.
 ```
 
-Write the new pair back to `.env` (rotation invalidates the old ones — must persist or next run breaks).
+**Always use the helper. Never call `tooling.tokens.rotate` directly.** Every successful rotation invalidates the previous refresh token. If a caller rotates inline and crashes / forgets to write back the new pair, the workspace loses access to the config-token API entirely (refresh dead, can't bootstrap without manual regen). `scripts/rotate-slack-config-token.sh` binds rotation and atomic persistence into one operation — writes to `.env.new`, then `os.replace` (POSIX-atomic rename). Any caller who receives an access token from it is guaranteed the new pair is already on disk.
 
 **2. Build the manifest** for this agent. The canonical shape lives in `templates/agent/slack-manifest.json` — substitute `{{AGENT_NAME}}` and `{{ROLE_DESCRIPTION}}` and you're done. Mirrored from a known-working production manifest. **Don't add `redirect_urls`** — that switches the app into the distributed-OAuth flow and breaks the workspace install-on-team button.
 

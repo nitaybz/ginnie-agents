@@ -227,20 +227,42 @@ async function runSession(resumeSessionId) {
 	}
 }
 
-try {
-	await runSession(resumeId);
-} catch (err) {
-	// If resume failed (stale session), retry as a new session
-	if (resumeId && String(err).includes("No conversation found")) {
-		console.error(`[${agentName}] Session ${resumeId.slice(0, 20)}... expired, starting fresh`);
-		try {
-			await runSession(undefined);
-		} catch (retryErr) {
-			console.error(`[${agentName}] FATAL:`, retryErr);
-			console.log(JSON.stringify({ session_id: "", is_error: true, result: String(retryErr) }));
-			process.exit(1);
+// Transient/ambiguous API failures that are worth one or two automatic retries.
+// "Could not process image" is nominally a 400, but in practice it's an
+// intermittent server-side decode hiccup (verified: the same image + container
+// + model succeeds on every re-run), so we treat it as retryable. Genuinely
+// deterministic 400s (bad request shape, unsupported param) won't match and
+// still fail fast — no infinite loops.
+const TRANSIENT_ERROR =
+	/could not process image|overloaded|rate.?limit|\b429\b|\b5\d\d\b|internal server error|timed? ?out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up/i;
+const MAX_TRANSIENT_RETRIES = 2;
+
+let transientRetries = 0;
+let sessionArg = resumeId;
+while (true) {
+	try {
+		await runSession(sessionArg);
+		break;
+	} catch (err) {
+		const msg = String(err);
+
+		// Stale resume → start a fresh session (does not consume retry budget).
+		if (sessionArg && msg.includes("No conversation found")) {
+			console.error(`[${agentName}] Session ${String(sessionArg).slice(0, 20)}... expired, starting fresh`);
+			sessionArg = undefined;
+			continue;
 		}
-	} else {
+
+		// Transient API error → brief backoff, then retry the same run.
+		if (TRANSIENT_ERROR.test(msg) && transientRetries < MAX_TRANSIENT_RETRIES) {
+			transientRetries++;
+			const delay = 1500 * transientRetries;
+			console.error(`[${agentName}] transient error (retry ${transientRetries}/${MAX_TRANSIENT_RETRIES} in ${delay}ms): ${msg.slice(0, 200)}`);
+			await new Promise((r) => setTimeout(r, delay));
+			continue;
+		}
+
+		// Non-transient, or retries exhausted → fail (listener posts a fallback).
 		console.error(`[${agentName}] FATAL:`, err);
 		console.log(JSON.stringify({ session_id: "", is_error: true, result: String(err) }));
 		process.exit(1);
