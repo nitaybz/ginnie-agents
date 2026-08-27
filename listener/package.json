@@ -6,7 +6,7 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "dev": "tsc && node dist/index.js",
-    "test": "tsc && node --test dist/studio-roster.test.js dist/studio-bridge.test.js"
+    "test": "tsc && node --test dist/*.test.js"
   },
   "dependencies": {
     "@slack/bolt": "^4.1.0",
