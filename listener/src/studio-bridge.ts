@@ -192,11 +192,6 @@ export function startStudioBridge(options: StudioBridgeOptions = {}): http.Serve
 	// kills the whole process. This is an optional, opt-in feature — failing
 	// to bind must only mean "Studio can't reach this installation right now",
 	// never "take down every agent's Slack connection".
-	// Without this, a bind failure (e.g. EADDRINUSE) arrives as an 'error'
-	// event with no listener, which Node throws as an uncaught exception and
-	// kills the whole process. This is an optional, opt-in feature — failing
-	// to bind must only mean "Studio can't reach this installation right now",
-	// never "take down every agent's Slack connection".
 	server.on("error", (err: NodeJS.ErrnoException) => {
 		console.error(`[studio-bridge] failed to bind 127.0.0.1:${port}, Studio bridge disabled:`, err.message);
 	});
