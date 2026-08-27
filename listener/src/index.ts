@@ -22,6 +22,7 @@ import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./s
 import { getSenderInfo, formatSenderLine, type SenderInfo } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
+import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
 
 // Load env from repo root. .env is the authoritative source for
 // CLAUDE_CODE_OAUTH_TOKEN, TZ, etc. — override any stale values that may
@@ -715,5 +716,14 @@ function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {
 			" with the create-agent skill, then `pm2 restart ginnie-agents-listener`.",
 		);
 	}
+	// Ginnie Studio bridge — loopback only, disabled until a key is installed.
+	const studioBridgePort = Number(process.env.STUDIO_BRIDGE_PORT || DEFAULT_STUDIO_BRIDGE_PORT);
+	try {
+		startStudioBridge({ port: studioBridgePort });
+		console.log(`   Studio bridge listening on 127.0.0.1:${studioBridgePort}`);
+	} catch (err) {
+		console.error("[studio-bridge] failed to start:", err instanceof Error ? err.message : err);
+	}
+
 	setInterval(() => { /* keep-alive */ }, 60_000);
 })();
