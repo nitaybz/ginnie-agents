@@ -91,7 +91,7 @@ Use the `manage-routines` skill format. Cron times are interpreted in the listen
 
 From the template `config.json`. Customize:
 - `boundaries`: ask "Should this agent be read-only or have write access?" Read-only restricts to `Read`, `Grep`, `Glob`, `WebSearch`, `WebFetch` — useful for analysts, monitors. Write is the default and gets the full tool set.
-- `work_hours`: ask "Does this agent work 24/7 or only during certain hours?" If certain hours, set `enabled: true` and gather start/end/days. Default `enabled: false` for monitors and on-call agents.
+- `work_hours`: informational only — it does not restrict when the agent answers inbound messages; those are always answered 24/7. Ask "What hours is this agent meant to be relevant, for the record?" and set `enabled: true` with start/end/days if the user wants that documented. Default `enabled: false`. If the user actually wants the agent quiet outside certain hours, that has to be encoded in the routine's cron (Step 4) instead.
 - `model`: leave default unless the user has a preference.
 
 ## Step 6 — Slack app

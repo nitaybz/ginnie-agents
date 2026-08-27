@@ -16,8 +16,7 @@
     "enabled": false,
     "start": "09:00",
     "end": "18:00",
-    "days": ["mon", "tue", "wed", "thu", "fri"],
-    "off_hours_behavior": "queue"
+    "days": ["mon", "tue", "wed", "thu", "fri"]
   },
   "model": "claude-sonnet-4-6",
   "button_ttl_hours": 48

@@ -83,7 +83,6 @@ Tell the user the file path and approximate size. Do not paste sensitive content
 | Agent didn't respond to a Slack message | Listener log around the message timestamp; look for `[@mention]` or `[DM]` lines for that agent |
 | Container exited with non-zero code | Listener log line `Container exited with code <N>` — preceding lines show stderr from the container |
 | Routine didn't fire | Listener log at expected fire time — look for `[scheduler] <agent>: firing "<id>"` |
-| Off-hours notice fired unexpectedly | Listener log: `off-hours: ignoring inbound message`. Then check `jq .work_hours agents/<n>/config.json` |
 | Auth failure | Listener log near startup: `start failed: not_authed` or `invalid_auth` → token in `agents/<n>/credentials.json` is bad; regenerate from Slack app's OAuth & Permissions page |
 | Memory hook rejected commit | Output of last commit attempt; usually `rules.md exceeds 200 lines` or `episodes/X.md is shrinking` |
 
