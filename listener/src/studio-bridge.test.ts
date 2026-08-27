@@ -204,6 +204,49 @@ test("run passes an agent-reported error through rather than swallowing it", asy
 	await h.close();
 });
 
+test("a second bridge on an already-bound port fails to bind without throwing", async () => {
+	const h = await start();
+	// h is already listening on a real (ephemeral) port. Starting a second
+	// bridge on that same port must hit EADDRINUSE. Deliberately do NOT
+	// attach an 'error' listener from this test — doing so would itself
+	// satisfy Node's "someone is listening" check and mask the very bug
+	// we're proving is fixed. Instead spy on console.error (production's own
+	// reporting channel) so we observe how the failure surfaces without
+	// touching the EventEmitter ourselves.
+	const port = Number(new URL(h.url).port);
+
+	const originalError = console.error;
+	const logged: unknown[][] = [];
+	console.error = (...args: unknown[]) => { logged.push(args); };
+
+	let second: ReturnType<typeof startStudioBridge> | undefined;
+	try {
+		second = startStudioBridge({
+			port,
+			keyFile: writeKeyFile(GOOD_KEY),
+			listAgents: () => [fakeAgent("casper")],
+		});
+
+		// Give the async EADDRINUSE 'error' event a tick to fire. Before the
+		// fix, this event had no listener anywhere, so Node would throw it as
+		// an uncaught exception right here and crash the whole test process —
+		// this test would never reach the assertions below. Simply getting
+		// here is itself evidence the process survived.
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	} finally {
+		console.error = originalError;
+	}
+
+	assert.ok(
+		logged.some((args) =>
+			String(args[0]).includes("[studio-bridge]") && String(args[0]).includes("failed to bind")),
+		"expected the bind failure to be reported via console.error, not thrown as an uncaught exception",
+	);
+
+	await h.close();
+	if (second) await new Promise<void>((resolve) => second.close(() => resolve()));
+});
+
 test("unknown routes are refused", async () => {
 	const h = await start();
 	const res = await fetch(`${h.url}/anything-else`, { headers: { "x-studio-key": GOOD_KEY } });
