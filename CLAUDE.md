@@ -2,6 +2,8 @@
 
 This is the **public framework** for ginnie-agents. Users clone this repo and add their own agents under `agents/`. Framework code is everything outside `agents/`, `shared/`, `config/`, and `.env`.
 
+- **Public forks need a local safeguard.** `agents/*/` is deliberately left out of the committed `.gitignore` so a private fork can version its agents' memory. Anyone running a public fork must run `bash scripts/private-fork-setup.sh` once per clone — see the "Running this from a public fork" section in `README.md`.
+
 ## Rules for working in this repo
 
 - **Framework dirs are off-limits to users.** `listener/`, `docker/`, `framework/`, `scripts/`, `templates/`, `.claude/skills/` are managed by `git pull`. User content lives only in `agents/`, `shared/`, `config/`, `.env`.

@@ -346,6 +346,26 @@ Then:
 
 That's it.
 
+## Running this from a public fork
+
+The agents you create under `agents/` are not sample data. Each one holds real files describing real people and real business context: who they report to, what they're allowed to do, private notes the agent has learned over time. That's on purpose, by design, for the framework: it is deliberately built so a **private** fork can commit and version all of that (so the agent's memory survives across machines and doesn't get lost). The project's tracked `.gitignore` does **not** hide `agents/`, and it never should.
+
+That default becomes a trap the moment your fork of this repo is **public**. A public fork gives strangers read access to your git history, so if any of that private content ever gets committed, it's exposed for good.
+
+If your fork is public, run this once on every machine where you clone it:
+
+```bash
+bash scripts/private-fork-setup.sh
+```
+
+What it does:
+- Hides your agents' private files (`agents/<name>/`), your optional company context (`shared/foundation.md`), your local `docs/`, and a couple of other private-only paths from `git status` and `git add`, so you can't commit them by accident.
+- Marks `shared/known-users.json` (your real team directory — names, emails, roles) so git ignores changes to it entirely; the version tracked by the repo stays an empty template.
+- Tells you, without changing anything, whether your `origin` remote looks public.
+- If it finds private content that's already been committed, it stops and tells you exactly which files — undoing a commit that's already public is a decision only you should make, so the script won't attempt it.
+
+These protections live only in your local `.git/` folder. They are **not** part of the repository and do not travel with `git clone`, `git push`, or `git pull` — that's why the script has to be run again on every new machine or fresh clone.
+
 ## What this is NOT
 
 Setting expectations honestly:
