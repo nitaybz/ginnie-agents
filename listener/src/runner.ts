@@ -12,6 +12,7 @@
 import { spawn } from "child_process";
 import { readdirSync, readFileSync, existsSync, mkdirSync } from "fs";
 import path from "path";
+import { deliveryInstruction, type DeliveryOrigin } from "./studio-delivery";
 
 const AGENTS_DIR = path.join(__dirname, "..", "..", "agents");
 const DOCKER_IMAGE = "ginnie-agent";
@@ -179,8 +180,9 @@ export let agents: AgentConfig[] = loadAgents();
 export async function runAgent(
 	agent: AgentConfig,
 	message: string,
+	origin: DeliveryOrigin = "slack",
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message);
+	return spawnContainer(agent, message, undefined, origin);
 }
 
 /**
@@ -190,8 +192,9 @@ export async function resumeAgent(
 	agent: AgentConfig,
 	sessionId: string,
 	message: string,
+	origin: DeliveryOrigin = "slack",
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, sessionId);
+	return spawnContainer(agent, message, sessionId, origin);
 }
 
 /**
@@ -210,6 +213,7 @@ function spawnContainer(
 	agent: AgentConfig,
 	message: string,
 	resumeId?: string,
+	origin: DeliveryOrigin = "slack",
 ): Promise<AgentRunResult> {
 	return new Promise((resolve, reject) => {
 		const containerName = `ginnie-${agent.name}-${Date.now()}`;
@@ -275,6 +279,11 @@ function spawnContainer(
 			"-e", `MAX_TURNS=${agent.maxTurns}`,
 			"-e", `ALLOWED_TOOLS=${agent.allowedTools.join(",")}`,
 		];
+
+		const deliveryText = deliveryInstruction(origin);
+		if (deliveryText) {
+			dockerArgs.push("-e", `DELIVERY_INSTRUCTION=${deliveryText}`);
+		}
 
 		if (apiKey) {
 			dockerArgs.push("-e", `ANTHROPIC_API_KEY=${apiKey}`);

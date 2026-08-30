@@ -20,6 +20,11 @@
  *   MAX_TURNS              — Optional: max agentic turns (default: 50)
  *   ALLOWED_TOOLS          — Optional: comma-separated tool list
  *   TZ                     — Optional: container timezone (default: UTC)
+ *   DELIVERY_INSTRUCTION   — Optional: extra system-prompt text appended after
+ *                             PROMPT.md, telling the agent how to deliver its
+ *                             answer for this turn's origin (e.g. Ginnie
+ *                             Studio instead of Slack). Empty/unset for a
+ *                             normal Slack turn.
  */
 
 import { createRequire } from "module";
@@ -63,8 +68,11 @@ if (!message) {
 //      memory-curation/SKILL.md                  (canonical memory model)
 //      routines/SKILL.md                         (canonical schedules.json schema)
 //   5. /workspace/PROMPT.md                    — agent-specific role & behaviors
-//   6. /workspace/memory/rules.md              — agent's USER-STATED RULES (always loaded)
-//   7. /workspace/memory/playbook.md           — agent's SETTLED PATTERNS (always loaded)
+//   6. DELIVERY_INSTRUCTION env var (if set)   — how to deliver THIS turn's answer;
+//                                                sits right after PROMPT.md so it
+//                                                overrides any conflicting rule there
+//   7. /workspace/memory/rules.md              — agent's USER-STATED RULES (always loaded)
+//   8. /workspace/memory/playbook.md           — agent's SETTLED PATTERNS (always loaded)
 //
 // Episodes (/workspace/memory/episodes/*.md) are NOT auto-loaded. The agent
 // greps them on demand. This keeps the system prompt bounded regardless of
@@ -166,6 +174,12 @@ if (existsSync(soulPath)) {
 if (existsSync(memorySkillPath)) parts.push(readFileSync(memorySkillPath, "utf-8"));
 if (existsSync(routinesSkillPath)) parts.push(readFileSync(routinesSkillPath, "utf-8"));
 if (existsSync(promptPath)) parts.push(readFileSync(promptPath, "utf-8"));
+
+// Delivery instruction — MUST come after PROMPT.md so it overrides rather
+// than being overridden by any conflicting rule in it (e.g. "always reply by
+// posting to the Slack thread"). Empty for a normal Slack turn.
+const deliveryInstruction = (process.env.DELIVERY_INSTRUCTION || "").trim();
+if (deliveryInstruction) parts.push(deliveryInstruction);
 
 // Always-loaded memory tiers. Rules and playbook are injected here — the
 // agent MUST NOT re-read them. Episodes are lazy (grep on demand).

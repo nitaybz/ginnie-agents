@@ -20,6 +20,7 @@ import path from "path";
 import { timingSafeEqual } from "crypto";
 import { agents, runAgent, resumeAgent, type AgentConfig, type AgentRunResult } from "./runner";
 import { buildRoster } from "./studio-roster";
+import type { DeliveryOrigin } from "./studio-delivery";
 
 /** Default port. Override with STUDIO_BRIDGE_PORT. */
 export const DEFAULT_STUDIO_BRIDGE_PORT = 4870;
@@ -38,8 +39,8 @@ export interface StudioBridgeOptions {
 	port?: number;
 	keyFile?: string;
 	listAgents?: () => AgentConfig[];
-	run?: (agent: AgentConfig, message: string) => Promise<AgentRunResult>;
-	resume?: (agent: AgentConfig, sessionId: string, message: string) => Promise<AgentRunResult>;
+	run?: (agent: AgentConfig, message: string, origin?: DeliveryOrigin) => Promise<AgentRunResult>;
+	resume?: (agent: AgentConfig, sessionId: string, message: string, origin?: DeliveryOrigin) => Promise<AgentRunResult>;
 }
 
 /** Reads the installed key, or null when there is not a usable one. */
@@ -162,8 +163,8 @@ export function startStudioBridge(options: StudioBridgeOptions = {}): http.Serve
 
 			try {
 				const result = sessionId
-					? await resume(agent, sessionId, message)
-					: await run(agent, message);
+					? await resume(agent, sessionId, message, "studio")
+					: await run(agent, message, "studio");
 				sendJson(res, 200, {
 					sessionId: result.sessionId,
 					isError: result.isError,
