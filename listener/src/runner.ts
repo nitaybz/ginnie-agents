@@ -13,6 +13,7 @@ import { spawn } from "child_process";
 import { readdirSync, readFileSync, existsSync, mkdirSync } from "fs";
 import path from "path";
 import { deliveryInstruction, type DeliveryOrigin } from "./studio-delivery";
+import { RUN_FAILURES_FILE, pickErrorLine, recordRunOutcome } from "./run-failures";
 
 const AGENTS_DIR = path.join(__dirname, "..", "..", "agents");
 const DOCKER_IMAGE = "ginnie-agent";
@@ -422,11 +423,14 @@ function spawnContainer(
 			} catch {}
 
 			console.log(`[${agent.name}] Container done: ${sessionId.slice(0, 30)}...${isError ? " (ERROR)" : ""}`);
+			// Feeds the watcher's "N failed runs in a row" alert.
+			recordRunOutcome(RUN_FAILURES_FILE, agent.name, isError, isError ? pickErrorLine(result, stderr) : "");
 			resolve({ sessionId, isError, result });
 		});
 
 		child.on("error", (err) => {
 			console.error(`[${agent.name}] Failed to spawn container:`, err);
+			recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${String(err)}`);
 			reject(err);
 		});
 	});

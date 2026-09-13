@@ -11,6 +11,7 @@
 import { execSync } from "child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import path from "path";
+import { checkRunFailures } from "./run-failures";
 
 export type Severity = "info" | "warn" | "critical";
 
@@ -341,6 +342,7 @@ export function runAllChecks(): CheckResult[] {
 		checkDisk(),
 		...checkMemoryCaps(),
 		...checkSchedulerRejects(),
+		...checkRunFailures(),
 	];
 	return results.filter((r): r is CheckResult => r !== null);
 }

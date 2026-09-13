@@ -18,6 +18,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { loadStore, getThread, setThread } from "./store";
 import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
+import { isSlackThreadTs } from "./run-failures";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
 import { getSenderInfo, formatSenderLine, type SenderInfo } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
@@ -524,6 +525,9 @@ async function postRunFailure(
 ): Promise<void> {
 	const app = apps.get(agent.name);
 	if (!app) return;
+	// Scheduled runs have no real thread to reply in; the watcher's
+	// consecutive-failure alert covers them instead.
+	if (!isSlackThreadTs(threadTs)) return;
 	const err = String(rawError || "");
 	let text = "⚠️ Sorry — I hit an error processing that and couldn't finish a reply. Mind trying again?";
 	// Give a useful, specific hint for the most common cause we've seen.
