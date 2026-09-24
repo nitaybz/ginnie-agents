@@ -3,7 +3,8 @@
  * information Ginnie Studio needs to show them as teammates.
  *
  * Everything here is best-effort. An agent missing slack.json, AGENT.md or
- * avatar.png is still a valid agent; it just shows up with less decoration.
+ * an avatar image (avatar.png, or the older icon.png name) is still a valid
+ * agent; it just shows up with less decoration.
  */
 
 import { existsSync, readFileSync } from "fs";
@@ -20,7 +21,7 @@ export interface RosterEntry {
 	/** "read-only" or "write", mirrored from the agent's config. */
 	boundaries: string;
 	hasAvatar: boolean;
-	/** Absolute path to avatar.png, or "" when there is none. */
+	/** Absolute path to the agent's avatar file (avatar.png or icon.png), or "" when there is none. */
 	avatarPath: string;
 }
 
@@ -61,17 +62,29 @@ export function readRole(agentDir: string): string {
 	return "";
 }
 
+/** An agent's picture file: avatar.png is canonical, icon.png is the older name. */
+const AVATAR_FILES = ["avatar.png", "icon.png"];
+
+/** The agent's avatar file if it ships one (avatar.png wins over icon.png), else "". */
+function findAvatar(agentDir: string): string {
+	for (const file of AVATAR_FILES) {
+		const candidate = path.join(agentDir, file);
+		if (existsSync(candidate)) return candidate;
+	}
+	return "";
+}
+
 export function buildRoster(agentList: AgentConfig[]): RosterEntry[] {
 	return agentList.map((agent) => {
-		const avatarPath = path.join(agent.dir, "avatar.png");
-		const hasAvatar = existsSync(avatarPath);
+		const avatarPath = findAvatar(agent.dir);
+		const hasAvatar = avatarPath !== "";
 		return {
 			name: agent.name,
 			displayName: readDisplayName(agent.dir, agent.name),
 			role: readRole(agent.dir),
 			boundaries: agent.boundaries,
 			hasAvatar,
-			avatarPath: hasAvatar ? avatarPath : "",
+			avatarPath,
 		};
 	});
 }

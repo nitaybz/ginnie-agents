@@ -88,3 +88,17 @@ test("buildRoster reports avatar presence and boundaries", () => {
 	assert.equal(roster[1].avatarPath, "");
 	assert.equal(roster[1].displayName, "Gadi");
 });
+
+test("buildRoster accepts icon.png as the agent's avatar", () => {
+	const withIcon = makeAgentDir("sally", { "icon.png": "not really a png" });
+	const roster = buildRoster([fakeAgent("sally", withIcon)]);
+	assert.equal(roster[0].hasAvatar, true);
+	assert.equal(roster[0].avatarPath, path.join(withIcon, "icon.png"));
+});
+
+test("buildRoster prefers avatar.png when both avatar files exist", () => {
+	const withBoth = makeAgentDir("omer", { "avatar.png": "a", "icon.png": "b" });
+	const roster = buildRoster([fakeAgent("omer", withBoth)]);
+	assert.equal(roster[0].hasAvatar, true);
+	assert.equal(roster[0].avatarPath, path.join(withBoth, "avatar.png"));
+});
