@@ -11,7 +11,7 @@ import type { AgentWorkHours } from "./runner";
 
 const DAY_NAMES = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
 
-function tzNow(tz: string): { day: string; minutes: number } {
+function tzNow(tz: string, at: Date = new Date()): { day: string; minutes: number } {
 	const fmt = new Intl.DateTimeFormat("en-US", {
 		timeZone: tz,
 		weekday: "short",
@@ -19,7 +19,7 @@ function tzNow(tz: string): { day: string; minutes: number } {
 		minute: "2-digit",
 		hour12: false,
 	});
-	const parts = fmt.formatToParts(new Date());
+	const parts = fmt.formatToParts(at);
 	const weekday = (parts.find((p) => p.type === "weekday")?.value || "").toLowerCase().slice(0, 3);
 	const hour = parseInt(parts.find((p) => p.type === "hour")?.value || "0", 10);
 	const minute = parseInt(parts.find((p) => p.type === "minute")?.value || "0", 10);
@@ -32,23 +32,42 @@ function parseHHMM(s: string): number {
 	return h * 60 + m;
 }
 
+/** The day abbreviation before `day` ("mon" -> "sun"). Returns "" if unknown. */
+function previousDay(day: string): string {
+	const idx = DAY_NAMES.indexOf(day);
+	if (idx < 0) return "";
+	return DAY_NAMES[(idx + DAY_NAMES.length - 1) % DAY_NAMES.length];
+}
+
 /**
  * Returns true if `now` falls within the agent's declared working hours.
  * If `enabled` is false, always returns true (no enforcement).
+ *
+ * `days` names the day a shift STARTS on. That distinction only matters for an
+ * overnight window (`end` < `start`, e.g. 22:00–06:00): a Mon–Fri night shift
+ * runs Fri 22:00 → Sat 06:00, so Saturday 02:00 is inside it even though "sat"
+ * is not in `days`; and Monday 02:00 is outside it, because the Sunday-night
+ * shift never started. Gating on the current calendar day alone gets both of
+ * those backwards.
  */
-export function isWithinWorkHours(workHours: AgentWorkHours): boolean {
+export function isWithinWorkHours(workHours: AgentWorkHours, at: Date = new Date()): boolean {
 	if (!workHours.enabled) return true;
 	const tz = process.env.TZ || "UTC";
-	const now = tzNow(tz);
+	const now = tzNow(tz, at);
 	const allowedDays = new Set(workHours.days.map((d) => d.toLowerCase().slice(0, 3)));
-	if (!allowedDays.has(now.day)) return false;
 	const startMin = parseHHMM(workHours.start);
 	const endMin = parseHHMM(workHours.end);
+
 	if (startMin <= endMin) {
+		// Same-day window. The shift starts and ends today.
+		if (!allowedDays.has(now.day)) return false;
 		return now.minutes >= startMin && now.minutes < endMin;
 	}
-	// overnight window (end < start) — allow wrap-around
-	return now.minutes >= startMin || now.minutes < endMin;
+
+	// Overnight window. Attribute the moment to the day its shift began.
+	if (now.minutes >= startMin) return allowedDays.has(now.day);
+	if (now.minutes < endMin) return allowedDays.has(previousDay(now.day));
+	return false;
 }
 
 /** Format a one-line off-hours notice for the agent's Slack channel. */
@@ -58,4 +77,4 @@ export function offHoursNotice(workHours: AgentWorkHours): string {
 }
 
 // Re-exported for tests / external introspection.
-export const _internal = { tzNow, parseHHMM, DAY_NAMES };
+export const _internal = { tzNow, parseHHMM, previousDay, DAY_NAMES };

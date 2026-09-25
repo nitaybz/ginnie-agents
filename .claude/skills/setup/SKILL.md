@@ -131,8 +131,7 @@ That's it — no further shell setup needed. When PM2 restarts the listener, it 
 Ask the user what timezone they want their agents to operate in. This affects:
 - The scheduler (cron expressions in `schedules.json` are interpreted in this TZ)
 - The container's `date` command output
-- Work-hours enforcement
-- Off-hours notice text
+- The recorded `work_hours` window in each agent's `config.json` (informational only; not enforced on inbound messages)
 
 Show common options: `UTC`, `America/New_York`, `Europe/London`, `Asia/Tokyo`, `Asia/Jerusalem`, `Australia/Sydney`. Default `UTC` if they have no preference.
 

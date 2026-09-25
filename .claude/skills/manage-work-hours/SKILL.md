@@ -1,11 +1,15 @@
 ---
 name: manage-work-hours
-description: Configure when an agent responds to inbound user messages — set work hours, days, and off-hours behavior in the agent's config.json. Use when the user says "set work hours", "make agent only respond during business hours", "configure availability", "off hours", or asks how to limit when an agent runs.
+description: Record an agent's intended availability window in config.json for documentation purposes, and steer users toward the real control (each routine's cron in schedules.json) for actually limiting when an agent speaks. Use when the user says "set work hours", "make agent only respond during business hours", "configure availability", "off hours", or asks how to limit when an agent runs.
 ---
 
 # Manage Work Hours
 
-`work_hours` in `agents/<n>/config.json` gates inbound user messages. Scheduled routines always fire regardless — work hours only apply to @mentions, DMs, and thread replies from users.
+**`work_hours` does not gate inbound messages.** Anyone can @mention, DM, or reply to an agent at any hour, on any day, and it will answer. This was a deliberate framework decision, not a bug: work hours only ever existed to stop an agent from *proactively* starting a conversation outside its expected hours, and that is already handled by each routine's own cron schedule in `agents/<n>/schedules.json` — not by this config block.
+
+In practice, `work_hours` and `off_hours_behavior` are informational only. Nothing in the listener reads them to decide whether to respond. Set them if you want a documented record of the agent's intended hours, but do not expect them to change runtime behavior.
+
+If what the user actually wants is "stop this agent from doing anything outside business hours," the real lever is the `manage-routines` skill: constrain or disable the routine's cron expression so it only fires in the desired window. Inbound @mentions/DMs will still be answered 24/7 regardless — there is currently no way to suppress those.
 
 ## Schema
 
@@ -21,13 +25,8 @@ description: Configure when an agent responds to inbound user messages — set w
 }
 ```
 
-- `enabled` — `false` disables enforcement entirely (default for new agents).
-- `start` / `end` — `HH:MM` 24h, in the listener's `TZ`. If `end < start`, the window wraps midnight (e.g. `start: "22:00"`, `end: "06:00"` means a night shift).
-- `days` — array of day abbreviations: `sun mon tue wed thu fri sat`.
-- `off_hours_behavior`:
-  - `"ignore"` — silently drop the message; agent does not respond.
-  - `"deferred_response"` — post a one-line off-hours notice in the thread; do not run the agent.
-  - `"queue"` — same as `deferred_response` in v0.1.0; persistent queue for later replay is a v0.2 concern.
+- `enabled`, `start`, `end`, `days` — record the agent's intended availability window. `HH:MM` 24h, in the listener's `TZ`. Purely documentation; not enforced.
+- `off_hours_behavior` — legacy field, kept only so existing agents' `config.json` keeps loading. Setting it to `"ignore"`, `"deferred_response"`, or `"queue"` has no effect on inbound message handling.
 
 ## Step 1 — Pick the agent
 
@@ -39,23 +38,23 @@ If named, use it. Otherwise list `agents/*/` and ask.
 jq .work_hours "agents/<n>/config.json"
 ```
 
-If null/missing, treat as `enabled: false` (the runner defaults all fields if absent).
+If null/missing, treat as unset.
 
 ## Step 3 — Gather changes
 
-Ask, with current values as defaults:
+Before writing anything, tell the user plainly: this only records intended hours for reference; it will not stop the agent from responding outside them. If they want actual off-hours silence for a routine, point them at `manage-routines` instead.
+
+If they still want to set/update the record, ask, with current values as defaults:
 1. **Enabled?** yes/no
 2. If yes:
    - **Start time** — HH:MM in the listener's TZ (`echo $TZ` to remind the user)
    - **End time** — HH:MM
    - **Days** — comma-separated abbreviations, or "weekdays" / "all" / "weekends" as shortcuts
-   - **Off-hours behavior** — `ignore` or `deferred_response`
 
 ## Step 4 — Validate
 
 - Times parse as HH:MM with valid hours/minutes
 - Days are subset of `[sun, mon, tue, wed, thu, fri, sat]`
-- `off_hours_behavior` is one of the allowed values
 
 ## Step 5 — Write
 
@@ -67,25 +66,21 @@ Pretty-print on save (use `jq` without `-c`).
 
 ## Step 6 — Restart
 
-Work hours are read at agent message time, but the listener caches `config.json` per agent at startup. To pick up changes:
+The listener caches `config.json` per agent at startup. To pick up the change:
 
 ```bash
 pm2 restart ginnie-agents-listener --update-env
 ```
 
-## Step 7 — Verify
+There is nothing to functionally verify afterward — the change is a documentation record, not a behavior switch. Don't send a test message expecting off-hours silence; the agent will respond regardless.
 
-Send a test message in the agent's channel during off-hours and confirm the off-hours notice posts (or that the agent stays silent for `ignore`).
-
-If you want to manually verify the time check without waiting:
+If you want to check what time the listener thinks it is (e.g. to sanity-check the `TZ` used in the record):
 ```bash
 TZ=$(grep -E '^TZ=' .env | cut -d= -f2) date '+%a %H:%M'
 ```
-That tells you what day/time the listener thinks it is.
 
 ## Common gotchas
 
-- **Wrong TZ:** the framework's `TZ` env (in `.env`) is the source of truth. If the agent's day boundary feels off, check that.
-- **"My agent is silent during work hours":** maybe `enabled: false` got flipped, or `days` doesn't include today's abbreviation. Run `jq .work_hours` and read carefully.
-- **Wrap-around windows:** if `end < start`, the window is `[start..midnight) ∪ [00:00..end)`. The runner handles this correctly. If you want a single-day window, make sure `start < end`.
-- **Schedules vs. work hours:** a routine fires no matter what `work_hours` says. To pause a routine during off-hours, gate it inside the routine's cron expression instead.
+- **"I set `off_hours_behavior: ignore` but the agent still answers at 2am":** expected. `work_hours` and `off_hours_behavior` are not enforced on inbound messages. There is no config that silences an agent's replies outside certain hours.
+- **Wrong TZ:** the framework's `TZ` env (in `.env`) is the source of truth for the recorded window.
+- **Schedules vs. work hours:** a routine fires exactly when its own cron in `schedules.json` says, regardless of `work_hours`. To limit when a routine runs, edit its cron expression via `manage-routines` — that is the only real lever for time-based behavior.

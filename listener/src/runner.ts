@@ -12,6 +12,8 @@
 import { spawn } from "child_process";
 import { readdirSync, readFileSync, existsSync, mkdirSync } from "fs";
 import path from "path";
+import { deliveryInstruction, type DeliveryOrigin } from "./studio-delivery";
+import { RUN_FAILURES_FILE, pickErrorLine, recordRunOutcome } from "./run-failures";
 
 const AGENTS_DIR = path.join(__dirname, "..", "..", "agents");
 const DOCKER_IMAGE = "ginnie-agent";
@@ -42,6 +44,7 @@ export interface AgentConfig {
 	workHours: AgentWorkHours;
 	allowUnverifiedSenders: boolean;
 	model?: string;
+	buttonTtlHours: number;
 }
 
 interface AgentManifest {
@@ -53,7 +56,12 @@ interface AgentManifest {
 	work_hours?: Partial<AgentWorkHours>;
 	allow_unverified_senders?: boolean;
 	model?: string;
+	button_ttl_hours?: number;
 }
+
+// How long an interactive (actions) block stays live before the listener's
+// sweep retires it. Per-agent override via config.json `button_ttl_hours`.
+const DEFAULT_BUTTON_TTL_HOURS = 48;
 
 // Read-only agents are restricted to a tool set that cannot mutate the
 // container filesystem or invoke shell-level write operations. The runner
@@ -155,6 +163,9 @@ export function loadAgents(): AgentConfig[] {
 			workHours,
 			allowUnverifiedSenders: manifest.allow_unverified_senders === true,
 			model: manifest.model,
+			buttonTtlHours: typeof manifest.button_ttl_hours === "number" && manifest.button_ttl_hours > 0
+				? manifest.button_ttl_hours
+				: DEFAULT_BUTTON_TTL_HOURS,
 		});
 	}
 
@@ -170,8 +181,9 @@ export let agents: AgentConfig[] = loadAgents();
 export async function runAgent(
 	agent: AgentConfig,
 	message: string,
-): Promise<string> {
-	return spawnContainer(agent, message);
+	origin: DeliveryOrigin = "slack",
+): Promise<AgentRunResult> {
+	return spawnContainer(agent, message, undefined, origin);
 }
 
 /**
@@ -181,15 +193,29 @@ export async function resumeAgent(
 	agent: AgentConfig,
 	sessionId: string,
 	message: string,
-): Promise<void> {
-	await spawnContainer(agent, message, sessionId);
+	origin: DeliveryOrigin = "slack",
+): Promise<AgentRunResult> {
+	return spawnContainer(agent, message, sessionId, origin);
+}
+
+/**
+ * Outcome of a single container run. `isError` is true when the container
+ * exited non-zero OR the entrypoint emitted `is_error` (e.g. an API rejection
+ * like "Could not process image") — in that case the agent did NOT post a
+ * reply and the caller must surface something to the user.
+ */
+export interface AgentRunResult {
+	sessionId: string;
+	isError: boolean;
+	result: string;
 }
 
 function spawnContainer(
 	agent: AgentConfig,
 	message: string,
 	resumeId?: string,
-): Promise<string> {
+	origin: DeliveryOrigin = "slack",
+): Promise<AgentRunResult> {
 	return new Promise((resolve, reject) => {
 		const containerName = `ginnie-${agent.name}-${Date.now()}`;
 
@@ -254,6 +280,11 @@ function spawnContainer(
 			"-e", `MAX_TURNS=${agent.maxTurns}`,
 			"-e", `ALLOWED_TOOLS=${agent.allowedTools.join(",")}`,
 		];
+
+		const deliveryText = deliveryInstruction(origin);
+		if (deliveryText) {
+			dockerArgs.push("-e", `DELIVERY_INSTRUCTION=${deliveryText}`);
+		}
 
 		if (apiKey) {
 			dockerArgs.push("-e", `ANTHROPIC_API_KEY=${apiKey}`);
@@ -374,26 +405,32 @@ function spawnContainer(
 				console.error(`[${agent.name}] Container exited with code ${code}`);
 			}
 
-			// Parse structured output from stdout
+			// Parse structured output from stdout. The entrypoint emits one JSON
+			// line per result: { session_id, is_error, result, ... }.
 			let sessionId = resumeId || `session_${Date.now()}`;
+			let isError = code !== 0; // non-zero exit always counts as an error
+			let result = "";
 			try {
 				const lines = stdout.trim().split("\n");
 				for (const line of lines) {
 					try {
 						const parsed = JSON.parse(line);
-						if (parsed.session_id) {
-							sessionId = parsed.session_id;
-						}
+						if (parsed.session_id) sessionId = parsed.session_id;
+						if (parsed.is_error) isError = true;
+						if (typeof parsed.result === "string") result = parsed.result;
 					} catch {}
 				}
 			} catch {}
 
-			console.log(`[${agent.name}] Container done: ${sessionId.slice(0, 30)}...`);
-			resolve(sessionId);
+			console.log(`[${agent.name}] Container done: ${sessionId.slice(0, 30)}...${isError ? " (ERROR)" : ""}`);
+			// Feeds the watcher's "N failed runs in a row" alert.
+			recordRunOutcome(RUN_FAILURES_FILE, agent.name, isError, isError ? pickErrorLine(result, stderr) : "");
+			resolve({ sessionId, isError, result });
 		});
 
 		child.on("error", (err) => {
 			console.error(`[${agent.name}] Failed to spawn container:`, err);
+			recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${String(err)}`);
 			reject(err);
 		});
 	});

@@ -108,7 +108,7 @@ This is not a sandbox. Agents still run as their declared identity in their cont
 
 ## Work hours
 
-`config.json.work_hours` controls when the agent responds to inbound user messages:
+`config.json.work_hours` does **not** gate inbound user messages. An @mention, DM, or thread reply reaches the agent and gets answered at any hour, any day — there is no config that silences that.
 
 ```json
 "work_hours": {
@@ -120,12 +120,9 @@ This is not a sandbox. Agents still run as their declared identity in their cont
 }
 ```
 
-When `enabled` is true and the current time (in the container's `TZ`) falls outside the window, the listener applies `off_hours_behavior`:
+`work_hours` (and the legacy `off_hours_behavior` field, kept only so old `config.json` files keep loading) is informational: a record of the agent's intended availability. Nothing in the listener reads it to decide whether to respond.
 
-- `ignore` — silently drop the message.
-- `deferred_response` (and v0.1.0 `queue`) — post a one-line off-hours notice in the same thread; do not run the agent.
-
-Scheduled routines fire regardless of work hours — the schedule itself decides timing. Work hours only gate inbound user messages.
+The actual concern `work_hours` was meant to address, stopping an agent from *proactively* starting a conversation outside its expected hours, is handled by each routine's own cron expression in `agents/<n>/schedules.json`. Scheduled routines fire exactly when their cron says, independent of `work_hours`. To limit when an agent speaks, constrain the routine's cron; there is no lever that limits when it answers inbound messages.
 
 ## Auth flow
 

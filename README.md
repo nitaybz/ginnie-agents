@@ -147,7 +147,7 @@ Opt-in at setup. The first run of `/setup` asks `Do you want to enable voice-mes
 
 ### Work hours
 
-Each agent has `work_hours` in its `config.json`:
+Each agent has `work_hours` in its `config.json`, but it does not gate inbound messages: an @mention, DM, or thread reply gets answered at any hour, any day. There is no setting that makes an agent go quiet on inbound messages outside a window.
 
 ```json
 {
@@ -155,13 +155,12 @@ Each agent has `work_hours` in its `config.json`:
     "enabled": true,
     "start": "09:00",
     "end":   "18:00",
-    "days":  ["mon", "tue", "wed", "thu", "fri"],
-    "off_hours_behavior": "deferred_response"
+    "days":  ["mon", "tue", "wed", "thu", "fri"]
   }
 }
 ```
 
-When enabled and a message arrives outside the window, the framework either drops it silently (`ignore`) or posts a one-line off-hours notice and skips dispatch (`deferred_response`). Scheduled routines fire regardless; work hours only gate inbound human messages.
+`work_hours` is a record of the agent's intended availability, nothing more. What actually keeps an agent from proactively starting a conversation outside its hours is each routine's own cron expression in `schedules.json` — a routine fires exactly when its cron says, regardless of `work_hours`. If you want an agent quiet outside certain hours, constrain the routine's schedule; there's currently no way to silence inbound replies.
 
 ### Skills (personal, shared, framework-internal)
 
@@ -283,7 +282,6 @@ sequenceDiagram
 
     U->>L: @mention or DM
     L->>L: Resolve sender identity from team directory
-    L->>L: Check work hours
     L->>C: Spawn container with mounts
     Note over C: SOUL + PROMPT + memory<br/>+ skills + team dir<br/>composed into system prompt
     C->>C: Reason. Possibly grep episodes.<br/>Write to memory.
@@ -304,7 +302,7 @@ The repo ships with nine Claude Code skills that cover the entire lifecycle. You
 | **doctor** | Health check across prerequisites, env, hooks, listener, Docker image, agents, memory caps, disk. Delegates to `scripts/doctor.sh` for deterministic mechanical checks; the skill adds Slack-reachability and token-age context. | *"doctor"*, *"is everything ok"* |
 | **manage-known-users** | Add, edit, or remove humans and agents from the team directory. Asks the visibility tree question (all agents, specific agents, or none) so you don't accidentally make every entry visible to every agent. | *"add a known user"*, *"register my new teammate"* |
 | **manage-routines** | View, add, edit, or disable schedules in an agent's `schedules.json`. Live-reloaded by the listener; no restart needed. | *"add a routine for the ops agent"*, *"change the schedule"* |
-| **manage-work-hours** | Configure when an agent responds to inbound user messages. Off-hours behavior options. | *"make the sales agent only respond during business hours"* |
+| **manage-work-hours** | Record an agent's intended availability window in `config.json` for reference. Does not gate inbound replies — points you to `manage-routines` for actually limiting when an agent acts. | *"make the sales agent only respond during business hours"* |
 | **logs** | Tail, search, or download listener and per-agent logs. Wraps `pm2 logs` and per-agent log files with friendly diagnostics for common symptoms. | *"show logs"*, *"why didn't the agent respond at 3pm?"* |
 | **setup-watcher** | Wire up the optional Watcher daemon. Creates the Watcher's Slack app via manifest, walks the install, captures tokens, configures `.env`, registers the PM2 process. | *"set up the watcher"*, *"watchdog"* |
 
@@ -347,6 +345,26 @@ Then:
 > **"create an agent for &lt;role&gt;"**
 
 That's it.
+
+## Running this from a public fork
+
+The agents you create under `agents/` are not sample data. Each one holds real files describing real people and real business context: who they report to, what they're allowed to do, private notes the agent has learned over time. That's on purpose, by design, for the framework: it is deliberately built so a **private** fork can commit and version all of that (so the agent's memory survives across machines and doesn't get lost). The project's tracked `.gitignore` does **not** hide `agents/`, and it never should.
+
+That default becomes a trap the moment your fork of this repo is **public**. A public fork gives strangers read access to your git history, so if any of that private content ever gets committed, it's exposed for good.
+
+If your fork is public, run this once on every machine where you clone it:
+
+```bash
+bash scripts/private-fork-setup.sh
+```
+
+What it does:
+- Hides your agents' private files (`agents/<name>/`), your optional company context (`shared/foundation.md`), your local `docs/`, and a couple of other private-only paths from `git status` and `git add`, so you can't commit them by accident.
+- Marks `shared/known-users.json` (your real team directory — names, emails, roles) so git ignores changes to it entirely; the version tracked by the repo stays an empty template.
+- Tells you, without changing anything, whether your `origin` remote looks public.
+- If it finds private content that's already been committed, it stops and tells you exactly which files — undoing a commit that's already public is a decision only you should make, so the script won't attempt it.
+
+These protections live only in your local `.git/` folder. They are **not** part of the repository and do not travel with `git clone`, `git push`, or `git pull` — that's why the script has to be run again on every new machine or fresh clone.
 
 ## What this is NOT
 
