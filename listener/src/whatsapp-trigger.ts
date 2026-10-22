@@ -12,8 +12,15 @@
  *     "watch_chats": ["<chat jid>"],          // chats whose new messages wake the agent
  *     "poll_seconds": 10,                     // optional
  *     "debounce_seconds": 4,                  // optional: a burst becomes one run
- *     "context_messages": 15                  // optional: recent history shown with the wake
+ *     "context_messages": 15,                 // optional: recent history shown with the wake
+ *     "local_address": "127.0.0.1"            // optional: source IP for the listener's polls
  *   }
+ *
+ * local_address (an IPv4 or IPv6 literal; anything else is ignored) makes the
+ * listener connect to api_url from that address instead of the system's
+ * default. Use it when the gateway only accepts some source addresses, e.g.
+ * a firewall that drops the host's default source on the Docker bridge but
+ * allows loopback. Unset, polls use fetch() exactly as before.
  *
  * The gateway is the agent-access API of a WhatsApp gateway (GET
  * /v1/messages, POST /v1/send, ...; see framework/skills/whatsapp). The
@@ -40,6 +47,9 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { request as httpRequest } from "http";
+import { request as httpsRequest } from "https";
+import { isIP } from "net";
 import path from "path";
 
 export const WHATSAPP_CURSORS_FILE = path.join(__dirname, "..", "..", "data", "whatsapp-cursors.json");
@@ -54,6 +64,8 @@ export interface WhatsAppConfig {
 	pollSeconds: number;
 	debounceSeconds: number;
 	contextMessages: number;
+	// Source IP for polls; undefined = system default (plain fetch).
+	localAddress?: string;
 }
 
 export interface WaMessage {
@@ -104,6 +116,7 @@ export function parseWhatsAppConfig(raw: unknown): WhatsAppConfig | undefined {
 	const watchChats = Array.isArray(r.watch_chats)
 		? r.watch_chats.filter((c): c is string => typeof c === "string" && CHAT_ID.test(c))
 		: [];
+	const local = typeof r.local_address === "string" ? r.local_address.trim() : "";
 	return {
 		apiUrl,
 		containerApiUrl: /^https?:\/\/[^\s/]+$/.test(container) ? container : apiUrl,
@@ -112,6 +125,7 @@ export function parseWhatsAppConfig(raw: unknown): WhatsAppConfig | undefined {
 		pollSeconds: num(r.poll_seconds, 10, 3, 300),
 		debounceSeconds: num(r.debounce_seconds, 4, 0, 120),
 		contextMessages: num(r.context_messages, 15, 0, 50),
+		localAddress: isIP(local) ? local : undefined,
 	};
 }
 
@@ -288,13 +302,49 @@ export interface TriggerDeps {
 	log?: (line: string) => void;
 }
 
-async function defaultFetchJson(url: string, token: string): Promise<unknown> {
+const FETCH_TIMEOUT_MS = 15_000;
+
+/**
+ * GET url as JSON with the Bearer token. With localAddress the connection is
+ * made from that source IP (node:http/https; fetch cannot bind one).
+ */
+export async function defaultFetchJson(url: string, token: string, localAddress?: string): Promise<unknown> {
+	if (localAddress) return requestJson(url, token, localAddress);
 	const r = await fetch(url, {
 		headers: { Authorization: `Bearer ${token}` },
-		signal: AbortSignal.timeout(15_000),
+		signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
 	});
 	if (!r.ok) throw new Error(`HTTP ${r.status}`);
 	return r.json();
+}
+
+function requestJson(url: string, token: string, localAddress: string): Promise<unknown> {
+	const u = new URL(url);
+	const request = u.protocol === "https:" ? httpsRequest : httpRequest;
+	return new Promise((resolve, reject) => {
+		const req = request(u, {
+			method: "GET",
+			headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+			localAddress,
+			timeout: FETCH_TIMEOUT_MS,
+		}, (res) => {
+			const status = res.statusCode || 0;
+			const chunks: Buffer[] = [];
+			res.on("data", (c: Buffer) => chunks.push(c));
+			res.on("error", reject);
+			res.on("end", () => {
+				if (status < 200 || status >= 300) return reject(new Error(`HTTP ${status}`));
+				try {
+					resolve(JSON.parse(Buffer.concat(chunks).toString("utf-8")));
+				} catch (err) {
+					reject(err);
+				}
+			});
+		});
+		req.on("timeout", () => req.destroy(new Error(`timeout after ${FETCH_TIMEOUT_MS / 1000}s`)));
+		req.on("error", reject);
+		req.end();
+	});
 }
 
 interface WakeItem {
@@ -327,7 +377,8 @@ export class WhatsAppTrigger {
 
 	constructor(private deps: TriggerDeps) {
 		this.pendingFile = deps.pendingFile || path.join(path.dirname(deps.cursorFile), "whatsapp-pending.json");
-		this.fetchJson = deps.fetchJson || defaultFetchJson;
+		const localAddress = deps.cfg.localAddress;
+		this.fetchJson = deps.fetchJson || ((url, token) => defaultFetchJson(url, token, localAddress));
 		this.setTimer = deps.setTimer || ((fn, ms) => setTimeout(fn, ms));
 		this.log = deps.log || ((l) => console.log(l));
 	}
