@@ -4,7 +4,7 @@
  *
  * Accounts come from the listener .env, in order:
  *   A  CLAUDE_CODE_OAUTH_TOKEN          (long-lived token from `claude setup-token`)
- *   B  CLAUDE_CODE_OAUTH_TOKEN_2        (same, second subscription)
+ *   B  CLAUDE_CODE_OAUTH_TOKEN_2        (same, second subscription; preferred)
  *      or CLAUDE_CODE_OAUTH_TOKEN_2_FILE (path to a Claude Code .credentials.json
  *                                         that another program keeps fresh; the
  *                                         access token is read at spawn time and
@@ -15,8 +15,11 @@
  *
  * When a run ends on a usage limit, the account is put in cooldown in
  * data/account-cooldowns.json until the limit resets, and the run is retried
- * once on the next account that is not cooling down. Limit hits are not run
- * failures. Logs carry the account label only, never the token.
+ * once on the next account that is not cooling down: from the start if the
+ * first try made no tool calls, else by resuming its session with an
+ * instruction not to repeat completed actions. Limit hits are not run
+ * failures. Logs carry the account label only, never the token, and the
+ * token never goes on a command line (see accountDockerAuth).
  *
  * Cooldown file shape (also fine to write by hand to force a cooldown):
  *   { "A": { "seven_day": "2026-10-25T01:00:00.000Z", "manual": "..." } }
@@ -26,6 +29,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
+import { pickErrorLine, recordRunOutcome } from "./run-failures";
 
 export const ACCOUNT_COOLDOWNS_FILE = path.join(__dirname, "..", "..", "data", "account-cooldowns.json");
 
@@ -155,6 +159,16 @@ export function recordLimitCooldown(
 	return until;
 }
 
+/**
+ * How a container receives the account: docker gets only `-e NAME`, and the
+ * value travels in the docker client's own environment. The token is never
+ * on a command line, so it cannot show in `ps` or in a launch-error message.
+ */
+export function accountDockerAuth(account: ClaudeAccount | null): { args: string[]; env: Record<string, string> } {
+	if (!account) return { args: [], env: {} };
+	return { args: ["-e", account.envVar], env: { [account.envVar]: account.value } };
+}
+
 export interface AttemptResult {
 	sessionId: string;
 	isError: boolean;
@@ -162,6 +176,10 @@ export interface AttemptResult {
 	limit?: LimitInfo | null;
 	model?: string;
 	stderr?: string;
+	// Tool calls the run made; undefined when the container did not say.
+	toolCalls?: number;
+	// Session id the container itself reported (resumable), if any.
+	reportedSessionId?: string;
 }
 
 export interface FallbackResult extends AttemptResult {
@@ -169,16 +187,41 @@ export interface FallbackResult extends AttemptResult {
 	limitHit: boolean;
 }
 
+// A retry after a limit that must not start over: resume the first try's session.
+export interface Continuation {
+	sessionId: string;
+	message: string;
+}
+
+export const CONTINUE_AFTER_LIMIT_MESSAGE =
+	"Your previous attempt at this task stopped partway because of a Claude usage limit; it now continues on " +
+	"another account. Continue from where it stopped. Do NOT repeat any action already completed above " +
+	"(messages or posts sent, files or records written, payments or documents issued). If you are unsure " +
+	"whether an action went through, check its result first instead of doing it again.";
+
+/**
+ * How to retry on another account after a limit:
+ *  - no tool call yet: start over with the original request (nothing happened);
+ *  - tool calls made (or unknown): resume the first try's session and continue;
+ *  - tool calls made but no session to resume: do not retry (repeating could
+ *    resend messages or money actions).
+ */
+export function planLimitRetry(r: AttemptResult): { kind: "fresh" } | { kind: "resume"; sessionId: string } | { kind: "none" } {
+	if (r.toolCalls === 0) return { kind: "fresh" };
+	if (r.reportedSessionId) return { kind: "resume", sessionId: r.reportedSessionId };
+	return { kind: "none" };
+}
+
 /**
  * Run once on the first usable account; on a usage limit, record the
- * cooldown and retry once on the next usable account. With no accounts
- * configured, run once with none (host credentials fallback).
+ * cooldown and retry once on the next usable account (see planLimitRetry).
+ * With no accounts configured, run once with none (host credentials fallback).
  */
 export async function runWithAccountFallback(opts: {
 	accounts: ClaudeAccount[];
 	cooldownFile: string;
 	model: string | undefined;
-	attempt: (account: ClaudeAccount | null) => Promise<AttemptResult>;
+	attempt: (account: ClaudeAccount | null, cont: Continuation | null) => Promise<AttemptResult>;
 	now?: () => number;
 	log?: (line: string) => void;
 }): Promise<FallbackResult> {
@@ -186,29 +229,48 @@ export async function runWithAccountFallback(opts: {
 	const log = opts.log || (() => {});
 	const order = accountAttemptOrder(opts.accounts, loadCooldowns(opts.cooldownFile), opts.model, now());
 	if (!order.length) {
-		const r = await opts.attempt(null);
+		const r = await opts.attempt(null, null);
 		return { ...r, account: null, limitHit: !!(r.isError && r.limit) };
 	}
 
 	const first = order[0];
-	const r1 = await opts.attempt(first);
+	const r1 = await opts.attempt(first, null);
 	if (!(r1.isError && r1.limit)) return { ...r1, account: first.label, limitHit: false };
 
 	const until1 = recordLimitCooldown(opts.cooldownFile, first.label, r1.limit, now());
+	const what = `usage limit on account ${first.label} (${r1.limit.type || "unknown"}), cooling until ${until1}`;
 	// Re-read after recording, so a per-family limit still excludes the account it just hit.
 	const next = accountAttemptOrder(opts.accounts, loadCooldowns(opts.cooldownFile), opts.model, now())
 		.find((a) => a.label !== first.label);
 	if (!next) {
-		log(`usage limit on account ${first.label} (${r1.limit.type || "unknown"}), cooling until ${until1}; no other account available`);
+		log(`${what}; no other account available`);
 		return { ...r1, account: first.label, limitHit: true };
 	}
-	log(`usage limit on account ${first.label} (${r1.limit.type || "unknown"}), cooling until ${until1}; retrying on account ${next.label}`);
+	const plan = planLimitRetry(r1);
+	if (plan.kind === "none") {
+		log(`${what}; not retrying: ${r1.toolCalls ?? "unknown"} tool calls already made and no session to resume`);
+		return { ...r1, account: first.label, limitHit: true };
+	}
+	const cont = plan.kind === "resume" ? { sessionId: plan.sessionId, message: CONTINUE_AFTER_LIMIT_MESSAGE } : null;
+	log(`${what}; retrying on account ${next.label} (${cont ? `resuming after ${r1.toolCalls ?? "unknown"} tool calls` : "from the start, no tool calls yet"})`);
 
-	const r2 = await opts.attempt(next);
+	const r2 = await opts.attempt(next, cont);
 	if (r2.isError && r2.limit) {
 		const until2 = recordLimitCooldown(opts.cooldownFile, next.label, r2.limit, now());
 		log(`usage limit on account ${next.label} (${r2.limit.type || "unknown"}), cooling until ${until2}`);
 		return { ...r2, account: next.label, limitHit: true };
 	}
 	return { ...r2, account: next.label, limitHit: false };
+}
+
+/**
+ * Failure bookkeeping for the watcher after the final attempt: a run that
+ * stopped on a usage limit is not a broken agent and leaves the streak alone;
+ * anything else is recorded (success clears, error extends).
+ * Returns whether the outcome was recorded.
+ */
+export function recordFinalOutcome(file: string, agentName: string, out: FallbackResult): boolean {
+	if (out.limitHit) return false;
+	recordRunOutcome(file, agentName, out.isError, out.isError ? pickErrorLine(out.result, out.stderr || "") : "");
+	return true;
 }

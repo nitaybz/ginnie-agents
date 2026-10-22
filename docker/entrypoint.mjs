@@ -32,7 +32,7 @@
 
 import { createRequire } from "module";
 import { bottomLineSkill } from "./prompt-skills.mjs";
-import { limitFromEvent, limitOutcome } from "./limit-detect.mjs";
+import { createLimitTracker } from "./limit-detect.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -220,14 +220,18 @@ console.error(`[${agentName}] Starting session${resumeId ? ` (resume: ${resumeId
 console.error(`[${agentName}] Tools: ${allowedTools.join(", ")}`);
 console.error(`[${agentName}] Max turns: ${maxTurns}`);
 
-// Usage-limit signal seen during the run (SDK rate_limit_event, status
-// rejected). The listener uses it to cool this subscription down and retry
-// on another one; see listener/src/claude-accounts.ts.
-let seenLimit = null;
+// Usage-limit detection and tool-call count for this run. On a limit the
+// listener cools this subscription and retries on another one: from scratch
+// when no tool ran yet, else by resuming this session (so actions already
+// taken are not repeated). See listener/src/claude-accounts.ts.
+const tracker = createLimitTracker();
 let resolvedModel = "";
+// Latest known session id; also reported on the failure paths so the
+// listener can resume it.
+let sessionId = resumeId || "";
 
 async function runSession(resumeSessionId) {
-	let sessionId = resumeSessionId || "";
+	sessionId = resumeSessionId || sessionId;
 
 	for await (const msg of query({
 		prompt: message,
@@ -251,8 +255,7 @@ async function runSession(resumeSessionId) {
 			}
 		}
 
-		const limit = limitFromEvent(msg);
-		if (limit) seenLimit = limit;
+		tracker.observe(msg);
 
 		if (msg.type === "result") {
 			const output = {
@@ -262,7 +265,8 @@ async function runSession(resumeSessionId) {
 				num_turns: msg.num_turns || 0,
 				cost_usd: msg.total_cost_usd || 0,
 				model: resolvedModel || undefined,
-				...limitOutcome(msg.is_error || false, msg.result || "", seenLimit),
+				tool_calls: tracker.toolCalls,
+				...tracker.outcome(msg.is_error || false, msg.result || ""),
 			};
 			console.log(JSON.stringify(output));
 			console.error(`[${agentName}] Done — ${msg.num_turns} turns, $${(msg.total_cost_usd || 0).toFixed(4)}`);
@@ -293,15 +297,23 @@ while (true) {
 		if (sessionArg && msg.includes("No conversation found")) {
 			console.error(`[${agentName}] Session ${String(sessionArg).slice(0, 20)}... expired, starting fresh`);
 			sessionArg = undefined;
+			sessionId = "";
 			continue;
 		}
 
 		// Usage limit → never retry here (it will not clear in seconds). The
 		// listener cools this subscription and retries on another one.
-		const limitFields = limitOutcome(true, msg, seenLimit);
+		const limitFields = tracker.outcome(true, msg);
 		if (limitFields) {
 			console.error(`[${agentName}] usage limit hit${limitFields.limit_type ? ` (${limitFields.limit_type})` : ""}: ${msg.slice(0, 200)}`);
-			console.log(JSON.stringify({ session_id: "", is_error: true, result: msg, model: resolvedModel || undefined, ...limitFields }));
+			console.log(JSON.stringify({
+				session_id: sessionId,
+				is_error: true,
+				result: msg,
+				model: resolvedModel || undefined,
+				tool_calls: tracker.toolCalls,
+				...limitFields,
+			}));
 			process.exit(1);
 		}
 
@@ -316,7 +328,7 @@ while (true) {
 
 		// Non-transient, or retries exhausted → fail (listener posts a fallback).
 		console.error(`[${agentName}] FATAL:`, err);
-		console.log(JSON.stringify({ session_id: "", is_error: true, result: String(err) }));
+		console.log(JSON.stringify({ session_id: sessionId, is_error: true, result: String(err), tool_calls: tracker.toolCalls }));
 		process.exit(1);
 	}
 }

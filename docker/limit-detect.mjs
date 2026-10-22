@@ -2,9 +2,12 @@
 // entrypoint.mjs (which starts a session on import) so the listener tests can
 // exercise them.
 
-// The CLI ends a limited run with text like
-// "You've hit your limit · resets 4am (Asia/Jerusalem)".
-const USAGE_LIMIT_TEXT = /hit your limit|usage limit/i;
+// The CLI's own terminal message for a subscription limit, e.g.
+// "You've hit your limit · resets 4am (Asia/Jerusalem)", possibly wrapped by
+// the SDK as "Error: Claude Code returned an error result: <message>".
+// Anchored to the start so text quoted from tool output never matches.
+const USAGE_LIMIT_TEXT =
+	/^\s*(?:Error:\s*)?(?:Claude Code returned an error result:\s*)?(?:You['’]ve hit your (?:usage )?limit|Claude AI usage limit reached)/i;
 
 export function isUsageLimitText(text) {
 	return USAGE_LIMIT_TEXT.test(String(text || ""));
@@ -21,15 +24,49 @@ export function limitFromEvent(msg) {
 	};
 }
 
-// Fields to add to the entrypoint's JSON result when the run failed on a
-// usage limit, or null. A run that succeeded is never a limit hit, even if a
-// rejected event went by (e.g. overage took over).
-export function limitOutcome(isError, text, seenLimit) {
-	if (!isError) return null;
-	if (!seenLimit && !isUsageLimitText(text)) return null;
+/**
+ * Follows one run's SDK messages.
+ *  - Counts tool calls, so the listener knows whether a retry on another
+ *    account may start over (no tool calls yet) or must resume.
+ *  - Remembers a rejected rate_limit_event only while it is the last thing
+ *    that happened: any later normal assistant turn or tool result means the
+ *    run went on, so a later failure is not a limit.
+ */
+export function createLimitTracker() {
+	let pending = null;
+	let toolCalls = 0;
 	return {
-		limit_hit: true,
-		limit_type: seenLimit?.type ?? null,
-		resets_at: seenLimit?.resetsAt ?? null,
+		observe(msg) {
+			if (!msg) return;
+			const ev = limitFromEvent(msg);
+			if (ev) {
+				pending = ev;
+				return;
+			}
+			if (msg.type === "assistant") {
+				const content = msg.message?.content;
+				if (Array.isArray(content)) {
+					for (const block of content) if (block?.type === "tool_use") toolCalls++;
+				}
+				// The CLI's synthetic "You've hit your limit" turn carries an
+				// error; only a normal turn means the run continued.
+				if (!msg.error) pending = null;
+			} else if (msg.type === "user") {
+				pending = null;
+			}
+		},
+		get toolCalls() {
+			return toolCalls;
+		},
+		// Fields for the result JSON when the run's final error is the limit, else null.
+		outcome(isError, finalText) {
+			if (!isError) return null;
+			if (!pending && !isUsageLimitText(finalText)) return null;
+			return {
+				limit_hit: true,
+				limit_type: pending?.type ?? null,
+				resets_at: pending?.resetsAt ?? null,
+			};
+		},
 	};
 }

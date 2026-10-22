@@ -17,7 +17,9 @@ import { RUN_FAILURES_FILE, pickErrorLine, recordRunOutcome } from "./run-failur
 import { bottomLineDockerEnv } from "./bottom-line";
 import {
 	ACCOUNT_COOLDOWNS_FILE,
+	accountDockerAuth,
 	loadClaudeAccounts,
+	recordFinalOutcome,
 	runWithAccountFallback,
 	type AttemptResult,
 	type ClaudeAccount,
@@ -235,19 +237,26 @@ async function spawnContainer(
 	resumeId?: string,
 	origin: DeliveryOrigin = "slack",
 ): Promise<AgentRunResult> {
-	const out = await runWithAccountFallback({
-		accounts: loadClaudeAccounts(process.env),
-		cooldownFile: ACCOUNT_COOLDOWNS_FILE,
-		model: agent.model,
-		attempt: (account) => spawnAttempt(agent, message, resumeId, origin, account),
-		log: (line) => console.log(`[${agent.name}] ${line}`),
-	});
-	if (out.limitHit) {
-		// A usage limit is not a broken agent: leave the failure streak alone.
+	let out;
+	try {
+		out = await runWithAccountFallback({
+			accounts: loadClaudeAccounts(process.env),
+			cooldownFile: ACCOUNT_COOLDOWNS_FILE,
+			model: agent.model,
+			// A continuation resumes the limited try's session on the next
+			// account instead of replaying the original request.
+			attempt: (account, cont) =>
+				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account),
+			log: (line) => console.log(`[${agent.name}] ${line}`),
+		});
+	} catch (err) {
+		recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${String(err)}`);
+		throw err;
+	}
+	// Feeds the watcher's "N failed runs in a row" alert; a usage limit is not
+	// a broken agent and leaves the streak alone.
+	if (!recordFinalOutcome(RUN_FAILURES_FILE, agent.name, out)) {
 		console.log(`[${agent.name}] Run stopped on a usage limit (account ${out.account ?? "none"}); not counted as a failure`);
-	} else {
-		// Feeds the watcher's "N failed runs in a row" alert.
-		recordRunOutcome(RUN_FAILURES_FILE, agent.name, out.isError, out.isError ? pickErrorLine(out.result, out.stderr || "") : "");
 	}
 	return {
 		sessionId: out.sessionId,
@@ -259,7 +268,7 @@ async function spawnContainer(
 	};
 }
 
-function spawnAttempt(
+export function spawnAttempt(
 	agent: AgentConfig,
 	message: string,
 	resumeId: string | undefined,
@@ -337,9 +346,9 @@ function spawnAttempt(
 			dockerArgs.push("-e", `DELIVERY_INSTRUCTION=${deliveryText}`);
 		}
 
-		if (account) {
-			dockerArgs.push("-e", `${account.envVar}=${account.value}`);
-		}
+		// Token by name only; its value rides in the docker client's env.
+		const auth = accountDockerAuth(account);
+		dockerArgs.push(...auth.args);
 
 		if (resumeId) {
 			dockerArgs.push("-e", `RESUME_SESSION_ID=${resumeId}`);
@@ -440,6 +449,7 @@ function spawnAttempt(
 
 		const child = spawn("docker", dockerArgs, {
 			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, ...auth.env },
 		});
 
 		let stdout = "";
@@ -468,12 +478,15 @@ function spawnAttempt(
 			let result = "";
 			let model = "";
 			let limit: AttemptResult["limit"] = null;
+			let toolCalls: number | undefined;
+			let reportedSessionId = "";
 			try {
 				const lines = stdout.trim().split("\n");
 				for (const line of lines) {
 					try {
 						const parsed = JSON.parse(line);
-						if (parsed.session_id) sessionId = parsed.session_id;
+						if (parsed.session_id) sessionId = reportedSessionId = parsed.session_id;
+						if (typeof parsed.tool_calls === "number") toolCalls = parsed.tool_calls;
 						if (parsed.is_error) isError = true;
 						if (typeof parsed.result === "string") result = parsed.result;
 						if (typeof parsed.model === "string" && parsed.model) model = parsed.model;
@@ -492,12 +505,20 @@ function spawnAttempt(
 				`model=${model || "unknown"} account=${account ? account.label : "host-credentials"}` +
 				`${limit ? " (USAGE LIMIT)" : isError ? " (ERROR)" : ""}`,
 			);
-			resolve({ sessionId, isError, result, model: model || undefined, limit: isError ? limit : null, stderr });
+			resolve({
+				sessionId,
+				isError,
+				result,
+				model: model || undefined,
+				limit: isError ? limit : null,
+				stderr,
+				toolCalls,
+				reportedSessionId: reportedSessionId || undefined,
+			});
 		});
 
 		child.on("error", (err) => {
 			console.error(`[${agent.name}] Failed to spawn container:`, err);
-			recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${String(err)}`);
 			reject(err);
 		});
 	});

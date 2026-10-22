@@ -9,6 +9,7 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "fs";
+import { recordRunOutcome } from "./run-failures";
 import { tmpdir } from "os";
 import path from "path";
 import {
@@ -21,7 +22,12 @@ import {
 	DEFAULT_COOLDOWN_MS,
 	FILE_TOKEN_MIN_REMAINING_MS,
 	runWithAccountFallback,
+	accountDockerAuth,
+	recordFinalOutcome,
+	planLimitRetry,
+	CONTINUE_AFTER_LIMIT_MESSAGE,
 	type ClaudeAccount,
+	type Continuation,
 } from "./claude-accounts";
 
 const NOW = Date.parse("2026-10-22T12:00:00Z");
@@ -159,21 +165,61 @@ describe("entrypoint limit detection (docker/limit-detect.mjs)", () => {
 		assert.equal(limitFromEvent({ type: "result" }), null);
 	});
 
-	test("the CLI's limit text is recognized; other errors are not", async () => {
+	test("the CLI's limit text is recognized; other errors and quoted text are not", async () => {
 		const { isUsageLimitText } = await mod();
 		assert.ok(isUsageLimitText("Error: Claude Code returned an error result: You've hit your limit · resets 4am (Asia/Jerusalem)"));
+		assert.ok(isUsageLimitText("You've hit your limit · resets 4am"));
 		assert.ok(isUsageLimitText("Claude AI usage limit reached"));
 		assert.ok(!isUsageLimitText("Could not process image"));
 		assert.ok(!isUsageLimitText(""));
+		assert.ok(!isUsageLimitText("Error: Bash failed: API usage limit exceeded for key"), "a tool's own 'usage limit' is not ours");
+		assert.ok(!isUsageLimitText("Supplier says: You've hit your limit on this card"), "quoted text mid-message is not ours");
 	});
 
-	test("limitOutcome: only an errored run with a limit signal is a limit hit", async () => {
-		const { limitOutcome } = await mod();
-		const seen = { type: "five_hour", resetsAt: 123000 };
-		assert.deepEqual(limitOutcome(true, "boom", seen), { limit_hit: true, limit_type: "five_hour", resets_at: 123000 });
-		assert.deepEqual(limitOutcome(true, "You've hit your limit", null), { limit_hit: true, limit_type: null, resets_at: null });
-		assert.equal(limitOutcome(false, "You've hit your limit", seen), null, "a run that succeeded is not a limit hit");
-		assert.equal(limitOutcome(true, "boom", null), null);
+	const rejected = { type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "five_hour", resetsAt: 123 } };
+	const turn = (blocks: any[], extra: any = {}) => ({ type: "assistant", message: { content: blocks }, ...extra });
+	const toolUse = { type: "tool_use", id: "t1", name: "Bash", input: {} };
+
+	test("tracker: rejected event that ends the run is a limit", async () => {
+		const t = (await mod()).createLimitTracker();
+		t.observe(turn([toolUse]));
+		t.observe({ type: "user", message: { content: [] } });
+		t.observe(rejected);
+		t.observe(turn([{ type: "text", text: "You've hit your limit" }], { error: "rate_limit" }));
+		assert.deepEqual(t.outcome(true, ""), { limit_hit: true, limit_type: "five_hour", resets_at: 123000 });
+		assert.equal(t.toolCalls, 1);
+	});
+
+	test("tracker: a limit signal, then the run goes on and fails on max turns, is a counted failure", async () => {
+		const t = (await mod()).createLimitTracker();
+		t.observe(rejected);
+		t.observe(turn([toolUse]));
+		t.observe({ type: "user", message: { content: [{ type: "tool_result", content: "ok" }] } });
+		assert.equal(t.outcome(true, ""), null, "error_max_turns after a cleared limit is not a limit");
+		assert.equal(t.outcome(true, "Error: Claude Code returned an error result: Reached maximum number of turns (5)"), null);
+	});
+
+	test("tracker: tool output mentioning 'usage limit' is not a limit", async () => {
+		const t = (await mod()).createLimitTracker();
+		t.observe(turn([toolUse]));
+		t.observe({ type: "user", message: { content: [{ type: "tool_result", content: "429: usage limit exceeded" }] } });
+		assert.equal(t.outcome(true, "Tool failed: 429: usage limit exceeded"), null);
+	});
+
+	test("tracker: terminal limit text without an event is a limit; a successful run never is", async () => {
+		const t = (await mod()).createLimitTracker();
+		assert.deepEqual(t.outcome(true, "You've hit your limit · resets 4am"), { limit_hit: true, limit_type: null, resets_at: null });
+		t.observe(rejected);
+		assert.equal(t.outcome(false, "done"), null);
+		assert.equal(t.toolCalls, 0);
+	});
+
+	test("entrypoint reports the session id and tool calls on the limit exit path", () => {
+		const src = readFileSync(path.join(repoRoot, "docker", "entrypoint.mjs"), "utf-8");
+		const limitExit = src.slice(src.indexOf("const limitFields = tracker.outcome(true, msg);"));
+		assert.match(limitExit.slice(0, 600), /session_id: sessionId,/);
+		assert.match(limitExit.slice(0, 600), /tool_calls: tracker\.toolCalls/);
+		assert.doesNotMatch(src, /session_id: ""/);
 	});
 
 	test("the image ships limit-detect.mjs next to the entrypoint", () => {
@@ -185,20 +231,53 @@ describe("runWithAccountFallback", () => {
 	const A: ClaudeAccount = { label: "A", envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "a" };
 	const B: ClaudeAccount = { label: "B", envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "b" };
 	const ok = { sessionId: "s", isError: false, result: "done" };
-	const limited = { sessionId: "s", isError: true, result: "You've hit your limit", limit: { type: "seven_day", resetsAt: NOW + 3600_000 } };
+	const limited = { sessionId: "s", isError: true, result: "You've hit your limit", toolCalls: 0, limit: { type: "seven_day", resetsAt: NOW + 3600_000 } };
 	const broken = { sessionId: "s", isError: true, result: "boom" };
 
 	async function run(outcomes: Record<string, any>, accounts = [A, B], file = path.join(tmpDir(), "c.json")) {
 		const tried: string[] = [];
+		const conts: (Continuation | null)[] = [];
 		const out = await runWithAccountFallback({
 			accounts,
 			cooldownFile: file,
 			model: "opus",
 			now: () => NOW,
-			attempt: async (acct) => { tried.push(acct ? acct.label : "none"); return outcomes[acct ? acct.label : "none"]; },
+			attempt: async (acct, cont) => {
+				tried.push(acct ? acct.label : "none");
+				conts.push(cont);
+				return outcomes[acct ? acct.label : "none"];
+			},
 		});
-		return { out, tried, file };
+		return { out, tried, conts, file };
 	}
+
+	test("limit with no tool calls yet: retry on B from the start (original request)", async () => {
+		const { tried, conts } = await run({ A: limited, B: ok });
+		assert.deepEqual(tried, ["A", "B"]);
+		assert.deepEqual(conts, [null, null]);
+	});
+
+	test("limit after tool calls: resume A's session on B with a do-not-repeat instruction", async () => {
+		const midway = { ...limited, toolCalls: 3, reportedSessionId: "sess-A" };
+		const { out, tried, conts } = await run({ A: midway, B: ok });
+		assert.deepEqual(tried, ["A", "B"]);
+		assert.equal(conts[1]?.sessionId, "sess-A");
+		assert.equal(conts[1]?.message, CONTINUE_AFTER_LIMIT_MESSAGE);
+		assert.match(CONTINUE_AFTER_LIMIT_MESSAGE, /Do NOT repeat/);
+		assert.equal(out.isError, false);
+	});
+
+	test("limit after tool calls with no session to resume: no retry, reported as a limit", async () => {
+		const { out, tried } = await run({ A: { ...limited, toolCalls: 2 }, B: ok });
+		assert.deepEqual(tried, ["A"]);
+		assert.ok(out.limitHit);
+	});
+
+	test("unknown tool-call count is treated as 'something may have happened': resume, never restart", async () => {
+		const { toolCalls, ...noCount } = limited;
+		const { conts } = await run({ A: { ...noCount, reportedSessionId: "sess-A" }, B: ok });
+		assert.equal(conts[1]?.sessionId, "sess-A");
+	});
 
 	test("limit on A: cooldown recorded, one retry on B, which succeeds", async () => {
 		const { out, tried, file } = await run({ A: limited, B: ok });
@@ -236,5 +315,107 @@ describe("runWithAccountFallback", () => {
 		const { out, tried } = await run({ none: ok }, []);
 		assert.deepEqual(tried, ["none"]);
 		assert.equal(out.account, null);
+	});
+});
+
+describe("token never on a command line", () => {
+	const B: ClaudeAccount = { label: "B", envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "sk-test-token-B-123" };
+
+	test("accountDockerAuth passes the name in args and the value in env", () => {
+		const auth = accountDockerAuth(B);
+		assert.deepEqual(auth.args, ["-e", "CLAUDE_CODE_OAUTH_TOKEN"]);
+		assert.deepEqual(auth.env, { CLAUDE_CODE_OAUTH_TOKEN: "sk-test-token-B-123" });
+		assert.deepEqual(accountDockerAuth(null), { args: [], env: {} });
+	});
+
+	function withPath<T>(dir: string, fn: () => Promise<T>): Promise<T> {
+		const saved = process.env.PATH;
+		process.env.PATH = dir;
+		return fn().finally(() => { process.env.PATH = saved; });
+	}
+
+	function captureConsole() {
+		const lines: string[] = [];
+		const orig = { log: console.log, error: console.error, write: process.stderr.write.bind(process.stderr) };
+		console.log = (...a: any[]) => { lines.push(a.map((x) => (typeof x === "string" ? x : require("util").inspect(x))).join(" ")); };
+		console.error = console.log;
+		(process.stderr as any).write = (chunk: any) => { lines.push(String(chunk)); return true; };
+		return { lines, restore: () => { console.log = orig.log; console.error = orig.error; (process.stderr as any).write = orig.write; } };
+	}
+
+	const agent: any = { name: "tokcheck", dir: "", maxTurns: 1, allowedTools: ["Read"], model: "opus" };
+
+	test("a launch failure (no docker binary) mentions neither token A nor B", async () => {
+		const { spawnAttempt } = require("./runner");
+		const dir = tmpDir();
+		agent.dir = dir;
+		writeFileSync(path.join(dir, "PROMPT.md"), "# t");
+		const A: ClaudeAccount = { label: "A", envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "sk-test-token-A-999" };
+		for (const acct of [A, B]) {
+			const cap = captureConsole();
+			let err: any;
+			try {
+				await withPath(path.join(dir, "empty-bin"), () => spawnAttempt(agent, "hi", undefined, "slack", acct));
+			} catch (e) { err = e; } finally { cap.restore(); }
+			assert.ok(err, "spawn must fail without docker");
+			const everything = [String(err), JSON.stringify(err), require("util").inspect(err), ...cap.lines].join("\n");
+			assert.ok(everything.includes("ENOENT"), "the failure itself is reported");
+			assert.ok(!everything.includes(acct.value), `token ${acct.label} leaked into the launch failure`);
+		}
+	});
+
+	test("docker gets the token via env only, never in argv", async () => {
+		const { spawnAttempt } = require("./runner");
+		const dir = tmpDir();
+		agent.dir = dir;
+		writeFileSync(path.join(dir, "PROMPT.md"), "# t");
+		const bin = path.join(dir, "bin");
+		require("fs").mkdirSync(bin);
+		const out = path.join(dir, "seen.txt");
+		writeFileSync(path.join(bin, "docker"),
+			`#!/bin/sh\nprintf 'ARGS:%s\\n' "$*" > "${out}"\nprintf 'ENV:%s\\n' "$CLAUDE_CODE_OAUTH_TOKEN" >> "${out}"\n` +
+			`echo '{"session_id":"s9","is_error":false,"result":"OK","tool_calls":0}'\n`, { mode: 0o755 });
+		const cap = captureConsole();
+		let r: any;
+		try {
+			r = await withPath(`${bin}:/usr/bin:/bin`, () => spawnAttempt(agent, "hi", undefined, "slack", B));
+		} finally { cap.restore(); }
+		const seen = readFileSync(out, "utf-8");
+		assert.match(seen, /ARGS:.*-e CLAUDE_CODE_OAUTH_TOKEN /);
+		assert.ok(!seen.split("\n")[0].includes(B.value), "token in argv");
+		assert.ok(seen.includes(`ENV:${B.value}`), "token missing from docker's env");
+		assert.ok(!cap.lines.join("\n").includes(B.value), "token in listener log");
+		assert.equal(r.reportedSessionId, "s9");
+		assert.equal(r.toolCalls, 0);
+	});
+});
+
+describe("runner failure bookkeeping (recordFinalOutcome)", () => {
+	const base = { sessionId: "s", result: "", account: "A" };
+
+	test("a run that stopped on a usage limit is not counted as a failure", () => {
+		const file = path.join(tmpDir(), "run-failures.json");
+		recordRunOutcome(file, "omer", true, "earlier real failure", NOW);
+		const recorded = recordFinalOutcome(file, "omer", { ...base, isError: true, result: "You've hit your limit", limitHit: true });
+		assert.equal(recorded, false);
+		const data = JSON.parse(readFileSync(file, "utf-8"));
+		assert.equal(data.omer.count, 1, "streak neither extended nor cleared by a limit");
+		assert.equal(data.omer.lastError, "earlier real failure");
+	});
+
+	test("a non-limit error is counted; a success clears", () => {
+		const file = path.join(tmpDir(), "run-failures.json");
+		assert.equal(recordFinalOutcome(file, "omer", { ...base, isError: true, result: "boom", limitHit: false }), true);
+		assert.equal(JSON.parse(readFileSync(file, "utf-8")).omer.count, 1);
+		recordFinalOutcome(file, "omer", { ...base, isError: false, result: "ok", limitHit: false });
+		assert.equal(JSON.parse(readFileSync(file, "utf-8")).omer, undefined);
+	});
+});
+
+describe("planLimitRetry", () => {
+	test("fresh only with zero tool calls", () => {
+		assert.deepEqual(planLimitRetry({ sessionId: "x", isError: true, result: "", toolCalls: 0 }), { kind: "fresh" });
+		assert.deepEqual(planLimitRetry({ sessionId: "x", isError: true, result: "", toolCalls: 1, reportedSessionId: "x" }), { kind: "resume", sessionId: "x" });
+		assert.deepEqual(planLimitRetry({ sessionId: "session_1", isError: true, result: "", toolCalls: 1 }), { kind: "none" });
 	});
 });
