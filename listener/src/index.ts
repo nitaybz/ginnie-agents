@@ -13,7 +13,7 @@
  * No public URL needed — each app connects via WebSocket.
  */
 
-import { App } from "@slack/bolt";
+import { App, LogLevel, SocketModeReceiver } from "@slack/bolt";
 import dotenv from "dotenv";
 import path from "path";
 import { loadStore, getThread, setThread } from "./store";
@@ -24,6 +24,14 @@ import { getSenderInfo, formatSenderLine, type SenderInfo } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
+import {
+	SLACK_HEARTBEAT_DIR,
+	SLACK_HEARTBEAT_INTERVAL_MS,
+	clearSlackHeartbeat,
+	ensureSlackHeartbeat,
+	pruneSlackHeartbeats,
+	writeSlackHeartbeat,
+} from "./slack-heartbeat";
 
 // Load env from repo root. .env is the authoritative source for
 // CLAUDE_CODE_OAUTH_TOKEN, TZ, etc. — override any stale values that may
@@ -671,23 +679,44 @@ function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {
 	});
 }
 
+// ─── Slack socket heartbeat ────────────────────────────────
+// Refresh data/slack-heartbeats/<agent>.json while the agent's Socket Mode
+// connection is open. The watcher alerts when it goes stale (see
+// slack-heartbeat.ts), which is the only signal that an agent has silently
+// stopped hearing Slack.
+function startSlackHeartbeat(agentName: string, receiver: SocketModeReceiver): void {
+	const beat = () => {
+		if (receiver.client.websocket?.isActive()) writeSlackHeartbeat(SLACK_HEARTBEAT_DIR, agentName);
+	};
+	receiver.client.on("connected", beat);
+	setInterval(beat, SLACK_HEARTBEAT_INTERVAL_MS);
+}
+
 // ─── Start ─────────────────────────────────────────────────
 (async () => {
 	const started: string[] = [];
 	const skipped: string[] = [];
 
+	pruneSlackHeartbeats(SLACK_HEARTBEAT_DIR, agents.map((a) => a.name));
+
 	for (const agent of agents) {
 		if (!agent.slackBotToken || !agent.slackAppToken) {
 			skipped.push(`${agent.name} (missing slack tokens)`);
+			clearSlackHeartbeat(SLACK_HEARTBEAT_DIR, agent.name);
 			continue;
 		}
+		// Explicit receiver (same settings Bolt builds for socketMode: true) so
+		// the heartbeat can see the connection state.
+		const receiver = new SocketModeReceiver({ appToken: agent.slackAppToken, logLevel: LogLevel.INFO });
 		const app = new App({
 			token: agent.slackBotToken,
-			appToken: agent.slackAppToken,
+			receiver,
 			socketMode: true,
 		});
 		wireAgentApp(agent, app);
 		apps.set(agent.name, app);
+		ensureSlackHeartbeat(SLACK_HEARTBEAT_DIR, agent.name);
+		startSlackHeartbeat(agent.name, receiver);
 		try {
 			await app.start();
 			started.push(`${agent.name} (bot: ${agent.slackBotId || "NOT SET"}, channel: ${agent.slackChannel || "NOT SET"})`);
