@@ -12,6 +12,7 @@ import { execSync } from "child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import path from "path";
 import { checkRunFailures } from "./run-failures";
+import { checkSlackHeartbeats } from "./slack-heartbeat";
 
 export type Severity = "info" | "warn" | "critical";
 
@@ -61,6 +62,11 @@ export function checkTokenAge(): CheckResult | null {
 
 // ─── Framework update available ────────────────────────────
 //
+// Off by default: a busy upstream would otherwise DM the operator on every
+// commit. Opt in with WATCHER_FRAMEWORK_UPDATES=on. The alert key is the
+// constant "framework-update" (not the target sha), so an ack holds until
+// it expires instead of being reset by the next upstream commit.
+//
 // FRAMEWORK_UPSTREAM names the ref the operator wants tracked. For fresh
 // adopters who cloned this repo directly, that's `origin/main`. For
 // fork-and-track installs (private origin, public framework on `upstream`),
@@ -74,25 +80,34 @@ export function checkTokenAge(): CheckResult | null {
 // If data/framework-version.txt is missing, we fall back to git HEAD —
 // correct for direct-clone installs whose HEAD always equals the deployed
 // framework version.
-const FRAMEWORK_UPSTREAM = process.env.FRAMEWORK_UPSTREAM || "origin/main";
+const DEFAULT_FRAMEWORK_UPSTREAM = process.env.FRAMEWORK_UPSTREAM || "origin/main";
 const FRAMEWORK_VERSION_FILE = "data/framework-version.txt";
 
-function deployedSha(): string {
+export function frameworkUpdatesEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+	return (env.WATCHER_FRAMEWORK_UPDATES || "").trim().toLowerCase() === "on";
+}
+
+function deployedSha(repo: string): string {
 	try {
-		const f = path.join(REPO, FRAMEWORK_VERSION_FILE);
+		const f = path.join(repo, FRAMEWORK_VERSION_FILE);
 		if (existsSync(f)) {
 			const s = readFileSync(f, "utf-8").trim();
 			if (/^[0-9a-f]{7,40}$/.test(s)) return s;
 		}
 	} catch { /* fall through */ }
 	try {
-		return execSync("git rev-parse HEAD", { cwd: REPO, encoding: "utf-8" }).trim();
+		return execSync("git rev-parse HEAD", { cwd: repo, encoding: "utf-8" }).trim();
 	} catch {
 		return "";
 	}
 }
 
-export function checkFrameworkUpdate(): CheckResult | null {
+export function checkFrameworkUpdate(
+	opts: { repo?: string; upstream?: string; env?: NodeJS.ProcessEnv } = {},
+): CheckResult | null {
+	if (!frameworkUpdatesEnabled(opts.env ?? process.env)) return null;
+	const REPO = opts.repo ?? path.resolve(__dirname, "..", "..");
+	const FRAMEWORK_UPSTREAM = opts.upstream ?? DEFAULT_FRAMEWORK_UPSTREAM;
 	const slash = FRAMEWORK_UPSTREAM.indexOf("/");
 	if (slash <= 0) return null;
 	const remote = FRAMEWORK_UPSTREAM.slice(0, slash);
@@ -101,7 +116,7 @@ export function checkFrameworkUpdate(): CheckResult | null {
 	} catch {
 		return null; // no such remote, fetch failed — silent (not actionable)
 	}
-	const base = deployedSha();
+	const base = deployedSha(REPO);
 	if (!base) return null;
 	let targetSha = "";
 	try {
@@ -140,7 +155,7 @@ export function checkFrameworkUpdate(): CheckResult | null {
 	}
 	if (ahead === 0) return null;
 	return {
-		key: `framework-update:${targetSha.slice(0, 7)}`,
+		key: "framework-update",
 		severity: "info",
 		message:
 			`🔄 *${ahead} framework update${ahead === 1 ? "" : "s"} available* on ${FRAMEWORK_UPSTREAM}:\n` +
@@ -148,7 +163,7 @@ export function checkFrameworkUpdate(): CheckResult | null {
 		actions: [
 			{ type: "update_framework", label: "Update now", style: "primary", value: targetSha },
 			{ type: "ack_24h", label: "Remind tomorrow" },
-			{ type: "ack_7d", label: "Skip this version", value: targetSha },
+			{ type: "ack_7d", label: "Remind in 7 days" },
 		],
 		context: { target_sha: targetSha, ahead: String(ahead) },
 	};
@@ -343,6 +358,7 @@ export function runAllChecks(): CheckResult[] {
 		...checkMemoryCaps(),
 		...checkSchedulerRejects(),
 		...checkRunFailures(),
+		...checkSlackHeartbeats(),
 	];
 	return results.filter((r): r is CheckResult => r !== null);
 }
