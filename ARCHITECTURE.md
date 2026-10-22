@@ -175,6 +175,8 @@ When a schedule fires, the listener spawns a fresh container with the schedule's
 
 The schema (`id`, `cron`, `message`, optional `description`/`enabled`) is auto-injected into every agent's system prompt via `framework/skills/routines/SKILL.md`, so an agent editing its own `schedules.json` writes the correct shape regardless of how customized its `PROMPT.md` is. Rejected entries (missing required field, invalid cron, parse error) are written to `data/scheduler-rejects.json` with a per-entry reason; the Watcher reads this file on its periodic check and DMs the operator one alert per affected agent (24h cooldown). Silent drops can't happen — the operator finds out within an hour at most. On a clean reload the agent's record is removed.
 
+When `BOTTOM_LINE_CHANNEL` is set in `.env`, the runner forwards it into every container and the entrypoint also injects `framework/skills/bottom-line/SKILL.md` (channel filled in): a routine with a material finding posts one 2-4 line summary there, details in a thread.
+
 ## Voice transcription
 
 Audio attachments and Slack voice memos are transcribed locally by `whisper.cpp` (`listener/src/transcribe.ts`) before the agent runs. The pipeline:

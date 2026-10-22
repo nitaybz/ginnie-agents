@@ -28,6 +28,7 @@
  */
 
 import { createRequire } from "module";
+import { bottomLineSkill } from "./prompt-skills.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -67,6 +68,9 @@ if (!message) {
 //   4. /workspace/.framework/skills/           — framework-shipped runtime skills
 //      memory-curation/SKILL.md                  (canonical memory model)
 //      routines/SKILL.md                         (canonical schedules.json schema)
+//      bottom-line/SKILL.md                      (routine summary post; only when
+//                                                BOTTOM_LINE_CHANNEL is set, with the
+//                                                channel filled in)
 //   5. /workspace/PROMPT.md                    — agent-specific role & behaviors
 //   6. DELIVERY_INSTRUCTION env var (if set)   — how to deliver THIS turn's answer;
 //                                                sits right after PROMPT.md so it
@@ -148,6 +152,7 @@ const localKnownUsersPath = "/workspace/known-users.json";
 const soulPath = "/workspace/SOUL.md";
 const memorySkillPath = "/workspace/.framework/skills/memory-curation/SKILL.md";
 const routinesSkillPath = "/workspace/.framework/skills/routines/SKILL.md";
+const bottomLineSkillPath = "/workspace/.framework/skills/bottom-line/SKILL.md";
 const promptPath = "/workspace/PROMPT.md";
 const rulesPath = "/workspace/memory/rules.md";
 const playbookPath = "/workspace/memory/playbook.md";
@@ -173,6 +178,11 @@ if (existsSync(soulPath)) {
 
 if (existsSync(memorySkillPath)) parts.push(readFileSync(memorySkillPath, "utf-8"));
 if (existsSync(routinesSkillPath)) parts.push(readFileSync(routinesSkillPath, "utf-8"));
+const bottomLine = bottomLineSkill(
+	existsSync(bottomLineSkillPath) ? readFileSync(bottomLineSkillPath, "utf-8") : null,
+	process.env.BOTTOM_LINE_CHANNEL,
+);
+if (bottomLine) parts.push(bottomLine);
 if (existsSync(promptPath)) parts.push(readFileSync(promptPath, "utf-8"));
 
 // Delivery instruction — MUST come after PROMPT.md so it overrides rather

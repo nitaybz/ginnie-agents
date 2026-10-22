@@ -14,6 +14,7 @@ import { readdirSync, readFileSync, existsSync, mkdirSync } from "fs";
 import path from "path";
 import { deliveryInstruction, type DeliveryOrigin } from "./studio-delivery";
 import { RUN_FAILURES_FILE, pickErrorLine, recordRunOutcome } from "./run-failures";
+import { bottomLineDockerEnv } from "./bottom-line";
 
 const AGENTS_DIR = path.join(__dirname, "..", "..", "agents");
 const DOCKER_IMAGE = "ginnie-agent";
@@ -299,6 +300,9 @@ function spawnContainer(
 		if (agent.model) {
 			dockerArgs.push("-e", `AGENT_MODEL=${agent.model}`);
 		}
+
+		// Bottom-line channel (framework/skills/bottom-line). Off when unset.
+		dockerArgs.push(...bottomLineDockerEnv(process.env));
 
 		// Mount agent's .claude directory (session persistence, settings).
 		// Only overlay host credentials.json when neither auth env var is set —

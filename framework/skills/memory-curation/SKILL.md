@@ -11,7 +11,7 @@ Your rules and playbook are **already in your system prompt** (injected by the e
 
 | File | Loaded | Contents | Writer |
 |------|--------|----------|--------|
-| `./memory/rules.md` (≤200 lines, hard cap) | **Always** | User-stated rules | Agent edits in place, immediately, on first hearing |
+| `./memory/rules.md` (aim ≤200 lines; never cut to fit) | **Always** | User-stated rules | Agent edits in place, immediately, on first hearing |
 | `./memory/playbook.md` (≤300 lines, hard cap) | **Always** | Settled patterns | Nightly consolidation cron only |
 | `./memory/episodes/YYYY-Qn.md` | **Lazy** — grep on demand | Raw journal | Agent appends during sessions |
 
@@ -22,6 +22,14 @@ Edit `./memory/rules.md` immediately. One line. Edit-in-place — if a similar r
 
 Good: `- All reports in English only. (operator, permanent.)`
 Bad: `- 2026-04-19 11:00: operator said English today ...`
+
+**Then confirm in the same thread**, right after the edit, with the exact line you wrote:
+`נרשם: <the line>` (the line as it now stands in `rules.md`). One reply, nothing else in it. If you
+could not write the file, say so instead; never confirm a rule you did not save.
+
+**Never delete a rule.** A rule leaves `rules.md` only when the user explicitly asks to drop it.
+A newer rule that contradicts an older one amends that line (newer wins, keep the old *why* if it
+still applies); it does not remove it silently. Consolidation may merge rules, never delete one.
 
 **When something happens during a session** (scan result, action, observation, follow-up):
 Append to the current quarter's episode file.
@@ -54,10 +62,10 @@ grep -n -B1 -A4 'daniel-goldberg' ./memory/episodes/2026-Q2.md | head -60
 
 ## Hard limits
 
-- `rules.md` > 200 lines → git commit-msg hook rejects.
+- `rules.md` over 200 lines: keep every rule. Consolidation merges where it can; if the file is still over, leave it and flag it to the operator. Never trim a rule to fit.
 - `playbook.md` > 300 lines → rejected.
 - `episodes/*.md` shrinking → rejected unless commit message starts with `memory-consolidate:`.
 
 ## Consolidation (nightly cron only)
 
-If you ARE the nightly `memory-consolidate` cron session, the full consolidation procedure lives at `/workspace/.shared/skills/memory-curation/consolidation-routine.md`. `cat` that file and follow it. Live sessions do not need it.
+If you ARE the nightly `memory-consolidate` cron session, the full consolidation procedure lives at `/workspace/.framework/skills/memory-curation/consolidation-routine.md`. `cat` that file and follow it. Live sessions do not need it.
