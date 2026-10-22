@@ -11,7 +11,7 @@ Your rules and playbook are **already in your system prompt** (injected by the e
 
 | File | Loaded | Contents | Writer |
 |------|--------|----------|--------|
-| `./memory/rules.md` (≤200 lines, hard cap) | **Always** | User-stated rules | Agent edits in place, immediately, on first hearing |
+| `./memory/rules.md` (aim ≤200 lines; never cut to fit) | **Always** | User-stated rules | Agent edits in place, immediately, on first hearing |
 | `./memory/playbook.md` (≤300 lines, hard cap) | **Always** | Settled patterns | Nightly consolidation cron only |
 | `./memory/episodes/YYYY-Qn.md` | **Lazy** — grep on demand | Raw journal | Agent appends during sessions |
 
@@ -62,7 +62,7 @@ grep -n -B1 -A4 'daniel-goldberg' ./memory/episodes/2026-Q2.md | head -60
 
 ## Hard limits
 
-- `rules.md` > 200 lines → git commit-msg hook rejects.
+- `rules.md` over 200 lines: keep every rule. Consolidation merges where it can; if the file is still over, leave it and flag it to the operator. Never trim a rule to fit.
 - `playbook.md` > 300 lines → rejected.
 - `episodes/*.md` shrinking → rejected unless commit message starts with `memory-consolidate:`.
 

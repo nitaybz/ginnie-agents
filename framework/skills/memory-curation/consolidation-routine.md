@@ -56,7 +56,8 @@ If `rules.md` is **over 150 lines** (approaching the 200 cap):
 **Never delete a rule.** Every instruction in a rule line before this run must still be
 present after it, either word for word or inside a merged line. If you are not sure a merged
 line fully carries an old one, keep the old line. If the file still exceeds the cap after
-merging, leave it over the cap and say so in the commit message; do not cut rules to fit.
+merging, leave it over the cap and flag it to the operator: say so in the commit message and in
+this run's final output, and add an episode entry tagged `#rules-over-cap`. Do not cut rules to fit.
 
 ### Phase 4 — Quarterly rotation
 
@@ -67,15 +68,21 @@ If **today is the first day of a new quarter** (Jan 1 / Apr 1 / Jul 1 / Oct 1):
 
 ### Phase 5 — Verify rules survived, then commit
 
-First list every rule line that is no longer present word for word:
+First run the survival check against the Phase 0 snapshot:
 
 ```bash
-grep -vxF -f ./memory/rules.md /tmp/rules.before | grep -v '^\s*$'
+bash /workspace/.framework/skills/memory-curation/check-rules-survived.sh /tmp/rules.before ./memory/rules.md
 ```
 
-For each line printed, find the merged line that now carries it. If none does, put the original
-line back. Only commit when every printed line is accounted for, and name the merges in the
-commit message (`merged: "<old>" into "<new>"`).
+- **Exit code 0**: every prior rule line is present. Continue.
+- **Exit code 1**: it lists lines no longer present word for word. For each, find the merged line
+  that now carries it; if none does, put the original line back and run the check again. Commit
+  only when every listed line is accounted for, and name each merge in the commit message
+  (`merged: "<old>" into "<new>"`).
+- **Exit code 2**: the check could not run (rules.md missing or empty, snapshot missing, grep
+  error). Fail closed: abort, restore with `cp /tmp/rules.before ./memory/rules.md`, commit
+  nothing, add an episode entry tagged `#consolidation-aborted` with the check output, and put
+  the same output in this run's final message so the operator sees it.
 
 If `./memory` is not a git repository (`git -C ./memory rev-parse` fails), skip the commit; the
 operator tracks memory elsewhere. The verification above still applies.
