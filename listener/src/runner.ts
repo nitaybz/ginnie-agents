@@ -16,6 +16,7 @@ import { deliveryInstruction, type DeliveryOrigin } from "./studio-delivery";
 import { RUN_FAILURES_FILE, pickErrorLine, recordRunOutcome } from "./run-failures";
 import { bottomLineDockerEnv } from "./bottom-line";
 import { parseWhatsAppConfig, whatsappDockerArgs, type WhatsAppConfig } from "./whatsapp-trigger";
+import { parseExtraMounts, extraMountDockerArgs, type ExtraMount } from "./extra-mounts";
 import {
 	ACCOUNT_COOLDOWNS_FILE,
 	accountDockerAuth,
@@ -60,6 +61,9 @@ export interface AgentConfig {
 	// credentials.json "whatsapp_token"). See whatsapp-trigger.ts.
 	whatsapp?: WhatsAppConfig;
 	whatsappToken?: string;
+	// Read-only host paths mounted under /workspace/mounts (config.json
+	// "extra_mounts"). See extra-mounts.ts.
+	extraMounts?: ExtraMount[];
 }
 
 interface AgentManifest {
@@ -73,6 +77,7 @@ interface AgentManifest {
 	model?: string;
 	button_ttl_hours?: number;
 	whatsapp?: unknown;
+	extra_mounts?: unknown;
 }
 
 // How long an interactive (actions) block stays live before the listener's
@@ -186,6 +191,7 @@ export function loadAgents(): AgentConfig[] {
 				: DEFAULT_BUTTON_TTL_HOURS,
 			whatsapp: parseWhatsAppConfig(manifest.whatsapp),
 			whatsappToken,
+			extraMounts: parseExtraMounts(manifest.extra_mounts, (line) => console.warn(`[${entry.name}] ${line}`)),
 		});
 	}
 
@@ -455,6 +461,9 @@ export function spawnAttempt(
 		if (existsSync(frameworkSkillsDir)) {
 			dockerArgs.push("-v", `${frameworkSkillsDir}:/workspace/.framework/skills:ro`);
 		}
+
+		// Read-only extra mounts from config.json (under /workspace/mounts).
+		dockerArgs.push(...extraMountDockerArgs(agent.name, agent.extraMounts ?? [], existsSync, (line) => console.warn(`[${agent.name}] ${line}`)));
 
 		// Docker image
 		dockerArgs.push(DOCKER_IMAGE);
