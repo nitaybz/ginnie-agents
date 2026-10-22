@@ -18,8 +18,10 @@
  * The host path is then checked against the real filesystem (at startup and
  * again on every spawn): it must not be a symlink (realpath must equal it)
  * and must not be, sit inside, or contain a sensitive location (docker
- * socket, /etc, /proc, /sys, /dev, /run, /root, ~/.ssh, ~/.config/gh, the
- * framework .env, another agent's folder). A host_path that does not exist
+ * socket, /var/lib/docker, /etc, /proc, /sys, /dev, /run, /root, ~/.ssh,
+ * ~/.claude, ~/.docker, ~/.config/gh, ~/.config/gcloud, the framework .env,
+ * another agent's folder). A single file may be mounted on its own, so an
+ * agent can see one file of a folder without its siblings. A host_path that does not exist
  * is skipped with one log line per agent and path; the agent still runs.
  */
 
@@ -95,9 +97,12 @@ export function hostPathProblem(agentName: string, hostPath: string, host: HostE
 	}
 	if (real !== hostPath) return "is or goes through a symlink";
 	const sensitive = [
-		"/etc", "/proc", "/sys", "/dev", "/run", "/var/run", "/root", "/boot",
+		"/etc", "/proc", "/sys", "/dev", "/run", "/var/run", "/var/lib/docker", "/root", "/boot",
 		path.posix.join(host.home, ".ssh"),
+		path.posix.join(host.home, ".claude"),
+		path.posix.join(host.home, ".docker"),
 		path.posix.join(host.home, ".config", "gh"),
+		path.posix.join(host.home, ".config", "gcloud"),
 		path.posix.join(host.frameworkRoot, ".env"),
 	];
 	for (const root of sensitive) {

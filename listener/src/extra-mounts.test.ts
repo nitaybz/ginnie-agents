@@ -155,6 +155,22 @@ describe("hostPathProblem", () => {
 		}
 	});
 
+	test("docker, gcloud and claude credential locations are rejected, one by one", () => {
+		for (const p of [
+			"/home/u/.claude", "/home/u/.claude/.credentials.json",
+			"/home/u/.config/gcloud", "/home/u/.config/gcloud/application_default_credentials.json",
+			"/home/u/.docker", "/home/u/.docker/config.json",
+			"/var/lib/docker", "/var/lib/docker/volumes/x",
+			"/var/lib", "/var",
+		]) {
+			const r = hostPathProblem("agentA", p, self(p));
+			assert.ok(r && r !== "missing" && /protected location/.test(r), `${p} should be rejected, got ${String(r)}`);
+		}
+		// lookalike siblings are not caught by prefix
+		assert.equal(hostPathProblem("agentA", "/home/u/.claude-notes", self("/home/u/.claude-notes")), null);
+		assert.equal(hostPathProblem("agentA", "/var/lib/dockerish", self("/var/lib/dockerish")), null);
+	});
+
 	test("the agent's own folder is not 'another agent's folder'", () => {
 		assert.equal(hostPathProblem("agentA", "/opt/fw/agents/agentA/exports", self("/opt/fw/agents/agentA/exports")), null);
 		// prefix lookalike is still another agent
@@ -207,6 +223,17 @@ describe("extraMountDockerArgs", () => {
 		const args = extraMountDockerArgs("agentE", mounts.slice(0, 1), fakeHost({ "/srv/data/reports": "/home/u/.ssh" }), c.log);
 		assert.deepEqual(args, []);
 		assert.equal(c.lines.length, 1);
+	});
+
+	test("a single file can be mounted on its own (sibling files stay hidden)", () => {
+		const parsed = parseExtraMounts([{ host_path: "/srv/finance/data/latest.json", container_path: "/workspace/mounts/finance/latest.json", read_only: true }], () => {});
+		assert.deepEqual(parsed, [{ hostPath: "/srv/finance/data/latest.json", containerPath: "/workspace/mounts/finance/latest.json" }]);
+		const c = collect();
+		const args = extraMountDockerArgs("agentF", parsed, fakeHost({ "/srv/finance/data/latest.json": "/srv/finance/data/latest.json" }), c.log);
+		assert.deepEqual(args, [
+			"--mount", "type=bind,source=/srv/finance/data/latest.json,target=/workspace/mounts/finance/latest.json,readonly",
+		]);
+		assert.equal(c.lines.length, 0);
 	});
 
 	test("no mounts: no args", () => {
