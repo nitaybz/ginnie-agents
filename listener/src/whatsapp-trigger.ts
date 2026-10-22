@@ -11,7 +11,7 @@
  *     "account_id": "office",                 // which WhatsApp account the agent uses
  *     "watch_chats": ["<chat jid>"],          // chats whose new messages wake the agent
  *     "poll_seconds": 10,                     // optional
- *     "debounce_seconds": 15,                 // optional: a burst becomes one run
+ *     "debounce_seconds": 4,                  // optional: a burst becomes one run
  *     "context_messages": 15                  // optional: recent history shown with the wake
  *   }
  *
@@ -20,12 +20,18 @@
  * listener only reads here; any reply is the agent's own decision, sent by
  * the agent through the same API during its run.
  *
+ * Whether and how to answer is the agent's own decision (its PROMPT, rules
+ * and skills); the framework only delivers the messages.
+ *
  * Guarantees:
  *  - never wakes on the account's own messages (is_from_me) or reactions;
  *  - the first poll of a chat only records where it stands (no replay of history);
- *  - each message is handed to a run at most once (the cursor advances before
- *    the run, persisted in data/whatsapp-cursors.json), so a crash can lose a
- *    wake but never repeats one;
+ *  - each message is handed to a run at most once: the cursor advances before
+ *    the run (data/whatsapp-cursors.json) and messages waiting for their run
+ *    are kept in data/whatsapp-pending.json, so a listener restart delivers
+ *    them later; a run that already started is never replayed;
+ *  - more new messages than one page (50) since the last check: one wake that
+ *    says older messages were skipped (never silent);
  *  - one run per chat at a time; messages arriving in the debounce window or
  *    during a run are batched into the next run;
  *  - senders are resolved by phone from known-users ("whatsapp" field); an
@@ -37,6 +43,8 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "
 import path from "path";
 
 export const WHATSAPP_CURSORS_FILE = path.join(__dirname, "..", "..", "data", "whatsapp-cursors.json");
+export const WHATSAPP_FETCH_LIMIT = 50;
+const CHAT_ID = /^[0-9-]+@(g\.us|s\.whatsapp\.net|lid)$/;
 
 export interface WhatsAppConfig {
 	apiUrl: string;
@@ -94,7 +102,7 @@ export function parseWhatsAppConfig(raw: unknown): WhatsAppConfig | undefined {
 	if (!/^https?:\/\/[^\s/]+$/.test(apiUrl) || !/^[a-z][a-z0-9_-]{0,31}$/.test(accountId)) return undefined;
 	const container = typeof r.container_api_url === "string" ? r.container_api_url.trim().replace(/\/+$/, "") : "";
 	const watchChats = Array.isArray(r.watch_chats)
-		? r.watch_chats.filter((c): c is string => typeof c === "string" && /^[0-9-]+@(g\.us|s\.whatsapp\.net)$/.test(c))
+		? r.watch_chats.filter((c): c is string => typeof c === "string" && CHAT_ID.test(c))
 		: [];
 	return {
 		apiUrl,
@@ -102,7 +110,7 @@ export function parseWhatsAppConfig(raw: unknown): WhatsAppConfig | undefined {
 		accountId,
 		watchChats,
 		pollSeconds: num(r.poll_seconds, 10, 3, 300),
-		debounceSeconds: num(r.debounce_seconds, 15, 0, 120),
+		debounceSeconds: num(r.debounce_seconds, 4, 0, 120),
 		contextMessages: num(r.context_messages, 15, 0, 50),
 	};
 }
@@ -202,6 +210,8 @@ export function buildWakePrompt(opts: {
 	history: WaMessage[];
 	users: Record<string, WaKnownUser>;
 	tz?: string;
+	// More new messages arrived than one fetch returns; older ones were skipped.
+	skipped?: boolean;
 }): string {
 	const tz = opts.tz || process.env.TZ || "UTC";
 	const batchIds = new Set(opts.batch.map((b) => b.message.id));
@@ -210,7 +220,13 @@ export function buildWakePrompt(opts: {
 		.sort(byTime)
 		.slice(-opts.cfg.contextMessages);
 	const lines: string[] = [];
-	lines.push(`WhatsApp (account: ${opts.cfg.accountId}, chat: ${opts.chat}): ${opts.batch.length} new message${opts.batch.length > 1 ? "s" : ""}.`);
+	lines.push(`WhatsApp (account: ${opts.cfg.accountId}, chat: ${opts.chat}): ${opts.batch.length} new message${opts.batch.length === 1 ? "" : "s"}.`);
+	if (opts.skipped) {
+		lines.push(
+			`Note: more than ${WHATSAPP_FETCH_LIMIT} new messages arrived since the last check; older messages were skipped ` +
+			"here. Read the chat through the gateway if they may matter.",
+		);
+	}
 	if (earlier.length) {
 		lines.push("", "Recent messages in this chat, oldest first, for context. \"(You)\" = sent by this account:");
 		for (const m of earlier) {
@@ -229,8 +245,8 @@ export function buildWakePrompt(opts: {
 	});
 	lines.push(
 		"",
-		"Decide first whether this is for you (follow the WhatsApp skill and your PROMPT). If it is, answer in this " +
-		"WhatsApp chat through the gateway, quoting the message you answer. If it is not for you, send nothing.",
+		"Whether and how to answer follows your own rules (PROMPT, rules, skills). Any answer goes to this WhatsApp " +
+		"chat through the gateway (see the WhatsApp skill), never to Slack unless your rules say so.",
 	);
 	return lines.join("\n");
 }
@@ -261,6 +277,8 @@ export interface TriggerDeps {
 	cfg: WhatsAppConfig;
 	token: string;
 	cursorFile: string;
+	// Wakes waiting for their run; default: whatsapp-pending.json next to cursorFile.
+	pendingFile?: string;
 	// Whether a sender may wake this agent (unknown senders for write agents: no).
 	allowSender: (s: WaSender) => boolean;
 	knownUsers: () => Record<string, WaKnownUser>;
@@ -279,11 +297,23 @@ async function defaultFetchJson(url: string, token: string): Promise<unknown> {
 	return r.json();
 }
 
+interface WakeItem {
+	message: WaMessage;
+	sender: WaSender;
+}
+
 interface ChatQueue {
-	pending: { message: WaMessage; sender: WaSender }[];
+	pending: WakeItem[];
+	skipped: boolean;
 	history: WaMessage[];
 	timer: unknown;
 	active: boolean;
+}
+
+interface PendingEntry {
+	items: WakeItem[];
+	skipped: boolean;
+	history: WaMessage[];
 }
 
 export class WhatsAppTrigger {
@@ -293,8 +323,10 @@ export class WhatsAppTrigger {
 	private readonly fetchJson: (url: string, token: string) => Promise<unknown>;
 	private readonly setTimer: (fn: () => void, ms: number) => unknown;
 	private readonly log: (line: string) => void;
+	private readonly pendingFile: string;
 
 	constructor(private deps: TriggerDeps) {
+		this.pendingFile = deps.pendingFile || path.join(path.dirname(deps.cursorFile), "whatsapp-pending.json");
 		this.fetchJson = deps.fetchJson || defaultFetchJson;
 		this.setTimer = deps.setTimer || ((fn, ms) => setTimeout(fn, ms));
 		this.log = deps.log || ((l) => console.log(l));
@@ -312,7 +344,7 @@ export class WhatsAppTrigger {
 			let rows: WaMessage[];
 			try {
 				const url = `${cfg.apiUrl}/v1/messages?account_id=${encodeURIComponent(cfg.accountId)}` +
-					`&chat_jid=${encodeURIComponent(chat)}&limit=50`;
+					`&chat_jid=${encodeURIComponent(chat)}&limit=${WHATSAPP_FETCH_LIMIT}`;
 				const body = await this.fetchJson(url, this.deps.token);
 				if (!Array.isArray(body)) throw new Error("unexpected response");
 				rows = body as WaMessage[];
@@ -325,7 +357,14 @@ export class WhatsAppTrigger {
 				continue;
 			}
 			const all = loadCursors(this.deps.cursorFile);
-			const { fresh, cursor } = newSince(rows, all[this.key(chat)]);
+			const previous = all[this.key(chat)];
+			const { fresh, cursor } = newSince(rows, previous);
+			const valid = rows.filter((m) => m && typeof m.id === "string" && typeof m.ts === "number").length;
+			// A full page of only new messages: there may be more we never saw.
+			const skipped = !!previous && rows.length >= WHATSAPP_FETCH_LIMIT && fresh.length >= valid;
+			if (skipped) {
+				this.log(`[${this.deps.agentName}] whatsapp: more than ${WHATSAPP_FETCH_LIMIT} new messages in ${chat}; older ones skipped, waking once with a note`);
+			}
 			if (cursor && JSON.stringify(cursor) !== JSON.stringify(all[this.key(chat)])) {
 				all[this.key(chat)] = cursor;
 				saveCursors(this.deps.cursorFile, all);
@@ -343,7 +382,7 @@ export class WhatsAppTrigger {
 			}
 			const q = this.queue(chat);
 			q.history = rows;
-			if (wake.length) this.enqueue(chat, wake);
+			if (wake.length || skipped) this.enqueue(chat, wake, skipped);
 		}
 		if (ok && this.failures) {
 			this.log(`[${this.deps.agentName}] whatsapp poll recovered after ${this.failures} failures`);
@@ -354,15 +393,17 @@ export class WhatsAppTrigger {
 	private queue(chat: string): ChatQueue {
 		let q = this.queues.get(chat);
 		if (!q) {
-			q = { pending: [], history: [], timer: null, active: false };
+			q = { pending: [], skipped: false, history: [], timer: null, active: false };
 			this.queues.set(chat, q);
 		}
 		return q;
 	}
 
-	private enqueue(chat: string, items: { message: WaMessage; sender: WaSender }[]): void {
+	private enqueue(chat: string, items: WakeItem[], skipped = false): void {
 		const q = this.queue(chat);
 		q.pending.push(...items);
+		q.skipped = q.skipped || skipped;
+		this.persistPending();
 		this.log(`[${this.deps.agentName}] whatsapp: ${items.length} new message(s) in ${chat}${q.active ? " (run in progress, queued)" : ""}`);
 		if (q.active || q.timer) return;
 		q.timer = this.setTimer(() => {
@@ -374,12 +415,16 @@ export class WhatsAppTrigger {
 	/** Run the agent once for everything pending in this chat. */
 	async flush(chat: string): Promise<void> {
 		const q = this.queue(chat);
-		if (q.active || !q.pending.length) return;
+		if (q.active || (!q.pending.length && !q.skipped)) return;
 		const batch = q.pending.splice(0);
+		const skipped = q.skipped;
+		q.skipped = false;
 		q.active = true;
+		// The run starts now: it is no longer pending (never replayed after a restart).
+		this.persistPending();
 		try {
 			const prompt = buildWakePrompt({
-				cfg: this.deps.cfg, chat, batch, history: q.history, users: this.deps.knownUsers(),
+				cfg: this.deps.cfg, chat, batch, history: q.history, users: this.deps.knownUsers(), skipped,
 			});
 			await this.deps.dispatch(prompt, chat);
 		} catch (err) {
@@ -387,7 +432,7 @@ export class WhatsAppTrigger {
 		} finally {
 			q.active = false;
 		}
-		if (q.pending.length && !q.timer) {
+		if ((q.pending.length || q.skipped) && !q.timer) {
 			q.timer = this.setTimer(() => {
 				q.timer = null;
 				void this.flush(chat);
@@ -395,8 +440,56 @@ export class WhatsAppTrigger {
 		}
 	}
 
+	/** Write this agent's waiting wakes to disk (other agents' entries are kept). */
+	private persistPending(): void {
+		const prefix = `${this.deps.agentName}:${this.deps.cfg.accountId}:`;
+		let all: Record<string, PendingEntry> = {};
+		try {
+			if (existsSync(this.pendingFile)) all = JSON.parse(readFileSync(this.pendingFile, "utf-8")) || {};
+		} catch {
+			all = {};
+		}
+		for (const k of Object.keys(all)) if (k.startsWith(prefix)) delete all[k];
+		for (const [chat, q] of this.queues) {
+			if (q.pending.length || q.skipped) {
+				all[this.key(chat)] = { items: q.pending, skipped: q.skipped, history: q.history.slice(0, this.deps.cfg.contextMessages + 10) };
+			}
+		}
+		try {
+			mkdirSync(path.dirname(this.pendingFile), { recursive: true });
+			const tmp = `${this.pendingFile}.tmp`;
+			writeFileSync(tmp, JSON.stringify(all));
+			renameSync(tmp, this.pendingFile);
+		} catch (err) {
+			this.log(`[${this.deps.agentName}] whatsapp: could not save pending wakes: ${err instanceof Error ? err.message : String(err)}`);
+		}
+	}
+
+	/** Re-queue wakes that were waiting when the listener last stopped. */
+	restorePending(): void {
+		let all: Record<string, PendingEntry> = {};
+		try {
+			if (existsSync(this.pendingFile)) all = JSON.parse(readFileSync(this.pendingFile, "utf-8")) || {};
+		} catch {
+			return;
+		}
+		const prefix = `${this.deps.agentName}:${this.deps.cfg.accountId}:`;
+		for (const [k, entry] of Object.entries(all)) {
+			if (!k.startsWith(prefix) || !entry || !Array.isArray(entry.items)) continue;
+			const chat = k.slice(prefix.length);
+			if (!this.deps.cfg.watchChats.includes(chat)) continue;
+			const q = this.queue(chat);
+			if (Array.isArray(entry.history) && !q.history.length) q.history = entry.history;
+			if (entry.items.length || entry.skipped) {
+				this.log(`[${this.deps.agentName}] whatsapp: restoring ${entry.items.length} pending message(s) for ${chat}`);
+				this.enqueue(chat, entry.items, !!entry.skipped);
+			}
+		}
+	}
+
 	/** Poll forever; slower while the gateway is unreachable. */
 	start(): void {
+		this.restorePending();
 		const loop = async () => {
 			if (this.stopped) return;
 			try {

@@ -48,6 +48,10 @@ describe("config", () => {
 		assert.deepEqual(cfg.watchChats, [CHAT]);
 		assert.equal(cfg.pollSeconds, 10);
 		assert.equal(cfg.debounceSeconds, 5);
+		assert.equal(parseWhatsAppConfig({ api_url: "http://h:1", account_id: "a" })!.debounceSeconds, 4, "default batching window is short");
+	});
+	test("LID chat ids are accepted", () => {
+		assert.deepEqual(parseWhatsAppConfig({ api_url: "http://h:1", account_id: "a", watch_chats: ["123456789@lid"] })!.watchChats, ["123456789@lid"]);
 	});
 	test("absent or broken block is off", () => {
 		assert.equal(parseWhatsAppConfig(undefined), undefined);
@@ -114,12 +118,13 @@ describe("who wakes the agent", () => {
 		assert.match(p, /\(You\) \(msg_id y1\): open question\?/);
 		assert.doesNotMatch(p, /msg_id r\)/);
 		assert.match(p, /From: Alice \| role: owner \| channel: whatsapp .* msg_id: n1 \| quoted: y1\ncan you check\?/);
-		assert.match(p, /If it is not for you, send nothing/);
+		assert.match(p, /your own rules/);
+		assert.doesNotMatch(p, /not for you/, "no addressing rule in framework text");
 	});
 });
 
-function harness(rowsByPoll: WaMessage[][], opts: { allowUnknown?: boolean } = {}) {
-	const dir = mkdtempSync(path.join(tmpdir(), "wa-trigger-"));
+function harness(rowsByPoll: WaMessage[][], opts: { allowUnknown?: boolean; dir?: string } = {}) {
+	const dir = opts.dir || mkdtempSync(path.join(tmpdir(), "wa-trigger-"));
 	const cursorFile = path.join(dir, "cursors.json");
 	const timers: { fn: () => void; ms: number }[] = [];
 	const runs: string[] = [];
@@ -154,7 +159,7 @@ function harness(rowsByPoll: WaMessage[][], opts: { allowUnknown?: boolean } = {
 		for (const x of due) x.fn();
 		await new Promise((r) => setImmediate(r));
 	};
-	return { t, timers, runs, logs, cursorFile, fire, setHold: (h: boolean) => { hold = h; }, release: () => release?.() };
+	return { t, dir, timers, runs, logs, cursorFile, fire, setHold: (h: boolean) => { hold = h; }, release: () => release?.() };
 }
 
 describe("poller", () => {
@@ -231,7 +236,9 @@ describe("whatsapp skill and wiring", () => {
 		assert.ok(body.includes("{{WHATSAPP_API_URL}}") && body.includes("{{WHATSAPP_ACCOUNT_ID}}"));
 		assert.match(body, /idempotency_key/);
 		assert.match(body, /uncertain/);
-		assert.match(body, /no reply/);
+		assert.match(body, /own rules/);
+		assert.doesNotMatch(body, /Answer only when|not for you/i, "relevance is the agent's own rule, not the framework's");
+		assert.match(body, /reply-<msg_id>-<n>/);
 		assert.doesNotMatch(body, /\d{9,}@g\.us/);
 	});
 
@@ -260,5 +267,38 @@ describe("whatsapp skill and wiring", () => {
 		assert.match(text, /WhatsApp/);
 		assert.match(text, /not .*Slack/i);
 		assert.equal(deliveryInstruction("slack"), "");
+	});
+});
+
+describe("no silent loss of wakes", () => {
+	test("pending wakes survive a listener restart and run once", async () => {
+		const base = [msg("a", 10)];
+		const h = harness([base, [...base, msg("b", 20)]]);
+		await h.t.pollOnce();
+		await h.t.pollOnce();
+		assert.equal(h.runs.length, 0, "still in the batching window");
+		h.t.stop(); // listener goes down before the window closes
+		const h2 = harness([[...base, msg("b", 20)]], { dir: h.dir });
+		h2.t.restorePending();
+		await h2.fire();
+		assert.equal(h2.runs.length, 1);
+		assert.match(h2.runs[0], /msg_id: b/);
+		await h2.t.pollOnce();
+		const h3 = harness([[...base, msg("b", 20)]], { dir: h.dir });
+		h3.t.restorePending();
+		await h3.fire();
+		assert.equal(h3.runs.length, 0, "a started wake is not replayed");
+	});
+
+	test("more than a page of new messages: one wake that says older ones were skipped", async () => {
+		const base = [msg("a", 10)];
+		const flood = Array.from({ length: 50 }, (_, i) => msg(`f${i}`, 100 + i, { is_from_me: true }));
+		const h = harness([base, flood]);
+		await h.t.pollOnce();
+		await h.t.pollOnce();
+		await h.fire();
+		assert.equal(h.runs.length, 1);
+		assert.match(h.runs[0], /older messages were skipped/);
+		assert.ok(h.logs.some((l) => /skipped/.test(l)));
 	});
 });

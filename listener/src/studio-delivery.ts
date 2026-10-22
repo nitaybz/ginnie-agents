@@ -22,8 +22,8 @@ const STUDIO_INSTRUCTION =
 
 const WHATSAPP_INSTRUCTION =
 	"This turn was started by a new WhatsApp message, not by Slack. There is no Slack thread for it: " +
-	"do not post your answer to Slack. If the message is for you, answer in the same WhatsApp chat " +
-	"through the WhatsApp gateway (see the WhatsApp skill); if it is not for you, send nothing. " +
+	"do not post your answer to Slack. Whether and how to answer follows your own rules; any answer " +
+	"goes to the same WhatsApp chat through the WhatsApp gateway (see the WhatsApp skill). " +
 	"Your final reply text is only logged, nobody reads it.";
 
 /**
