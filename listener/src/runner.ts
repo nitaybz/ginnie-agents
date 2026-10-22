@@ -10,13 +10,13 @@
  */
 
 import { spawn } from "child_process";
-import { readdirSync, readFileSync, existsSync, mkdirSync } from "fs";
+import { readdirSync, readFileSync, existsSync, mkdirSync, realpathSync } from "fs";
 import path from "path";
 import { deliveryInstruction, type DeliveryOrigin } from "./studio-delivery";
 import { RUN_FAILURES_FILE, pickErrorLine, recordRunOutcome } from "./run-failures";
 import { bottomLineDockerEnv } from "./bottom-line";
 import { parseWhatsAppConfig, whatsappDockerArgs, type WhatsAppConfig } from "./whatsapp-trigger";
-import { parseExtraMounts, extraMountDockerArgs, type ExtraMount } from "./extra-mounts";
+import { parseExtraMounts, checkHostPaths, extraMountDockerArgs, type ExtraMount, type HostEnv } from "./extra-mounts";
 import {
 	ACCOUNT_COOLDOWNS_FILE,
 	accountDockerAuth,
@@ -29,6 +29,16 @@ import {
 
 const AGENTS_DIR = path.join(__dirname, "..", "..", "agents");
 const DOCKER_IMAGE = "ginnie-agent";
+
+// Host facts the extra-mount safety check needs (see extra-mounts.ts).
+function extraMountHost(): HostEnv {
+	return {
+		home: (() => { try { return realpathSync(process.env.HOME || "/root"); } catch { return process.env.HOME || "/root"; } })(),
+		agentsDir: realpathSync(AGENTS_DIR),
+		frameworkRoot: realpathSync(path.join(__dirname, "..", "..")),
+		realpath: (p) => realpathSync(p),
+	};
+}
 
 export type AgentBoundaries = "read-only" | "write";
 
@@ -191,7 +201,12 @@ export function loadAgents(): AgentConfig[] {
 				: DEFAULT_BUTTON_TTL_HOURS,
 			whatsapp: parseWhatsAppConfig(manifest.whatsapp),
 			whatsappToken,
-			extraMounts: parseExtraMounts(manifest.extra_mounts, (line) => console.warn(`[${entry.name}] ${line}`)),
+			extraMounts: checkHostPaths(
+				entry.name,
+				parseExtraMounts(manifest.extra_mounts, (line) => console.warn(`[${entry.name}] ${line}`)),
+				extraMountHost(),
+				(line) => console.warn(`[${entry.name}] ${line}`),
+			),
 		});
 	}
 
@@ -463,7 +478,7 @@ export function spawnAttempt(
 		}
 
 		// Read-only extra mounts from config.json (under /workspace/mounts).
-		dockerArgs.push(...extraMountDockerArgs(agent.name, agent.extraMounts ?? [], existsSync, (line) => console.warn(`[${agent.name}] ${line}`)));
+		dockerArgs.push(...extraMountDockerArgs(agent.name, agent.extraMounts ?? [], extraMountHost(), (line) => console.warn(`[${agent.name}] ${line}`)));
 
 		// Docker image
 		dockerArgs.push(DOCKER_IMAGE);

@@ -13,9 +13,14 @@
  *  - container_path sits strictly under /workspace/mounts/, so it can never
  *    cover a framework mount (memory, skills, prompt, credentials, sessions).
  *  - Container paths may not repeat or nest inside each other.
- *  - No commas (docker's --mount spec is comma separated).
- * At spawn time a host_path that does not exist is skipped with one log line
- * per agent and path; the agent still runs.
+ *  - No commas, double quotes or control characters (docker's --mount spec
+ *    is CSV: a newline would cut off ",readonly" and mount it writable).
+ * The host path is then checked against the real filesystem (at startup and
+ * again on every spawn): it must not be a symlink (realpath must equal it)
+ * and must not be, sit inside, or contain a sensitive location (docker
+ * socket, /etc, /proc, /sys, /dev, /run, /root, ~/.ssh, ~/.config/gh, the
+ * framework .env, another agent's folder). A host_path that does not exist
+ * is skipped with one log line per agent and path; the agent still runs.
  */
 
 import path from "path";
@@ -26,6 +31,9 @@ export interface ExtraMount {
 	hostPath: string;
 	containerPath: string;
 }
+
+// Control characters (incl. newline, CR, tab, NUL), DEL and double quotes.
+const UNSAFE_CHARS = /[\u0000-\u001f\u007f"]/;
 
 function isCanonicalAbsolute(p: unknown): p is string {
 	return typeof p === "string"
@@ -56,6 +64,7 @@ export function parseExtraMounts(raw: unknown, log: (line: string) => void): Ext
 		if (!isCanonicalAbsolute(cp) || !cp.startsWith(EXTRA_MOUNTS_ROOT + "/")) {
 			return why(`container_path must be a canonical path under ${EXTRA_MOUNTS_ROOT}/`);
 		}
+		if (UNSAFE_CHARS.test(hp) || UNSAFE_CHARS.test(cp)) return why("paths may not contain control characters or quotes");
 		if (hp.includes(",") || cp.includes(",")) return why("paths may not contain commas");
 		if (out.some((m) => nests(m.containerPath, cp))) return why(`container_path overlaps an earlier entry (${cp})`);
 		out.push({ hostPath: hp, containerPath: cp });
@@ -63,21 +72,73 @@ export function parseExtraMounts(raw: unknown, log: (line: string) => void): Ext
 	return out;
 }
 
-const loggedMissing = new Set<string>();
+export interface HostEnv {
+	home: string;
+	agentsDir: string;
+	frameworkRoot: string;
+	// Throws (ENOENT) when the path does not exist.
+	realpath: (p: string) => string;
+}
+
+function within(p: string, root: string): boolean {
+	return p === root || p.startsWith(root === "/" ? "/" : root + "/");
+}
+
+/** null when safe to mount, "missing" when absent, otherwise the reason. */
+export function hostPathProblem(agentName: string, hostPath: string, host: HostEnv): string | null {
+	let real: string;
+	try {
+		real = host.realpath(hostPath);
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return "missing";
+		return `cannot resolve (${(err as NodeJS.ErrnoException).code || "error"})`;
+	}
+	if (real !== hostPath) return "is or goes through a symlink";
+	const sensitive = [
+		"/etc", "/proc", "/sys", "/dev", "/run", "/var/run", "/root", "/boot",
+		path.posix.join(host.home, ".ssh"),
+		path.posix.join(host.home, ".config", "gh"),
+		path.posix.join(host.frameworkRoot, ".env"),
+	];
+	for (const root of sensitive) {
+		if (within(hostPath, root) || within(root, hostPath)) return `overlaps a protected location (${root})`;
+	}
+	const ownDir = path.posix.join(host.agentsDir, agentName);
+	if (within(host.agentsDir, hostPath)) return "contains the agents folder";
+	if (within(hostPath, host.agentsDir) && !within(hostPath, ownDir)) return "is inside another agent's folder";
+	return null;
+}
+
+/** Startup check: drop entries whose existing host path is unsafe. Missing ones stay (checked again at spawn). */
+export function checkHostPaths(agentName: string, mounts: ExtraMount[], host: HostEnv, log: (line: string) => void): ExtraMount[] {
+	return mounts.filter((m) => {
+		const problem = hostPathProblem(agentName, m.hostPath, host);
+		if (problem && problem !== "missing") {
+			log(`extra mount rejected: ${m.hostPath} ${problem}`);
+			return false;
+		}
+		return true;
+	});
+}
+
+const loggedSkips = new Set<string>();
 
 export function extraMountDockerArgs(
 	agentName: string,
 	mounts: ExtraMount[],
-	exists: (p: string) => boolean,
+	host: HostEnv,
 	log: (line: string) => void,
 ): string[] {
 	const args: string[] = [];
 	for (const m of mounts) {
-		if (!exists(m.hostPath)) {
-			const key = `${agentName}\0${m.hostPath}`;
-			if (!loggedMissing.has(key)) {
-				loggedMissing.add(key);
-				log(`extra mount skipped, host path missing: ${m.hostPath} (agent still runs)`);
+		const problem = hostPathProblem(agentName, m.hostPath, host);
+		if (problem) {
+			const key = `${agentName}\0${m.hostPath}\0${problem}`;
+			if (!loggedSkips.has(key)) {
+				loggedSkips.add(key);
+				log(problem === "missing"
+					? `extra mount skipped, host path missing: ${m.hostPath} (agent still runs)`
+					: `extra mount skipped: ${m.hostPath} ${problem} (agent still runs)`);
 			}
 			continue;
 		}
