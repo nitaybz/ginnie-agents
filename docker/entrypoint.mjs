@@ -19,6 +19,9 @@
  *   RESUME_SESSION_ID      — Optional: session ID to resume
  *   MAX_TURNS              — Optional: max agentic turns (default: 50)
  *   ALLOWED_TOOLS          — Optional: comma-separated tool list
+ *   AGENT_MODEL            — Optional: model or alias (e.g. "opus"). The model
+ *                             the SDK actually resolved is logged at session
+ *                             start and returned as `model` in the result JSON.
  *   TZ                     — Optional: container timezone (default: UTC)
  *   DELIVERY_INSTRUCTION   — Optional: extra system-prompt text appended after
  *                             PROMPT.md, telling the agent how to deliver its
@@ -29,6 +32,7 @@
 
 import { createRequire } from "module";
 import { bottomLineSkill } from "./prompt-skills.mjs";
+import { createLimitTracker } from "./limit-detect.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -216,8 +220,18 @@ console.error(`[${agentName}] Starting session${resumeId ? ` (resume: ${resumeId
 console.error(`[${agentName}] Tools: ${allowedTools.join(", ")}`);
 console.error(`[${agentName}] Max turns: ${maxTurns}`);
 
+// Usage-limit detection and tool-call count for this run. On a limit the
+// listener cools this subscription and retries on another one: from scratch
+// when no tool ran yet, else by resuming this session (so actions already
+// taken are not repeated). See listener/src/claude-accounts.ts.
+const tracker = createLimitTracker();
+let resolvedModel = "";
+// Latest known session id; also reported on the failure paths so the
+// listener can resume it.
+let sessionId = resumeId || "";
+
 async function runSession(resumeSessionId) {
-	let sessionId = resumeSessionId || "";
+	sessionId = resumeSessionId || sessionId;
 
 	for await (const msg of query({
 		prompt: message,
@@ -233,9 +247,15 @@ async function runSession(resumeSessionId) {
 			model: process.env.AGENT_MODEL || undefined,
 		},
 	})) {
-		if (msg.type === "system" && msg.subtype === "init" && msg.session_id) {
-			sessionId = msg.session_id;
+		if (msg.type === "system" && msg.subtype === "init") {
+			if (msg.session_id) sessionId = msg.session_id;
+			if (msg.model && msg.model !== resolvedModel) {
+				resolvedModel = msg.model;
+				console.error(`[${agentName}] Model: ${resolvedModel}${process.env.AGENT_MODEL ? ` (requested: ${process.env.AGENT_MODEL})` : ""}`);
+			}
 		}
+
+		tracker.observe(msg);
 
 		if (msg.type === "result") {
 			const output = {
@@ -244,6 +264,9 @@ async function runSession(resumeSessionId) {
 				is_error: msg.is_error || false,
 				num_turns: msg.num_turns || 0,
 				cost_usd: msg.total_cost_usd || 0,
+				model: resolvedModel || undefined,
+				tool_calls: tracker.toolCalls,
+				...tracker.outcome(msg.is_error || false, msg.result || ""),
 			};
 			console.log(JSON.stringify(output));
 			console.error(`[${agentName}] Done — ${msg.num_turns} turns, $${(msg.total_cost_usd || 0).toFixed(4)}`);
@@ -274,7 +297,24 @@ while (true) {
 		if (sessionArg && msg.includes("No conversation found")) {
 			console.error(`[${agentName}] Session ${String(sessionArg).slice(0, 20)}... expired, starting fresh`);
 			sessionArg = undefined;
+			sessionId = "";
 			continue;
+		}
+
+		// Usage limit → never retry here (it will not clear in seconds). The
+		// listener cools this subscription and retries on another one.
+		const limitFields = tracker.outcome(true, msg);
+		if (limitFields) {
+			console.error(`[${agentName}] usage limit hit${limitFields.limit_type ? ` (${limitFields.limit_type})` : ""}: ${msg.slice(0, 200)}`);
+			console.log(JSON.stringify({
+				session_id: sessionId,
+				is_error: true,
+				result: msg,
+				model: resolvedModel || undefined,
+				tool_calls: tracker.toolCalls,
+				...limitFields,
+			}));
+			process.exit(1);
 		}
 
 		// Transient API error → brief backoff, then retry the same run.
@@ -288,7 +328,7 @@ while (true) {
 
 		// Non-transient, or retries exhausted → fail (listener posts a fallback).
 		console.error(`[${agentName}] FATAL:`, err);
-		console.log(JSON.stringify({ session_id: "", is_error: true, result: String(err) }));
+		console.log(JSON.stringify({ session_id: sessionId, is_error: true, result: String(err), tool_calls: tracker.toolCalls }));
 		process.exit(1);
 	}
 }

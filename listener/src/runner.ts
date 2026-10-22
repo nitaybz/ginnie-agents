@@ -15,6 +15,15 @@ import path from "path";
 import { deliveryInstruction, type DeliveryOrigin } from "./studio-delivery";
 import { RUN_FAILURES_FILE, pickErrorLine, recordRunOutcome } from "./run-failures";
 import { bottomLineDockerEnv } from "./bottom-line";
+import {
+	ACCOUNT_COOLDOWNS_FILE,
+	accountDockerAuth,
+	loadClaudeAccounts,
+	recordFinalOutcome,
+	runWithAccountFallback,
+	type AttemptResult,
+	type ClaudeAccount,
+} from "./claude-accounts";
 
 const AGENTS_DIR = path.join(__dirname, "..", "..", "agents");
 const DOCKER_IMAGE = "ginnie-agent";
@@ -209,14 +218,63 @@ export interface AgentRunResult {
 	sessionId: string;
 	isError: boolean;
 	result: string;
+	// True when the run ended on a Claude usage limit on every account tried.
+	// Not counted as a run failure.
+	limitHit?: boolean;
+	// Label of the Claude account the final attempt ran on ("A", "B", ...).
+	account?: string | null;
+	// Model the SDK reported for the run.
+	model?: string;
 }
 
-function spawnContainer(
+/**
+ * Run on the first Claude account not cooling down; on a usage limit, cool
+ * that account and retry once on the next (see claude-accounts.ts).
+ */
+async function spawnContainer(
 	agent: AgentConfig,
 	message: string,
 	resumeId?: string,
 	origin: DeliveryOrigin = "slack",
 ): Promise<AgentRunResult> {
+	let out;
+	try {
+		out = await runWithAccountFallback({
+			accounts: loadClaudeAccounts(process.env),
+			cooldownFile: ACCOUNT_COOLDOWNS_FILE,
+			model: agent.model,
+			// A continuation resumes the limited try's session on the next
+			// account instead of replaying the original request.
+			attempt: (account, cont) =>
+				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account),
+			log: (line) => console.log(`[${agent.name}] ${line}`),
+		});
+	} catch (err) {
+		recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${String(err)}`);
+		throw err;
+	}
+	// Feeds the watcher's "N failed runs in a row" alert; a usage limit is not
+	// a broken agent and leaves the streak alone.
+	if (!recordFinalOutcome(RUN_FAILURES_FILE, agent.name, out)) {
+		console.log(`[${agent.name}] Run stopped on a usage limit (account ${out.account ?? "none"}); not counted as a failure`);
+	}
+	return {
+		sessionId: out.sessionId,
+		isError: out.isError,
+		result: out.result,
+		limitHit: out.limitHit,
+		account: out.account,
+		model: out.model,
+	};
+}
+
+export function spawnAttempt(
+	agent: AgentConfig,
+	message: string,
+	resumeId: string | undefined,
+	origin: DeliveryOrigin,
+	account: ClaudeAccount | null,
+): Promise<AttemptResult> {
 	return new Promise((resolve, reject) => {
 		const containerName = `ginnie-${agent.name}-${Date.now()}`;
 
@@ -228,12 +286,15 @@ function spawnContainer(
 		if (!existsSync(episodesDir)) mkdirSync(episodesDir, { recursive: true });
 		if (!existsSync(sessionsDir)) mkdirSync(sessionsDir, { recursive: true });
 
-		// Auth: two supported modes.
+		// Auth: two supported modes, resolved into `account` by
+		// claude-accounts.ts (loadClaudeAccounts).
 		//
 		// Option A — Long-lived OAuth token (CLAUDE_CODE_OAUTH_TOKEN) from
 		//   `claude setup-token`. ~1y, tied to a Claude subscription. Per
 		//   Anthropic's usage policy this is for ordinary individual use of
 		//   Claude Code by the subscriber — not for serving other users.
+		//   Optional further subscriptions (CLAUDE_CODE_OAUTH_TOKEN_2, ...) are
+		//   used only while an earlier one is in a usage-limit cooldown.
 		// Option B — Anthropic API key (ANTHROPIC_API_KEY) from
 		//   console.anthropic.com. Per-token billing, fully supported for
 		//   automation and multi-user scenarios.
@@ -242,9 +303,7 @@ function spawnContainer(
 		// If neither is set, fall back to mounting the host's
 		// ~/.claude/.credentials.json (8h OAuth, can't refresh inside the
 		// read-only container — last resort).
-		const apiKey = process.env.ANTHROPIC_API_KEY || "";
-		const longLivedToken = process.env.CLAUDE_CODE_OAUTH_TOKEN || "";
-		if (!apiKey && !longLivedToken && !process.env.HOME) {
+		if (!account && !process.env.HOME) {
 			throw new Error(
 				"No auth available: set ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN, " +
 				"or ensure HOME is set so host credentials can be mounted.",
@@ -287,11 +346,9 @@ function spawnContainer(
 			dockerArgs.push("-e", `DELIVERY_INSTRUCTION=${deliveryText}`);
 		}
 
-		if (apiKey) {
-			dockerArgs.push("-e", `ANTHROPIC_API_KEY=${apiKey}`);
-		} else if (longLivedToken) {
-			dockerArgs.push("-e", `CLAUDE_CODE_OAUTH_TOKEN=${longLivedToken}`);
-		}
+		// Token by name only; its value rides in the docker client's env.
+		const auth = accountDockerAuth(account);
+		dockerArgs.push(...auth.args);
 
 		if (resumeId) {
 			dockerArgs.push("-e", `RESUME_SESSION_ID=${resumeId}`);
@@ -311,7 +368,7 @@ function spawnContainer(
 		dockerArgs.push(
 			"-v", `${claudeDir}:/home/node/.claude`,
 		);
-		if (!apiKey && !longLivedToken && existsSync(hostCredentials)) {
+		if (!account && existsSync(hostCredentials)) {
 			dockerArgs.push("-v", `${hostCredentials}:/home/node/.claude/.credentials.json:ro`);
 		}
 
@@ -384,10 +441,15 @@ function spawnContainer(
 		// Docker image
 		dockerArgs.push(DOCKER_IMAGE);
 
-		console.log(`[${agent.name}] Starting container ${containerName}${resumeId ? " (resume)" : " (new)"}...`);
+		// Account label and requested model only; never the token.
+		console.log(
+			`[${agent.name}] Starting container ${containerName}${resumeId ? " (resume)" : " (new)"} ` +
+			`account=${account ? account.label : "host-credentials"} model=${agent.model || "default"}...`,
+		);
 
 		const child = spawn("docker", dockerArgs, {
 			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, ...auth.env },
 		});
 
 		let stdout = "";
@@ -414,27 +476,49 @@ function spawnContainer(
 			let sessionId = resumeId || `session_${Date.now()}`;
 			let isError = code !== 0; // non-zero exit always counts as an error
 			let result = "";
+			let model = "";
+			let limit: AttemptResult["limit"] = null;
+			let toolCalls: number | undefined;
+			let reportedSessionId = "";
 			try {
 				const lines = stdout.trim().split("\n");
 				for (const line of lines) {
 					try {
 						const parsed = JSON.parse(line);
-						if (parsed.session_id) sessionId = parsed.session_id;
+						if (parsed.session_id) sessionId = reportedSessionId = parsed.session_id;
+						if (typeof parsed.tool_calls === "number") toolCalls = parsed.tool_calls;
 						if (parsed.is_error) isError = true;
 						if (typeof parsed.result === "string") result = parsed.result;
+						if (typeof parsed.model === "string" && parsed.model) model = parsed.model;
+						if (parsed.limit_hit) {
+							limit = {
+								type: typeof parsed.limit_type === "string" ? parsed.limit_type : null,
+								resetsAt: typeof parsed.resets_at === "number" ? parsed.resets_at : null,
+							};
+						}
 					} catch {}
 				}
 			} catch {}
 
-			console.log(`[${agent.name}] Container done: ${sessionId.slice(0, 30)}...${isError ? " (ERROR)" : ""}`);
-			// Feeds the watcher's "N failed runs in a row" alert.
-			recordRunOutcome(RUN_FAILURES_FILE, agent.name, isError, isError ? pickErrorLine(result, stderr) : "");
-			resolve({ sessionId, isError, result });
+			console.log(
+				`[${agent.name}] Container done: ${sessionId.slice(0, 30)}... ` +
+				`model=${model || "unknown"} account=${account ? account.label : "host-credentials"}` +
+				`${limit ? " (USAGE LIMIT)" : isError ? " (ERROR)" : ""}`,
+			);
+			resolve({
+				sessionId,
+				isError,
+				result,
+				model: model || undefined,
+				limit: isError ? limit : null,
+				stderr,
+				toolCalls,
+				reportedSessionId: reportedSessionId || undefined,
+			});
 		});
 
 		child.on("error", (err) => {
 			console.error(`[${agent.name}] Failed to spawn container:`, err);
-			recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${String(err)}`);
 			reject(err);
 		});
 	});
