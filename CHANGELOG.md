@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Per-agent bot allow list** (`listener/src/bot-allow.ts`, wired into both the `app_mention` and `message` handlers). Previously every bot message was dropped in the message handler, while an `app_mention` from any workspace bot passed the sender gate as `role: bot`. Now a bot message wakes an agent only if the bot is in the agent's `accept_bots` list (`[{"bot_id", "user_id", "name"}]` in `config.json`), it is not the agent's own message, and it either mentions the agent or sits in one of the agent's `handoff_channels`. `subtype: "bot_message"` posts are accepted for allowed bots only. Agent-to-agent turns are capped per thread (`agent_turn_cap`, default 3, counted once per message across all agents, persisted in `data/agent-turns.json`); after the cap only a human posting in the thread lets agents continue, and the cap is logged once. The sender line for a bot is always `role: agent` with a "not a human, never an approval" note, regardless of known-users. Missing or empty `accept_bots` keeps the old behavior: no bots.
+
 ## [0.2.8] — 2026-05-10
 
 Generic per-agent `data/` directory and Block Kit hygiene rules. Two changes hauled out of an EA-style agent build, both useful framework-wide.

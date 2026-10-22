@@ -26,6 +26,7 @@ import { startButtonSweep } from "./button-sweep";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
 import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger } from "./whatsapp-trigger";
 import { getKnownUsersFor } from "./users";
+import { AGENT_TURNS_FILE, NO_BOT_POLICY, AgentTurns, BotEventSeen, admitBotMessage, mentionsAgent, isBotMessage, isOwnMessage, type BotDecision } from "./bot-allow";
 import {
 	SLACK_HEARTBEAT_DIR,
 	SLACK_HEARTBEAT_INTERVAL_MS,
@@ -185,6 +186,26 @@ function passesSenderPolicy(agent: AgentConfig, sender: SenderInfo): boolean {
 	return true;
 }
 
+// ─── Bot allow list ────────────────────────────────────────
+// Bot messages wake an agent only from bots in its accept_bots list, only when
+// they mention it or sit in one of its handoff_channels, never its own, and at
+// most agent_turn_cap of them per thread until a human posts there. The turn
+// count is shared by every agent in this listener. See bot-allow.ts.
+const agentTurns = new AgentTurns({ file: AGENT_TURNS_FILE });
+const botEventsSeen = new BotEventSeen();
+
+function admitBot(agent: AgentConfig, event: any): BotDecision {
+	const d = admitBotMessage({ agent, policy: agent.botPolicy || NO_BOT_POLICY, ev: event, turns: agentTurns, seen: botEventsSeen });
+	if (d.kind === "drop" && d.log) console.log(d.log);
+	return d;
+}
+
+// A human (who passes the sender policy) posted in a thread: agents may
+// continue an agent-to-agent exchange there again.
+function noteHumanInThread(channel: string, threadTs: string | undefined): void {
+	if (channel && threadTs) agentTurns.humanSpoke(threadKey(channel, threadTs));
+}
+
 // ─── Work hours ────────────────────────────────────────────
 //
 // work_hours is intentionally NOT enforced on inbound messages. Its purpose is
@@ -212,9 +233,22 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		// Drop messages that have neither text nor any attached file.
 		if (!baseText && !hasFiles) return;
 
-		const sender = await getSenderInfo(app, event.user, agent);
-		if (!passesSenderPolicy(agent, sender)) return;
-		const senderLine = formatSenderLine(sender);
+		// Bots (other agents) only through the allow list; never labelled human.
+		const bot = admitBot(agent, event);
+		if (bot.kind === "drop") return;
+		let senderName: string;
+		let senderRole: string;
+		let senderLine: string;
+		if (bot.kind === "accept") {
+			({ name: senderName, role: senderRole } = bot.sender);
+			senderLine = bot.senderLine;
+		} else {
+			const sender = await getSenderInfo(app, event.user, agent);
+			if (!passesSenderPolicy(agent, sender)) return;
+			if (event.thread_ts) noteHumanInThread(channel, event.thread_ts);
+			({ name: senderName, role: senderRole } = sender);
+			senderLine = formatSenderLine(sender);
+		}
 
 		// Post early ack BEFORE transcription so the user sees feedback within
 		// the same ~200ms window non-audio messages get.
@@ -227,7 +261,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			: baseText;
 		if (!messageText) return;
 
-		console.log(`[@mention] Agent: ${agent.name}, From: ${sender.name} (${sender.role}), Channel: ${channel}, Thread: ${threadTs}`);
+		console.log(`[@mention] Agent: ${agent.name}, From: ${senderName} (${senderRole}), Channel: ${channel}, Thread: ${threadTs}`);
 		enqueueOrProcess({
 			agent, channel, threadTs, message: messageText,
 			isThreadReply, messageTs: event.ts, userId: event.user, senderLine,
@@ -236,15 +270,38 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 
 	// Message handler (DMs + channel thread replies)
 	app.event("message", async ({ event }: any) => {
-		if (event.bot_id) return;
 		// Allow message-with-file subtypes to fall through to the file-attachment
 		// handler below. Slack sends file uploads as `subtype: "file_share"`
 		// (legacy) or as a regular message with `files: [...]`. Without this,
-		// every file upload was silently dropped.
-		const ALLOWED_SUBTYPES = new Set(["file_share"]);
+		// every file upload was silently dropped. Bot posts often arrive as
+		// `subtype: "bot_message"`; that is let through only for allowed bots.
+		const fromBot = isOwnMessage(agent, event) || isBotMessage(event, agent.botPolicy || NO_BOT_POLICY);
+		const ALLOWED_SUBTYPES = new Set(fromBot ? ["file_share", "bot_message"] : ["file_share"]);
 		if (event.subtype && !ALLOWED_SUBTYPES.has(event.subtype)) return;
 
 		const channel = event.channel;
+
+		// ── Bot (another agent): allow list only ──
+		// A bot that mentions the agent in a channel is handled by the
+		// app_mention handler; here: hand-off channels, and DMs that mention it.
+		if (fromBot) {
+			const inHandoff = (agent.botPolicy || NO_BOT_POLICY).handoffChannels.includes(channel);
+			const dmMention = event.channel_type === "im" && mentionsAgent(event.text, agent.slackBotId);
+			if (!inHandoff && !dmMention) return;
+			const bot = admitBot(agent, event);
+			if (bot.kind !== "accept") return;
+			let botText = event.text || "";
+			if (event.files && event.files.length > 0) botText = await expandFileAttachments(event.files, agent, botText);
+			if (!botText) return;
+			const threadTs = event.thread_ts || event.ts;
+			console.log(`[bot:${bot.via}] Agent: ${agent.name}, From: ${bot.sender.name} (agent), Channel: ${channel}, Thread: ${threadTs}`);
+			enqueueOrProcess({
+				agent, channel, threadTs, message: botText,
+				isThreadReply: !!event.thread_ts, messageTs: event.ts, userId: bot.sender.userId, senderLine: bot.senderLine,
+			});
+			return;
+		}
+
 		let messageText = event.text || "";
 
 		// Handle file attachments.
@@ -284,6 +341,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		const sender = await getSenderInfo(app, event.user, agent);
 		if (!passesSenderPolicy(agent, sender)) return;
 		const senderLine = formatSenderLine(sender);
+		if (event.thread_ts) noteHumanInThread(channel, event.thread_ts);
 
 		// ── DM ──
 		if (event.channel_type === "im") {
