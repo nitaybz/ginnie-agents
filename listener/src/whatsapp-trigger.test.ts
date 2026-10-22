@@ -6,11 +6,14 @@
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync } from "fs";
+import { createServer, type IncomingMessage } from "http";
+import type { AddressInfo } from "net";
 import { tmpdir } from "os";
 import path from "path";
 import {
 	WhatsAppTrigger,
 	buildWakePrompt,
+	defaultFetchJson,
 	formatWhatsAppSenderLine,
 	isWakeable,
 	newSince,
@@ -300,5 +303,78 @@ describe("no silent loss of wakes", () => {
 		assert.equal(h.runs.length, 1);
 		assert.match(h.runs[0], /older messages were skipped/);
 		assert.ok(h.logs.some((l) => /skipped/.test(l)));
+	});
+});
+
+describe("local source address", () => {
+	test("local_address is parsed when it is an IP literal", () => {
+		assert.equal(parseWhatsAppConfig({ api_url: "http://h:1", account_id: "a", local_address: " 127.0.0.1 " })!.localAddress, "127.0.0.1");
+		assert.equal(parseWhatsAppConfig({ api_url: "http://h:1", account_id: "a", local_address: "::1" })!.localAddress, "::1");
+		assert.equal(parseWhatsAppConfig({ api_url: "http://h:1", account_id: "a" })!.localAddress, undefined, "absent: unchanged behavior");
+	});
+
+	test("an invalid local_address is dropped, the block still works", () => {
+		for (const bad of ["localhost", "300.1.1.1", "10.0.0", "1.2.3.4:80", "", 42, null]) {
+			const c = parseWhatsAppConfig({ api_url: "http://h:1", account_id: "a", local_address: bad });
+			assert.ok(c, `block stays on for ${JSON.stringify(bad)}`);
+			assert.equal(c!.localAddress, undefined, `${JSON.stringify(bad)} is rejected`);
+		}
+	});
+
+	async function server(handler: (req: IncomingMessage) => { status: number; body: unknown }) {
+		const seen: { remote: string | undefined; auth: string | undefined }[] = [];
+		const srv = createServer((req, res) => {
+			seen.push({ remote: req.socket.remoteAddress, auth: req.headers.authorization });
+			const { status, body } = handler(req);
+			res.writeHead(status, { "content-type": "application/json" });
+			res.end(JSON.stringify(body));
+		});
+		await new Promise<void>((r) => srv.listen(0, "127.0.0.1", () => r()));
+		const url = `http://127.0.0.1:${(srv.address() as AddressInfo).port}`;
+		return { url, seen, close: () => new Promise<void>((r) => srv.close(() => r())) };
+	}
+
+	test("the poller connects from local_address, with the token, and reads the JSON", async () => {
+		const s = await server(() => ({ status: 200, body: [msg("a", 10)] }));
+		try {
+			const c = parseWhatsAppConfig({ api_url: s.url, account_id: "office", watch_chats: [CHAT], local_address: "127.0.0.1" })!;
+			const dir = mkdtempSync(path.join(tmpdir(), "wa-local-"));
+			const logs: string[] = [];
+			const t = new WhatsAppTrigger({
+				agentName: "office", cfg: c, token: "tok", cursorFile: path.join(dir, "cursors.json"),
+				allowSender: () => true, knownUsers: () => users, dispatch: async () => {},
+				setTimer: () => null, log: (l) => logs.push(l),
+			});
+			await t.pollOnce();
+			assert.deepEqual(logs.filter((l) => /poll failed/.test(l)), []);
+			assert.equal(s.seen.length, 1);
+			assert.equal(s.seen[0].remote, "127.0.0.1");
+			assert.equal(s.seen[0].auth, "Bearer tok");
+			const saved = JSON.parse(readFileSync(path.join(dir, "cursors.json"), "utf-8"));
+			assert.deepEqual(saved[`office:office:${CHAT}`], { ts: 10, ids: ["a"] }, "the response was parsed");
+		} finally {
+			await s.close();
+		}
+	});
+
+	// Linux routes all of 127.0.0.0/8 to loopback, so a second source address
+	// proves the request really is bound (a default connection comes from 127.0.0.1).
+	test("the source address is the configured one, not the default", { skip: process.platform !== "linux" }, async () => {
+		const s = await server(() => ({ status: 200, body: [] }));
+		try {
+			assert.deepEqual(await defaultFetchJson(`${s.url}/v1/messages`, "tok", "127.0.0.2"), []);
+			assert.equal(s.seen[0].remote, "127.0.0.2");
+		} finally {
+			await s.close();
+		}
+	});
+
+	test("with local_address, a non-2xx status is an error", async () => {
+		const s = await server(() => ({ status: 401, body: { error: "unauthorized" } }));
+		try {
+			await assert.rejects(defaultFetchJson(`${s.url}/v1/messages`, "bad", "127.0.0.1"), /HTTP 401/);
+		} finally {
+			await s.close();
+		}
 	});
 });
