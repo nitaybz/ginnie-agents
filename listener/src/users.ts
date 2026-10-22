@@ -23,6 +23,10 @@ interface KnownUser {
 	email?: string;
 	supabase_id?: string | null;
 	notes?: string;
+	short_name?: string;
+	// WhatsApp phone number(s), international digits (e.g. "15550000001");
+	// used to name WhatsApp senders. Optional.
+	whatsapp?: string | string[];
 }
 
 interface KnownUsersFile {
@@ -69,7 +73,7 @@ loadKnownUsers();
  * per-entry override (same slack_id in both → local wins for that entry).
  * Local files are read on demand and cached per agent name.
  */
-function getKnownUsersFor(agent?: AgentConfig): Record<string, KnownUser> {
+export function getKnownUsersFor(agent?: AgentConfig): Record<string, KnownUser> {
 	if (!agent) return sharedKnownUsers;
 	let local = localKnownUsersByAgent.get(agent.name);
 	if (local === undefined) {
