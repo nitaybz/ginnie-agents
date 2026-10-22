@@ -20,12 +20,14 @@ import { loadStore, getThread, setThread } from "./store";
 import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
 import { isSlackThreadTs } from "./run-failures";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
-import { getSenderInfo, formatSenderLine, type SenderInfo } from "./users";
+import { getSenderInfo, formatSenderLine, slackUserIsBot } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
 import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger } from "./whatsapp-trigger";
 import { getKnownUsersFor } from "./users";
+import { AGENT_TURNS_FILE, AgentTurns, BotEventSeen } from "./bot-allow";
+import { passesSenderPolicy, resolveInbound, type InboundResult } from "./inbound-gate";
 import {
 	SLACK_HEARTBEAT_DIR,
 	SLACK_HEARTBEAT_INTERVAL_MS,
@@ -166,23 +168,24 @@ async function drainQueue(key: string): Promise<void> {
 	}
 }
 
-// Refuse, at dispatch time, to wake a write-capable agent for an
-// uncurated sender. role === "external" means Slack returned a real
-// user but they're not in known-users.json; "unknown" means the lookup
-// failed. Silent drop, not a posted reply — see ARCHITECTURE.md threat
-// model for reasoning. Read-only agents and `allow_unverified_senders`
-// opt out.
-function passesSenderPolicy(agent: AgentConfig, sender: SenderInfo): boolean {
-	if (agent.boundaries === "read-only") return true;
-	if (agent.allowUnverifiedSenders) return true;
-	if (sender.role === "unknown" || sender.role === "external") {
-		console.log(
-			`[${agent.name}] dispatch refused: unverified sender ${sender.userId || "(no id)"}` +
-			` (role: ${sender.role}, name: ${sender.name})`,
-		);
-		return false;
-	}
-	return true;
+// ─── Bot allow list ────────────────────────────────────────
+// Bot messages wake an agent only from bots in its accept_bots list, only when
+// they mention it or sit in one of its handoff_channels, never its own, and at
+// most agent_turn_cap of them per thread until a human posts there. The turn
+// count is shared by every agent in this listener. See bot-allow.ts.
+const agentTurns = new AgentTurns({ file: AGENT_TURNS_FILE });
+const botEventsSeen = new BotEventSeen();
+
+// Who sent this event and may it wake the agent (inbound-gate.ts). Bots only
+// through the allow list; humans through the sender policy, which refuses
+// role "bot" for every agent.
+function gateInbound(agent: AgentConfig, app: App, source: "mention" | "message", event: any): Promise<InboundResult> {
+	return resolveInbound({
+		agent, source, event, turns: agentTurns, seen: botEventsSeen,
+		lookupIsBot: (userId) => slackUserIsBot(app, userId),
+		lookupSender: (userId) => getSenderInfo(app, userId, agent),
+		onHumanInThread: (channel, threadTs) => agentTurns.humanSpoke(threadKey(channel, threadTs)),
+	});
 }
 
 // ─── Work hours ────────────────────────────────────────────
@@ -212,9 +215,12 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		// Drop messages that have neither text nor any attached file.
 		if (!baseText && !hasFiles) return;
 
-		const sender = await getSenderInfo(app, event.user, agent);
-		if (!passesSenderPolicy(agent, sender)) return;
-		const senderLine = formatSenderLine(sender);
+		// Bots (other agents) only through the allow list; never labelled human.
+		const gate = await gateInbound(agent, app, "mention", event);
+		if (gate.kind === "drop") return;
+		const senderName = gate.kind === "bot" ? gate.decision.sender.name : gate.sender.name;
+		const senderRole = gate.kind === "bot" ? gate.decision.sender.role : gate.sender.role;
+		const senderLine = gate.kind === "bot" ? gate.decision.senderLine : formatSenderLine(gate.sender);
 
 		// Post early ack BEFORE transcription so the user sees feedback within
 		// the same ~200ms window non-audio messages get.
@@ -227,7 +233,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			: baseText;
 		if (!messageText) return;
 
-		console.log(`[@mention] Agent: ${agent.name}, From: ${sender.name} (${sender.role}), Channel: ${channel}, Thread: ${threadTs}`);
+		console.log(`[@mention] Agent: ${agent.name}, From: ${senderName} (${senderRole}), Channel: ${channel}, Thread: ${threadTs}`);
 		enqueueOrProcess({
 			agent, channel, threadTs, message: messageText,
 			isThreadReply, messageTs: event.ts, userId: event.user, senderLine,
@@ -236,15 +242,33 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 
 	// Message handler (DMs + channel thread replies)
 	app.event("message", async ({ event }: any) => {
-		if (event.bot_id) return;
-		// Allow message-with-file subtypes to fall through to the file-attachment
-		// handler below. Slack sends file uploads as `subtype: "file_share"`
-		// (legacy) or as a regular message with `files: [...]`. Without this,
-		// every file upload was silently dropped.
-		const ALLOWED_SUBTYPES = new Set(["file_share"]);
-		if (event.subtype && !ALLOWED_SUBTYPES.has(event.subtype)) return;
+		// Subtypes, bots and the sender policy are decided in inbound-gate.ts:
+		// plain messages and file shares (`subtype: "file_share"`) only; bot
+		// posts (often `subtype: "bot_message"`) only for allowed bots; edits
+		// and other subtypes never wake the agent.
+		const gate = await gateInbound(agent, app, "message", event);
+		if (gate.kind === "drop") return;
 
 		const channel = event.channel;
+
+		// ── Bot (another agent): allow list only ──
+		// A bot that mentions the agent in a channel is handled by the
+		// app_mention handler; here: hand-off channels, and DMs that mention it.
+		if (gate.kind === "bot") {
+			const bot = gate.decision;
+			let botText = event.text || "";
+			if (event.files && event.files.length > 0) botText = await expandFileAttachments(event.files, agent, botText);
+			if (!botText) return;
+			const threadTs = event.thread_ts || event.ts;
+			console.log(`[bot:${bot.via}] Agent: ${agent.name}, From: ${bot.sender.name} (agent), Channel: ${channel}, Thread: ${threadTs}`);
+			enqueueOrProcess({
+				agent, channel, threadTs, message: botText,
+				isThreadReply: !!event.thread_ts, messageTs: event.ts, userId: bot.sender.userId, senderLine: bot.senderLine,
+			});
+			return;
+		}
+		const sender = gate.sender;
+
 		let messageText = event.text || "";
 
 		// Handle file attachments.
@@ -266,14 +290,11 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			// sees the same ~200ms acknowledgement non-audio messages get.
 			// Channel-thread replies skip this because the parent-message check
 			// downstream may still drop the message — we don't want to leak a
-			// dangling status. Sender + within-work-hours gate it so we don't
-			// ack messages we'll later silently drop.
+			// dangling status. The sender already passed the gate above, so
+			// we don't ack messages we'll later silently drop.
 			if (event.channel_type === "im" && hasAudioAttachment(event.files)) {
-				const sender = await getSenderInfo(app, event.user, agent);
-				if (passesSenderPolicy(agent, sender)) {
-					const earlyThreadTs = event.thread_ts || event.ts;
-					await postEarlyAudioAck(agent, channel, earlyThreadTs);
-				}
+				const earlyThreadTs = event.thread_ts || event.ts;
+				await postEarlyAudioAck(agent, channel, earlyThreadTs);
 			}
 
 			messageText = await expandFileAttachments(event.files, agent, messageText);
@@ -281,8 +302,6 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 
 		if (!messageText) return;
 
-		const sender = await getSenderInfo(app, event.user, agent);
-		if (!passesSenderPolicy(agent, sender)) return;
 		const senderLine = formatSenderLine(sender);
 
 		// ── DM ──

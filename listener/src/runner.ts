@@ -17,6 +17,7 @@ import { RUN_FAILURES_FILE, pickErrorLine, recordRunOutcome } from "./run-failur
 import { bottomLineDockerEnv } from "./bottom-line";
 import { parseWhatsAppConfig, whatsappDockerArgs, type WhatsAppConfig } from "./whatsapp-trigger";
 import { parseExtraMounts, checkHostPaths, extraMountDockerArgs, type ExtraMount, type HostEnv } from "./extra-mounts";
+import { parseBotPolicy, type BotPolicy } from "./bot-allow";
 import {
 	ACCOUNT_COOLDOWNS_FILE,
 	accountDockerAuth,
@@ -74,6 +75,9 @@ export interface AgentConfig {
 	// Read-only host paths mounted under /workspace/mounts (config.json
 	// "extra_mounts"). See extra-mounts.ts.
 	extraMounts?: ExtraMount[];
+	// Which other bots may wake this agent (config.json "accept_bots",
+	// "handoff_channels", "agent_turn_cap"). Missing or empty = none. See bot-allow.ts.
+	botPolicy?: BotPolicy;
 }
 
 interface AgentManifest {
@@ -88,6 +92,9 @@ interface AgentManifest {
 	button_ttl_hours?: number;
 	whatsapp?: unknown;
 	extra_mounts?: unknown;
+	accept_bots?: unknown;
+	handoff_channels?: unknown;
+	agent_turn_cap?: unknown;
 }
 
 // How long an interactive (actions) block stays live before the listener's
@@ -174,6 +181,8 @@ export function loadAgents(): AgentConfig[] {
 		const declaredTools = manifest.allowed_tools || [
 			"Bash", "Read", "Write", "Edit", "Glob", "Grep", "WebSearch", "WebFetch",
 		];
+		const bots = parseBotPolicy(manifest);
+		for (const w of bots.warnings) console.warn(`[${entry.name}] ${w}`);
 		const wh = manifest.work_hours || {};
 		const workHours: AgentWorkHours = {
 			enabled: wh.enabled === true,
@@ -207,6 +216,7 @@ export function loadAgents(): AgentConfig[] {
 				extraMountHost(),
 				(line) => console.warn(`[${entry.name}] ${line}`),
 			),
+			botPolicy: bots.policy,
 		});
 	}
 
