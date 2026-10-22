@@ -17,6 +17,14 @@
  *   AGENT_MESSAGE          — The prompt/task for the agent
  *   AGENT_NAME             — Agent name (for logging + system prompt headers)
  *   RESUME_SESSION_ID      — Optional: session ID to resume
+ *   RESUME_STRICT          — Optional: "1" when the resume continues an
+ *                             interrupted run (after a usage limit). If that
+ *                             session is gone the run fails instead of
+ *                             starting over, so no action is repeated.
+ *   WHATSAPP_API_URL       — Optional: the WhatsApp gateway's agent API as
+ *   WHATSAPP_ACCOUNT_ID       seen from the container; loads the whatsapp
+ *                             framework skill. The token stays in
+ *                             credentials.json (whatsapp_token).
  *   MAX_TURNS              — Optional: max agentic turns (default: 50)
  *   ALLOWED_TOOLS          — Optional: comma-separated tool list
  *   AGENT_MODEL            — Optional: model or alias (e.g. "opus"). The model
@@ -31,8 +39,9 @@
  */
 
 import { createRequire } from "module";
-import { bottomLineSkill } from "./prompt-skills.mjs";
+import { bottomLineSkill, whatsappSkill } from "./prompt-skills.mjs";
 import { createLimitTracker } from "./limit-detect.mjs";
+import { CONTINUE_AFTER_ERROR_MESSAGE, nextStep } from "./run-policy.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -157,6 +166,7 @@ const soulPath = "/workspace/SOUL.md";
 const memorySkillPath = "/workspace/.framework/skills/memory-curation/SKILL.md";
 const routinesSkillPath = "/workspace/.framework/skills/routines/SKILL.md";
 const bottomLineSkillPath = "/workspace/.framework/skills/bottom-line/SKILL.md";
+const whatsappSkillPath = "/workspace/.framework/skills/whatsapp/SKILL.md";
 const promptPath = "/workspace/PROMPT.md";
 const rulesPath = "/workspace/memory/rules.md";
 const playbookPath = "/workspace/memory/playbook.md";
@@ -187,6 +197,12 @@ const bottomLine = bottomLineSkill(
 	process.env.BOTTOM_LINE_CHANNEL,
 );
 if (bottomLine) parts.push(bottomLine);
+const whatsapp = whatsappSkill(
+	existsSync(whatsappSkillPath) ? readFileSync(whatsappSkillPath, "utf-8") : null,
+	process.env.WHATSAPP_API_URL,
+	process.env.WHATSAPP_ACCOUNT_ID,
+);
+if (whatsapp) parts.push(whatsapp);
 if (existsSync(promptPath)) parts.push(readFileSync(promptPath, "utf-8"));
 
 // Delivery instruction — MUST come after PROMPT.md so it overrides rather
@@ -230,11 +246,11 @@ let resolvedModel = "";
 // listener can resume it.
 let sessionId = resumeId || "";
 
-async function runSession(resumeSessionId) {
+async function runSession(resumeSessionId, prompt) {
 	sessionId = resumeSessionId || sessionId;
 
 	for await (const msg of query({
-		prompt: message,
+		prompt,
 		options: {
 			systemPrompt,
 			allowedTools,
@@ -274,34 +290,20 @@ async function runSession(resumeSessionId) {
 	}
 }
 
-// Transient/ambiguous API failures that are worth one or two automatic retries.
-// "Could not process image" is nominally a 400, but in practice it's an
-// intermittent server-side decode hiccup (verified: the same image + container
-// + model succeeds on every re-run), so we treat it as retryable. Genuinely
-// deterministic 400s (bad request shape, unsupported param) won't match and
-// still fail fast — no infinite loops.
-const TRANSIENT_ERROR =
-	/could not process image|overloaded|rate.?limit|\b429\b|\b5\d\d\b|internal server error|timed? ?out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up/i;
-const MAX_TRANSIENT_RETRIES = 2;
-
+// Retry rules (docker/run-policy.mjs): after any tool call the original
+// request is never replayed; the run continues its own session or fails.
 let transientRetries = 0;
 let sessionArg = resumeId;
+let prompt = message;
+let strictResume = !!resumeId && process.env.RESUME_STRICT === "1";
 while (true) {
 	try {
-		await runSession(sessionArg);
+		await runSession(sessionArg, prompt);
 		break;
 	} catch (err) {
 		const msg = String(err);
 
-		// Stale resume → start a fresh session (does not consume retry budget).
-		if (sessionArg && msg.includes("No conversation found")) {
-			console.error(`[${agentName}] Session ${String(sessionArg).slice(0, 20)}... expired, starting fresh`);
-			sessionArg = undefined;
-			sessionId = "";
-			continue;
-		}
-
-		// Usage limit → never retry here (it will not clear in seconds). The
+		// Usage limit -> never retry here (it will not clear in seconds). The
 		// listener cools this subscription and retries on another one.
 		const limitFields = tracker.outcome(true, msg);
 		if (limitFields) {
@@ -317,18 +319,41 @@ while (true) {
 			process.exit(1);
 		}
 
-		// Transient API error → brief backoff, then retry the same run.
-		if (TRANSIENT_ERROR.test(msg) && transientRetries < MAX_TRANSIENT_RETRIES) {
+		const step = nextStep({
+			error: msg,
+			sessionArg,
+			strictResume,
+			toolCalls: tracker.toolCalls,
+			sessionId,
+			transientRetries,
+		});
+
+		if (step.action === "fresh") {
+			// Stale thread session and nothing done yet (does not consume retry budget).
+			console.error(`[${agentName}] Session ${String(sessionArg).slice(0, 20)}... not found, starting a new session (no tool calls yet)`);
+			sessionArg = undefined;
+			sessionId = "";
+			continue;
+		}
+
+		if (step.action === "retry" || step.action === "continue") {
 			transientRetries++;
 			const delay = 1500 * transientRetries;
-			console.error(`[${agentName}] transient error (retry ${transientRetries}/${MAX_TRANSIENT_RETRIES} in ${delay}ms): ${msg.slice(0, 200)}`);
+			if (step.action === "continue") {
+				// Tool calls already ran: resume this run's own session and ask it to
+				// continue, never re-send the original request.
+				sessionArg = step.sessionId;
+				prompt = CONTINUE_AFTER_ERROR_MESSAGE;
+				strictResume = true;
+			}
+			console.error(`[${agentName}] transient error (${step.action} ${transientRetries} in ${delay}ms): ${msg.slice(0, 200)}`);
 			await new Promise((r) => setTimeout(r, delay));
 			continue;
 		}
 
-		// Non-transient, or retries exhausted → fail (listener posts a fallback).
-		console.error(`[${agentName}] FATAL:`, err);
-		console.log(JSON.stringify({ session_id: sessionId, is_error: true, result: String(err), tool_calls: tracker.toolCalls }));
+		// Non-transient, retries exhausted, or a continuation that cannot resume.
+		console.error(`[${agentName}] FATAL${step.reason ? ` (${step.reason})` : ""}:`, err);
+		console.log(JSON.stringify({ session_id: sessionId, is_error: true, result: step.reason ? `${step.reason}: ${msg}` : String(err), tool_calls: tracker.toolCalls }));
 		process.exit(1);
 	}
 }

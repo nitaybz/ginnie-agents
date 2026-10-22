@@ -15,6 +15,7 @@ import path from "path";
 import { deliveryInstruction, type DeliveryOrigin } from "./studio-delivery";
 import { RUN_FAILURES_FILE, pickErrorLine, recordRunOutcome } from "./run-failures";
 import { bottomLineDockerEnv } from "./bottom-line";
+import { parseWhatsAppConfig, whatsappDockerArgs, type WhatsAppConfig } from "./whatsapp-trigger";
 import {
 	ACCOUNT_COOLDOWNS_FILE,
 	accountDockerAuth,
@@ -55,6 +56,10 @@ export interface AgentConfig {
 	allowUnverifiedSenders: boolean;
 	model?: string;
 	buttonTtlHours: number;
+	// Optional WhatsApp access + wake-up (config.json "whatsapp"; token in
+	// credentials.json "whatsapp_token"). See whatsapp-trigger.ts.
+	whatsapp?: WhatsAppConfig;
+	whatsappToken?: string;
 }
 
 interface AgentManifest {
@@ -67,6 +72,7 @@ interface AgentManifest {
 	allow_unverified_senders?: boolean;
 	model?: string;
 	button_ttl_hours?: number;
+	whatsapp?: unknown;
 }
 
 // How long an interactive (actions) block stays live before the listener's
@@ -135,11 +141,13 @@ export function loadAgents(): AgentConfig[] {
 		// Falls back to root .env for the single-agent case.
 		let slackBotToken = "";
 		let slackAppToken = "";
+		let whatsappToken = "";
 		if (existsSync(credsPath)) {
 			try {
 				const creds = JSON.parse(readFileSync(credsPath, "utf-8"));
 				slackBotToken = creds.slack_bot_token || "";
 				slackAppToken = creds.slack_app_token || "";
+				whatsappToken = typeof creds.whatsapp_token === "string" ? creds.whatsapp_token.trim() : "";
 			} catch {}
 		}
 		if (!slackBotToken) slackBotToken = process.env.SLACK_BOT_TOKEN || "";
@@ -176,6 +184,8 @@ export function loadAgents(): AgentConfig[] {
 			buttonTtlHours: typeof manifest.button_ttl_hours === "number" && manifest.button_ttl_hours > 0
 				? manifest.button_ttl_hours
 				: DEFAULT_BUTTON_TTL_HOURS,
+			whatsapp: parseWhatsAppConfig(manifest.whatsapp),
+			whatsappToken,
 		});
 	}
 
@@ -246,7 +256,7 @@ async function spawnContainer(
 			// A continuation resumes the limited try's session on the next
 			// account instead of replaying the original request.
 			attempt: (account, cont) =>
-				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account),
+				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont),
 			log: (line) => console.log(`[${agent.name}] ${line}`),
 		});
 	} catch (err) {
@@ -274,6 +284,9 @@ export function spawnAttempt(
 	resumeId: string | undefined,
 	origin: DeliveryOrigin,
 	account: ClaudeAccount | null,
+	// A continuation after a usage limit: if its session is gone the run must
+	// fail, never start over (that would repeat completed actions).
+	strictResume = false,
 ): Promise<AttemptResult> {
 	return new Promise((resolve, reject) => {
 		const containerName = `ginnie-${agent.name}-${Date.now()}`;
@@ -352,6 +365,7 @@ export function spawnAttempt(
 
 		if (resumeId) {
 			dockerArgs.push("-e", `RESUME_SESSION_ID=${resumeId}`);
+			if (strictResume) dockerArgs.push("-e", "RESUME_STRICT=1");
 		}
 
 		if (agent.model) {
@@ -360,6 +374,10 @@ export function spawnAttempt(
 
 		// Bottom-line channel (framework/skills/bottom-line). Off when unset.
 		dockerArgs.push(...bottomLineDockerEnv(process.env));
+
+		// WhatsApp gateway agent API (framework/skills/whatsapp). The token is
+		// not passed here; the agent reads it from its credentials.json mount.
+		dockerArgs.push(...whatsappDockerArgs(agent.whatsapp));
 
 		// Mount agent's .claude directory (session persistence, settings).
 		// Only overlay host credentials.json when neither auth env var is set —

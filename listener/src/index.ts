@@ -24,6 +24,8 @@ import { getSenderInfo, formatSenderLine, type SenderInfo } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
+import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger } from "./whatsapp-trigger";
+import { getKnownUsersFor } from "./users";
 import {
 	SLACK_HEARTBEAT_DIR,
 	SLACK_HEARTBEAT_INTERVAL_MS,
@@ -679,6 +681,37 @@ function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {
 	});
 }
 
+// ─── WhatsApp wake-up ──────────────────────────────────────
+// Agents with a "whatsapp" block in config.json (and whatsapp_token in
+// credentials.json) are woken by new messages in the chats they watch. Each
+// batch is a fresh run; the agent decides whether the message is for it and
+// replies in WhatsApp itself (framework/skills/whatsapp).
+function startWhatsAppTriggers(): void {
+	for (const agent of agents) {
+		const cfg = agent.whatsapp;
+		if (!cfg || !cfg.watchChats.length) continue;
+		if (!agent.whatsappToken) {
+			console.log(`[${agent.name}] whatsapp: configured but credentials.json has no whatsapp_token; wake-up off`);
+			continue;
+		}
+		const trigger = new WhatsAppTrigger({
+			agentName: agent.name,
+			cfg,
+			token: agent.whatsappToken,
+			cursorFile: WHATSAPP_CURSORS_FILE,
+			knownUsers: () => getKnownUsersFor(agent),
+			allowSender: (s) => s.known || agent.boundaries === "read-only" || agent.allowUnverifiedSenders,
+			dispatch: async (prompt, chat) => {
+				console.log(`[${agent.name}] whatsapp wake for ${chat}`);
+				const r = await runAgent(agent, prompt, "whatsapp");
+				if (r.isError) console.error(`[${agent.name}] whatsapp-woken run failed${r.limitHit ? " (usage limit)" : ""}`);
+			},
+		});
+		trigger.start();
+		console.log(`   WhatsApp wake-up: ${agent.name} (${cfg.accountId}, ${cfg.watchChats.length} chat${cfg.watchChats.length > 1 ? "s" : ""}, every ${cfg.pollSeconds}s)`);
+	}
+}
+
 // ─── Slack socket heartbeat ────────────────────────────────
 // Refresh data/slack-heartbeats/<agent>.json while the agent's Socket Mode
 // connection is open. The watcher alerts when it goes stale (see
@@ -734,6 +767,8 @@ function startSlackHeartbeat(agentName: string, receiver: SocketModeReceiver): v
 		loadAgentSchedules(agent, onScheduleFire);
 		watchAgentSchedules(agent, onScheduleFire);
 	}
+
+	startWhatsAppTriggers();
 
 	// Periodically retire stale, never-clicked buttons from agent messages.
 	if (started.length) startButtonSweep(apps, agents);

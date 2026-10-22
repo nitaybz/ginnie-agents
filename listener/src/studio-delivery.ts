@@ -11,7 +11,7 @@
  */
 
 /** Turn origins the framework currently knows how to name. Add here as new bridges appear. */
-export type DeliveryOrigin = "slack" | "studio" | string;
+export type DeliveryOrigin = "slack" | "studio" | "whatsapp" | string;
 
 const STUDIO_INSTRUCTION =
 	"You were reached from Ginnie Studio, not from Slack, for this turn. " +
@@ -19,6 +19,12 @@ const STUDIO_INSTRUCTION =
 	"and do not call chat.postMessage or any other Slack API for it. " +
 	"Put your entire answer directly in your reply to this message instead — that reply is " +
 	"what the person on the other end will see.";
+
+const WHATSAPP_INSTRUCTION =
+	"This turn was started by a new WhatsApp message, not by Slack. There is no Slack thread for it: " +
+	"do not post your answer to Slack. If the message is for you, answer in the same WhatsApp chat " +
+	"through the WhatsApp gateway (see the WhatsApp skill); if it is not for you, send nothing. " +
+	"Your final reply text is only logged, nobody reads it.";
 
 /**
  * Returns the extra system-prompt instruction for a given turn origin, or ""
@@ -28,5 +34,6 @@ const STUDIO_INSTRUCTION =
  */
 export function deliveryInstruction(origin: DeliveryOrigin): string {
 	if (origin === "studio") return STUDIO_INSTRUCTION;
+	if (origin === "whatsapp") return WHATSAPP_INSTRUCTION;
 	return "";
 }
