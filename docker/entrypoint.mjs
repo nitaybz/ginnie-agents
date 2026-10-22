@@ -19,6 +19,9 @@
  *   RESUME_SESSION_ID      — Optional: session ID to resume
  *   MAX_TURNS              — Optional: max agentic turns (default: 50)
  *   ALLOWED_TOOLS          — Optional: comma-separated tool list
+ *   AGENT_MODEL            — Optional: model or alias (e.g. "opus"). The model
+ *                             the SDK actually resolved is logged at session
+ *                             start and returned as `model` in the result JSON.
  *   TZ                     — Optional: container timezone (default: UTC)
  *   DELIVERY_INSTRUCTION   — Optional: extra system-prompt text appended after
  *                             PROMPT.md, telling the agent how to deliver its
@@ -29,6 +32,7 @@
 
 import { createRequire } from "module";
 import { bottomLineSkill } from "./prompt-skills.mjs";
+import { limitFromEvent, limitOutcome } from "./limit-detect.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -216,6 +220,12 @@ console.error(`[${agentName}] Starting session${resumeId ? ` (resume: ${resumeId
 console.error(`[${agentName}] Tools: ${allowedTools.join(", ")}`);
 console.error(`[${agentName}] Max turns: ${maxTurns}`);
 
+// Usage-limit signal seen during the run (SDK rate_limit_event, status
+// rejected). The listener uses it to cool this subscription down and retry
+// on another one; see listener/src/claude-accounts.ts.
+let seenLimit = null;
+let resolvedModel = "";
+
 async function runSession(resumeSessionId) {
 	let sessionId = resumeSessionId || "";
 
@@ -233,9 +243,16 @@ async function runSession(resumeSessionId) {
 			model: process.env.AGENT_MODEL || undefined,
 		},
 	})) {
-		if (msg.type === "system" && msg.subtype === "init" && msg.session_id) {
-			sessionId = msg.session_id;
+		if (msg.type === "system" && msg.subtype === "init") {
+			if (msg.session_id) sessionId = msg.session_id;
+			if (msg.model && msg.model !== resolvedModel) {
+				resolvedModel = msg.model;
+				console.error(`[${agentName}] Model: ${resolvedModel}${process.env.AGENT_MODEL ? ` (requested: ${process.env.AGENT_MODEL})` : ""}`);
+			}
 		}
+
+		const limit = limitFromEvent(msg);
+		if (limit) seenLimit = limit;
 
 		if (msg.type === "result") {
 			const output = {
@@ -244,6 +261,8 @@ async function runSession(resumeSessionId) {
 				is_error: msg.is_error || false,
 				num_turns: msg.num_turns || 0,
 				cost_usd: msg.total_cost_usd || 0,
+				model: resolvedModel || undefined,
+				...limitOutcome(msg.is_error || false, msg.result || "", seenLimit),
 			};
 			console.log(JSON.stringify(output));
 			console.error(`[${agentName}] Done — ${msg.num_turns} turns, $${(msg.total_cost_usd || 0).toFixed(4)}`);
@@ -275,6 +294,15 @@ while (true) {
 			console.error(`[${agentName}] Session ${String(sessionArg).slice(0, 20)}... expired, starting fresh`);
 			sessionArg = undefined;
 			continue;
+		}
+
+		// Usage limit → never retry here (it will not clear in seconds). The
+		// listener cools this subscription and retries on another one.
+		const limitFields = limitOutcome(true, msg, seenLimit);
+		if (limitFields) {
+			console.error(`[${agentName}] usage limit hit${limitFields.limit_type ? ` (${limitFields.limit_type})` : ""}: ${msg.slice(0, 200)}`);
+			console.log(JSON.stringify({ session_id: "", is_error: true, result: msg, model: resolvedModel || undefined, ...limitFields }));
+			process.exit(1);
 		}
 
 		// Transient API error → brief backoff, then retry the same run.
