@@ -57,6 +57,27 @@ export function clearSlackHeartbeat(dir: string, agentName: string): void {
 	} catch { /* ignore */ }
 }
 
+// Called at listener startup with every discovered agent. Removes heartbeat
+// files of agents that were removed, moved or switched off, so a retired
+// agent does not raise a daily false "not connected" alert.
+export function pruneSlackHeartbeats(dir: string, discoveredAgents: Iterable<string>): void {
+	const keep = new Set(discoveredAgents);
+	let entries: string[];
+	try {
+		entries = readdirSync(dir);
+	} catch {
+		return;
+	}
+	for (const entry of entries) {
+		if (!entry.endsWith(".json")) continue;
+		const agent = entry.slice(0, -".json".length);
+		if (keep.has(agent)) continue;
+		try {
+			rmSync(path.join(dir, entry), { force: true });
+		} catch { /* ignore */ }
+	}
+}
+
 function formatAge(ms: number): string {
 	const mins = Math.floor(ms / 60_000);
 	if (mins >= 120) return `${Math.floor(mins / 60)}h`;

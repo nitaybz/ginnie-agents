@@ -29,6 +29,7 @@ import {
 	SLACK_HEARTBEAT_INTERVAL_MS,
 	clearSlackHeartbeat,
 	ensureSlackHeartbeat,
+	pruneSlackHeartbeats,
 	writeSlackHeartbeat,
 } from "./slack-heartbeat";
 
@@ -695,6 +696,8 @@ function startSlackHeartbeat(agentName: string, receiver: SocketModeReceiver): v
 (async () => {
 	const started: string[] = [];
 	const skipped: string[] = [];
+
+	pruneSlackHeartbeats(SLACK_HEARTBEAT_DIR, agents.map((a) => a.name));
 
 	for (const agent of agents) {
 		if (!agent.slackBotToken || !agent.slackAppToken) {

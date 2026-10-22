@@ -7,6 +7,7 @@ import {
 	writeSlackHeartbeat,
 	ensureSlackHeartbeat,
 	clearSlackHeartbeat,
+	pruneSlackHeartbeats,
 	checkSlackHeartbeats,
 	SLACK_HEARTBEAT_STALE_MS,
 } from "./slack-heartbeat";
@@ -85,4 +86,20 @@ test("missing dir, corrupt files and odd names produce no alerts", () => {
 	writeFileSync(path.join(dir, "alpha.json"), "{not json");
 	writeFileSync(path.join(dir, "notes.txt"), "x");
 	assert.deepEqual(checkSlackHeartbeats(dir, T0 + 60 * MIN), []);
+});
+
+test("pruneSlackHeartbeats drops files of agents no longer discovered", () => {
+	const dir = tmpDir();
+	writeSlackHeartbeat(dir, "alpha", T0);
+	writeSlackHeartbeat(dir, "retired", T0);
+	mkdirSync(dir, { recursive: true });
+	writeFileSync(path.join(dir, "notes.txt"), "x");
+	pruneSlackHeartbeats(dir, ["alpha"]);
+	assert.equal(existsSync(path.join(dir, "alpha.json")), true);
+	assert.equal(existsSync(path.join(dir, "retired.json")), false);
+	assert.equal(existsSync(path.join(dir, "notes.txt")), true);
+	// The retired agent no longer produces a stale alert.
+	const alerts = checkSlackHeartbeats(dir, T0 + 60 * 60_000);
+	assert.deepEqual(alerts.map((a) => a.key), ["slack-socket-dead-alpha"]);
+	pruneSlackHeartbeats(path.join(tmpdir(), "no-such-slackhb-dir"), []); // missing dir is fine
 });

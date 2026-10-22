@@ -106,22 +106,22 @@ export function checkFrameworkUpdate(
 	opts: { repo?: string; upstream?: string; env?: NodeJS.ProcessEnv } = {},
 ): CheckResult | null {
 	if (!frameworkUpdatesEnabled(opts.env ?? process.env)) return null;
-	const REPO = opts.repo ?? path.resolve(__dirname, "..", "..");
+	const repoDir = opts.repo ?? path.resolve(__dirname, "..", "..");
 	const FRAMEWORK_UPSTREAM = opts.upstream ?? DEFAULT_FRAMEWORK_UPSTREAM;
 	const slash = FRAMEWORK_UPSTREAM.indexOf("/");
 	if (slash <= 0) return null;
 	const remote = FRAMEWORK_UPSTREAM.slice(0, slash);
 	try {
-		execSync(`git fetch ${remote} --quiet`, { cwd: REPO, stdio: "ignore" });
+		execSync(`git fetch ${remote} --quiet`, { cwd: repoDir, stdio: "ignore" });
 	} catch {
 		return null; // no such remote, fetch failed — silent (not actionable)
 	}
-	const base = deployedSha(REPO);
+	const base = deployedSha(repoDir);
 	if (!base) return null;
 	let targetSha = "";
 	try {
 		targetSha = execSync(`git rev-parse ${FRAMEWORK_UPSTREAM}`, {
-			cwd: REPO,
+			cwd: repoDir,
 			encoding: "utf-8",
 		}).trim();
 	} catch {
@@ -133,14 +133,14 @@ export function checkFrameworkUpdate(
 	try {
 		ahead = parseInt(
 			execSync(`git rev-list --count ${base}..${FRAMEWORK_UPSTREAM}`, {
-				cwd: REPO,
+				cwd: repoDir,
 				encoding: "utf-8",
 			}).trim(),
 			10,
 		) || 0;
 		if (ahead > 0) {
 			titles = execSync(`git log ${base}..${FRAMEWORK_UPSTREAM} --oneline`, {
-				cwd: REPO,
+				cwd: repoDir,
 				encoding: "utf-8",
 			})
 				.split("\n")

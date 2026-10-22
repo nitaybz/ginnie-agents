@@ -17,9 +17,9 @@
  *   OPERATOR_SLACK_ID   — U0XXXXXXXXX (the human to DM)
  *
  * Optional:
- *   WATCHER_CHECK_INTERVAL_MIN — minutes between automatic checks (default 60)
- *   WATCHER_FRAMEWORK_UPDATES  — "on" to DM when the framework upstream has new
- *                                commits (default off)
+ *   WATCHER_CHECK_INTERVAL_MIN: minutes between automatic checks (default 60)
+ *   WATCHER_FRAMEWORK_UPDATES: "on" to DM when the framework upstream has new
+ *                              commits (default off)
  */
 
 import { App, type SlackAction } from "@slack/bolt";
