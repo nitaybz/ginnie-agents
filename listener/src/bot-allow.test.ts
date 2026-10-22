@@ -262,10 +262,12 @@ describe("listener wiring", () => {
 		assert.doesNotMatch(src, /if \(event\.bot_id\) return;/);
 		const mentionHandler = src.slice(src.indexOf('app.event("app_mention"'), src.indexOf('app.event("message"'));
 		const messageHandler = src.slice(src.indexOf('app.event("message"'), src.indexOf("app.action("));
-		assert.match(mentionHandler, /admitBot\(/);
-		assert.match(messageHandler, /admitBot\(/);
-		assert.match(messageHandler, /bot_message/);
+		assert.match(mentionHandler, /gateInbound\(/);
+		assert.match(messageHandler, /gateInbound\(/);
 		assert.match(src, /humanSpoke\(/);
+		const gateSrc = readFileSync(path.join(__dirname, "..", "src", "inbound-gate.ts"), "utf-8");
+		assert.match(gateSrc, /admitBotMessage\(/);
+		assert.match(gateSrc, /bot_message/);
 	});
 });
 
@@ -372,13 +374,11 @@ describe("r1 minors", () => {
 describe("r1 wiring", () => {
 	const src = readFileSync(path.join(__dirname, "..", "src", "index.ts"), "utf-8");
 	test("the reset goes through isRealHuman and both handlers ask users.info about is_bot", () => {
-		assert.match(src, /isRealHuman\(/);
-		const resets = src.split("\n").filter((l) => l.includes("noteHumanInThread(channel, event"));
-		assert.ok(resets.length >= 2);
-		for (const l of resets) assert.match(l, /isRealHuman\(/, "no reset without the real-human check");
-		const mentionHandler = src.slice(src.indexOf('app.event("app_mention"'), src.indexOf('app.event("message"'));
-		const messageHandler = src.slice(src.indexOf('app.event("message"'), src.indexOf("app.action("));
-		assert.match(mentionHandler, /slackUserIsBot\(/);
-		assert.match(messageHandler, /slackUserIsBot\(/);
+		const gateSrc = readFileSync(path.join(__dirname, "..", "src", "inbound-gate.ts"), "utf-8");
+		const resets = gateSrc.split("\n").filter((l) => l.includes("onHumanInThread("));
+		assert.equal(resets.length, 1);
+		assert.match(resets[0], /isRealHuman\(/, "no reset without the real-human check");
+		assert.match(gateSrc, /lookupIsBot\(/);
+		assert.match(src, /lookupIsBot: \(userId\) => slackUserIsBot\(/);
 	});
 });
