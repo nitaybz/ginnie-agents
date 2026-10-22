@@ -20,13 +20,13 @@ import { loadStore, getThread, setThread } from "./store";
 import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
 import { isSlackThreadTs } from "./run-failures";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
-import { getSenderInfo, formatSenderLine, type SenderInfo } from "./users";
+import { getSenderInfo, formatSenderLine, slackUserIsBot, type SenderInfo } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
 import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger } from "./whatsapp-trigger";
 import { getKnownUsersFor } from "./users";
-import { AGENT_TURNS_FILE, NO_BOT_POLICY, AgentTurns, BotEventSeen, admitBotMessage, mentionsAgent, isBotMessage, isOwnMessage, type BotDecision } from "./bot-allow";
+import { AGENT_TURNS_FILE, NO_BOT_POLICY, AgentTurns, BotEventSeen, admitBotMessage, mentionsAgent, isBotMessage, isOwnMessage, isRealHuman, type BotDecision } from "./bot-allow";
 import {
 	SLACK_HEARTBEAT_DIR,
 	SLACK_HEARTBEAT_INTERVAL_MS,
@@ -194,14 +194,14 @@ function passesSenderPolicy(agent: AgentConfig, sender: SenderInfo): boolean {
 const agentTurns = new AgentTurns({ file: AGENT_TURNS_FILE });
 const botEventsSeen = new BotEventSeen();
 
-function admitBot(agent: AgentConfig, event: any): BotDecision {
-	const d = admitBotMessage({ agent, policy: agent.botPolicy || NO_BOT_POLICY, ev: event, turns: agentTurns, seen: botEventsSeen });
+function admitBot(agent: AgentConfig, event: any, slackIsBot: boolean | undefined): BotDecision {
+	const d = admitBotMessage({ agent, policy: agent.botPolicy || NO_BOT_POLICY, ev: event, turns: agentTurns, seen: botEventsSeen, slackIsBot });
 	if (d.kind === "drop" && d.log) console.log(d.log);
 	return d;
 }
 
-// A human (who passes the sender policy) posted in a thread: agents may
-// continue an agent-to-agent exchange there again.
+// A real human (see isRealHuman) posted in a thread: agents may continue an
+// agent-to-agent exchange there again.
 function noteHumanInThread(channel: string, threadTs: string | undefined): void {
 	if (channel && threadTs) agentTurns.humanSpoke(threadKey(channel, threadTs));
 }
@@ -234,7 +234,9 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		if (!baseText && !hasFiles) return;
 
 		// Bots (other agents) only through the allow list; never labelled human.
-		const bot = admitBot(agent, event);
+		// An event without bot tags from a Slack bot user is still a bot.
+		const slackIsBot = (event.bot_id || event.subtype === "bot_message") ? true : await slackUserIsBot(app, event.user);
+		const bot = admitBot(agent, event, slackIsBot);
 		if (bot.kind === "drop") return;
 		let senderName: string;
 		let senderRole: string;
@@ -245,7 +247,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		} else {
 			const sender = await getSenderInfo(app, event.user, agent);
 			if (!passesSenderPolicy(agent, sender)) return;
-			if (event.thread_ts) noteHumanInThread(channel, event.thread_ts);
+			if (event.thread_ts && isRealHuman({ ev: event, sender, slackIsBot })) noteHumanInThread(channel, event.thread_ts);
 			({ name: senderName, role: senderRole } = sender);
 			senderLine = formatSenderLine(sender);
 		}
@@ -275,9 +277,12 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		// (legacy) or as a regular message with `files: [...]`. Without this,
 		// every file upload was silently dropped. Bot posts often arrive as
 		// `subtype: "bot_message"`; that is let through only for allowed bots.
-		const fromBot = isOwnMessage(agent, event) || isBotMessage(event, agent.botPolicy || NO_BOT_POLICY);
-		const ALLOWED_SUBTYPES = new Set(fromBot ? ["file_share", "bot_message"] : ["file_share"]);
+		const tagged = isOwnMessage(agent, event) || isBotMessage(event, agent.botPolicy || NO_BOT_POLICY);
+		const ALLOWED_SUBTYPES = new Set(tagged ? ["file_share", "bot_message"] : ["file_share"]);
 		if (event.subtype && !ALLOWED_SUBTYPES.has(event.subtype)) return;
+		// An event without bot tags from a Slack bot user is still a bot (users.info, cached).
+		const slackIsBot = tagged ? true : await slackUserIsBot(app, event.user);
+		const fromBot = tagged || slackIsBot === true;
 
 		const channel = event.channel;
 
@@ -288,7 +293,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			const inHandoff = (agent.botPolicy || NO_BOT_POLICY).handoffChannels.includes(channel);
 			const dmMention = event.channel_type === "im" && mentionsAgent(event.text, agent.slackBotId);
 			if (!inHandoff && !dmMention) return;
-			const bot = admitBot(agent, event);
+			const bot = admitBot(agent, event, slackIsBot);
 			if (bot.kind !== "accept") return;
 			let botText = event.text || "";
 			if (event.files && event.files.length > 0) botText = await expandFileAttachments(event.files, agent, botText);
@@ -341,7 +346,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		const sender = await getSenderInfo(app, event.user, agent);
 		if (!passesSenderPolicy(agent, sender)) return;
 		const senderLine = formatSenderLine(sender);
-		if (event.thread_ts) noteHumanInThread(channel, event.thread_ts);
+		if (event.thread_ts && isRealHuman({ ev: event, sender, slackIsBot })) noteHumanInThread(channel, event.thread_ts);
 
 		// ── DM ──
 		if (event.channel_type === "im") {

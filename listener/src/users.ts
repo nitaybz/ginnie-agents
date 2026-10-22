@@ -134,6 +134,24 @@ export async function getSenderInfo(
 	}
 }
 
+// Cache of Slack users.info is_bot (userId -> boolean). Failures are not cached.
+const isBotCache = new Map<string, boolean>();
+
+/** true/false from Slack users.info (cached); undefined when the lookup fails. */
+export async function slackUserIsBot(app: App, userId: string | undefined): Promise<boolean | undefined> {
+	if (!userId) return undefined;
+	const hit = isBotCache.get(userId);
+	if (hit !== undefined) return hit;
+	try {
+		const result = await app.client.users.info({ user: userId });
+		const isBot = Boolean((result as any).user?.is_bot);
+		isBotCache.set(userId, isBot);
+		return isBot;
+	} catch (_e) {
+		return undefined;
+	}
+}
+
 /** Format for inclusion in an agent prompt. One line. */
 export function formatSenderLine(info: SenderInfo): string {
 	const tag = info.known ? "" : " (unverified)";

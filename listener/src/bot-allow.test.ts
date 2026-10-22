@@ -7,7 +7,7 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, existsSync } from "fs";
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, unlinkSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import {
@@ -18,6 +18,8 @@ import {
 	formatBotSenderLine,
 	botSenderInfo,
 	isBotMessage,
+	isRealHuman,
+	MAX_TURN_THREADS,
 	mentionsAgent,
 	parseBotPolicy,
 	type AgentIds,
@@ -264,5 +266,119 @@ describe("listener wiring", () => {
 		assert.match(messageHandler, /admitBot\(/);
 		assert.match(messageHandler, /bot_message/);
 		assert.match(src, /humanSpoke\(/);
+	});
+});
+
+// ─── Review round 1 ────────────────────────────────────────
+
+describe("r1 I1: a corrupt turn file fails closed", () => {
+	test("corrupt file: the 4th (and every) bot message is dropped, the file is never overwritten", () => {
+		const { file, turns } = freshTurns();
+		const thread = "900.000001";
+		for (let i = 0; i < 3; i++) {
+			assert.equal(admit(A, policyA, fromBot(B, { ts: `90${i}.000001`, thread_ts: thread, text: `<@${A.slackBotId}> x` }), turns).kind, "accept");
+		}
+		writeFileSync(file, "{corrupt");
+		const reloaded = new AgentTurns({ file });
+		const logs: string[] = [];
+		for (const ts of ["909.000001", "910.000001"]) {
+			const d = admit(A, policyA, fromBot(B, { ts, thread_ts: thread, text: `<@${A.slackBotId}> x` }), reloaded);
+			assert.equal(d.kind, "drop");
+			if (d.kind === "drop" && d.log) logs.push(d.log);
+		}
+		// a brand-new thread is blocked too
+		const other = admit(A, policyA, fromBot(B, { ts: "950.000001", text: `<@${A.slackBotId}> x` }), reloaded);
+		assert.equal(other.kind === "drop" && other.reason, "turns-unreadable");
+		assert.equal(readFileSync(file, "utf-8"), "{corrupt", "corrupt file kept as is");
+		assert.equal(logs.length, 1, "at most one log line per minute");
+		assert.match(logs[0], /unreadable|corrupt/);
+		// a human message does not overwrite it either
+		reloaded.humanSpoke(`${OTHER_CH}:${thread}`);
+		assert.equal(readFileSync(file, "utf-8"), "{corrupt");
+	});
+	test("well-formed JSON with malformed entries is treated as corrupt", () => {
+		const { file } = freshTurns();
+		writeFileSync(file, JSON.stringify({ "C1:1.1": { ts: "nope", updatedAt: 1 } }));
+		const t = new AgentTurns({ file });
+		const d = admit(A, policyA, fromBot(B, { ts: "1.2", text: `<@${A.slackBotId}> x` }), t);
+		assert.equal(d.kind === "drop" && d.reason, "turns-unreadable");
+	});
+	test("once the file is valid again (fixed or removed), bots work again", () => {
+		const { file } = freshTurns();
+		writeFileSync(file, "[[[");
+		const t = new AgentTurns({ file });
+		assert.equal((admit(A, policyA, fromBot(B, { ts: "2.1", text: `<@${A.slackBotId}> x` }), t) as any).reason, "turns-unreadable");
+		unlinkSync(file);
+		assert.equal(admit(A, policyA, fromBot(B, { ts: "2.2", text: `<@${A.slackBotId}> x` }), t).kind, "accept");
+	});
+});
+
+describe("r1 I2: only a real human resets the cap", () => {
+	const person = { userId: "UHUMAN001", name: "Pat", role: "owner", known: true };
+	const ev = { user: "UHUMAN001", channel: OTHER_CH, ts: "3.1", thread_ts: "3.0", text: "go on" };
+	test("a known person, not a Slack bot, with no bot tags resets", () => {
+		assert.equal(isRealHuman({ ev, sender: person, slackIsBot: false }), true);
+	});
+	test("unknown, external, unverified, bot or agent roles never reset", () => {
+		for (const s of [
+			{ ...person, known: false, role: "external" },
+			{ ...person, known: false, role: "unknown" },
+			{ ...person, known: false, role: "bot" },
+			{ ...person, role: "bot" },
+			{ ...person, role: "agent" },
+			{ ...person, role: "unknown" },
+		]) assert.equal(isRealHuman({ ev, sender: s, slackIsBot: false }), false, JSON.stringify(s));
+	});
+	test("a Slack bot user (is_bot) or an unknown is_bot status never resets", () => {
+		assert.equal(isRealHuman({ ev, sender: person, slackIsBot: true }), false);
+		assert.equal(isRealHuman({ ev, sender: person, slackIsBot: undefined }), false);
+	});
+	test("an event with bot tags never resets", () => {
+		assert.equal(isRealHuman({ ev: { ...ev, bot_id: "BX" }, sender: person, slackIsBot: false }), false);
+		assert.equal(isRealHuman({ ev: { ...ev, subtype: "bot_message" }, sender: person, slackIsBot: false }), false);
+	});
+	test("an event without bot tags from a Slack bot user goes through the allow list", () => {
+		const { turns } = freshTurns();
+		const untagged = { user: "USTRANGE1", channel: OTHER_CH, ts: "4.1", text: `<@${A.slackBotId}> do it` };
+		assert.equal(admit(A, policyA, untagged, turns).kind, "human", "without the users.info flag it looks human");
+		const d = admitBotMessage({ agent: A, policy: policyA, ev: untagged, turns, seen: new BotEventSeen(), slackIsBot: true });
+		assert.equal(d.kind === "drop" && d.reason, "not-allowed");
+		// a listed bot's user without bot tags is matched by user id and labelled agent
+		const listed = admitBotMessage({ agent: A, policy: policyA, ev: { ...untagged, user: B.slackBotId, ts: "4.2" }, turns, seen: new BotEventSeen(), slackIsBot: true });
+		assert.equal(listed.kind, "accept");
+		assert.equal(listed.kind === "accept" && listed.sender.role, "agent");
+	});
+});
+
+describe("r1 minors", () => {
+	test("a mention inside inline code or a fenced block does not count", () => {
+		assert.equal(mentionsAgent("see `<@UAAAA0001>` here", A.slackBotId), false);
+		assert.equal(mentionsAgent("```\n[handoff] <@UAAAA0001> x\n```", A.slackBotId), false);
+		assert.equal(mentionsAgent("```quoted <@UAAAA0001>``` and real <@UAAAA0001>", A.slackBotId), true);
+	});
+	test("the turn file keeps at most MAX_TURN_THREADS threads, oldest dropped first", () => {
+		let now = 1_000_000_000_000;
+		const dir = mkdtempSync(path.join(tmpdir(), "agent-turns-"));
+		const file = path.join(dir, "t.json");
+		const t = new AgentTurns({ file, now: () => now });
+		for (let i = 0; i < MAX_TURN_THREADS + 5; i++) { now += 1000; t.take(`C1:${i}.0`, `${i}.0`, 3); }
+		const saved = JSON.parse(readFileSync(file, "utf-8"));
+		assert.equal(Object.keys(saved).length, MAX_TURN_THREADS);
+		assert.equal(t.count("C1:0.0"), 0, "oldest gone");
+		assert.equal(t.count(`C1:${MAX_TURN_THREADS + 4}.0`), 1, "newest kept");
+	});
+});
+
+describe("r1 wiring", () => {
+	const src = readFileSync(path.join(__dirname, "..", "src", "index.ts"), "utf-8");
+	test("the reset goes through isRealHuman and both handlers ask users.info about is_bot", () => {
+		assert.match(src, /isRealHuman\(/);
+		const resets = src.split("\n").filter((l) => l.includes("noteHumanInThread(channel, event"));
+		assert.ok(resets.length >= 2);
+		for (const l of resets) assert.match(l, /isRealHuman\(/, "no reset without the real-human check");
+		const mentionHandler = src.slice(src.indexOf('app.event("app_mention"'), src.indexOf('app.event("message"'));
+		const messageHandler = src.slice(src.indexOf('app.event("message"'), src.indexOf("app.action("));
+		assert.match(mentionHandler, /slackUserIsBot\(/);
+		assert.match(messageHandler, /slackUserIsBot\(/);
 	});
 });

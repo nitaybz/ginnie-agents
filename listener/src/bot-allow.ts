@@ -17,7 +17,10 @@
  *    agent's handoff_channels;
  *  - at most agent_turn_cap (default 3) bot messages per thread, counted once
  *    per message across every agent in this listener; after that only a
- *    human posting in the thread lets the agents continue;
+ *    real human (known person, not a Slack bot, no bot tags) posting in the
+ *    thread lets the agents continue. If the turn file is unreadable, no bot
+ *    message wakes anyone until it is valid again (fail closed);
+ *  - a mention inside inline code or a fenced block does not count;
  *  - the sender is labelled `role: agent` with a "not a human" note, whatever
  *    the known-users files say about that Slack id, so a bot message can never
  *    pass as a human's approval.
@@ -31,6 +34,9 @@ import path from "path";
 export const DEFAULT_AGENT_TURN_CAP = 3;
 export const AGENT_TURNS_FILE = path.join(__dirname, "..", "..", "data", "agent-turns.json");
 const TURN_TTL_MS = 7 * 24 * 3600 * 1000;
+export const MAX_TURN_THREADS = 500;
+const BROKEN_LOG_EVERY_MS = 60_000;
+const NOT_HUMAN_ROLES = new Set(["unknown", "external", "bot", "agent", "system"]);
 const SLACK_ID = /^[A-Z0-9]{2,32}$/;
 
 export interface AcceptedBot {
@@ -118,13 +124,27 @@ export function isOwnMessage(agent: AgentIds, ev: SlackMsgLike): boolean {
 	return Boolean((agent.slackBotMsgId && ev.bot_id === agent.slackBotMsgId) || (agent.slackBotId && ev.user === agent.slackBotId));
 }
 
-export function isBotMessage(ev: SlackMsgLike, policy: BotPolicy): boolean {
-	return Boolean(ev.bot_id) || ev.subtype === "bot_message" || policy.acceptBots.some((b) => b.userId && b.userId === ev.user);
+export function isBotMessage(ev: SlackMsgLike, policy: BotPolicy, slackIsBot?: boolean): boolean {
+	return Boolean(ev.bot_id) || ev.subtype === "bot_message" || slackIsBot === true
+		|| policy.acceptBots.some((b) => b.userId && b.userId === ev.user);
+}
+
+/**
+ * Only a real human may reset the agent-to-agent cap: no bot tags on the
+ * event, Slack's users.info says the user is not a bot (unknown = no), and the
+ * sender is a curated known person (not unknown, external, bot or agent).
+ */
+export function isRealHuman(args: { ev: SlackMsgLike; sender: { known: boolean; role: string }; slackIsBot: boolean | undefined }): boolean {
+	const { ev, sender, slackIsBot } = args;
+	return !ev.bot_id && ev.subtype !== "bot_message" && slackIsBot === false
+		&& sender.known === true && !NOT_HUMAN_ROLES.has(sender.role);
 }
 
 export function mentionsAgent(text: string | undefined, agentUserId: string): boolean {
 	if (!agentUserId || !text) return false;
-	return text.includes(`<@${agentUserId}>`) || text.includes(`<@${agentUserId}|`);
+	// A quoted mention inside code is not addressed to the agent.
+	const plain = text.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
+	return plain.includes(`<@${agentUserId}>`) || plain.includes(`<@${agentUserId}|`);
 }
 
 export function matchAcceptedBot(ev: SlackMsgLike, policy: BotPolicy): AcceptedBot | undefined {
@@ -156,22 +176,46 @@ interface ThreadTurns {
 	updatedAt: number;
 }
 
+function validTurns(data: unknown): data is Record<string, ThreadTurns> {
+	if (!data || typeof data !== "object" || Array.isArray(data)) return false;
+	return Object.values(data as Record<string, unknown>).every((v) => {
+		const t = v as ThreadTurns;
+		return Boolean(t) && typeof t === "object" && Array.isArray(t.ts) && t.ts.every((x) => typeof x === "string")
+			&& typeof t.updatedAt === "number";
+	});
+}
+
 export class AgentTurns {
 	private readonly file?: string;
 	private readonly now: () => number;
 	private threads: Record<string, ThreadTurns> = {};
+	// Set while the file exists but cannot be read or is malformed. Then no
+	// bot message is admitted and the file is never written (fail closed);
+	// it is re-checked on every bot message, so fixing or removing it heals.
+	private broken: string | null = null;
+	private lastBrokenLog = -Infinity;
 
 	constructor(opts: { file?: string; now?: () => number } = {}) {
 		this.file = opts.file;
 		this.now = opts.now || Date.now;
-		if (this.file && existsSync(this.file)) {
-			try {
-				const data = JSON.parse(readFileSync(this.file, "utf-8"));
-				if (data && typeof data === "object" && !Array.isArray(data)) this.threads = data;
-			} catch (err) {
-				console.error(`[agent-turns] ${this.file} unreadable, starting empty: ${err instanceof Error ? err.message : err}`);
-			}
+		this.load();
+	}
+
+	private load(): void {
+		if (!this.file || !existsSync(this.file)) { this.threads = {}; this.broken = null; return; }
+		try {
+			const data = JSON.parse(readFileSync(this.file, "utf-8"));
+			if (!validTurns(data)) throw new Error("malformed entries");
+			this.threads = data;
+			this.broken = null;
+		} catch (err) {
+			this.broken = err instanceof Error ? err.message : String(err);
 		}
+	}
+
+	private usable(): boolean {
+		if (this.broken !== null) this.load();
+		return this.broken === null;
 	}
 
 	count(threadKey: string): number {
@@ -180,7 +224,13 @@ export class AgentTurns {
 	}
 
 	/** Count this bot message toward the thread. ok=false when the cap is reached; firstHit once per capped run. */
-	take(threadKey: string, messageTs: string, cap: number): { ok: boolean; count: number; firstHit: boolean } {
+	take(threadKey: string, messageTs: string, cap: number): { ok: boolean; count: number; firstHit: boolean; broken?: string } {
+		if (!this.usable()) {
+			const now = this.now();
+			const firstHit = now - this.lastBrokenLog >= BROKEN_LOG_EVERY_MS;
+			if (firstHit) this.lastBrokenLog = now;
+			return { ok: false, count: 0, firstHit, broken: this.broken || "unreadable" };
+		}
 		this.prune();
 		const t = this.threads[threadKey] || { ts: [], updatedAt: this.now() };
 		if (messageTs && t.ts.includes(messageTs)) return { ok: true, count: t.ts.length, firstHit: false };
@@ -201,8 +251,9 @@ export class AgentTurns {
 		return { ok: true, count: t.ts.length, firstHit: false };
 	}
 
-	/** A human posted in the thread: the agents may continue. */
+	/** A real human posted in the thread: the agents may continue. */
 	humanSpoke(threadKey: string): void {
+		if (!this.usable()) return; // never overwrite a corrupt file
 		if (!this.threads[threadKey]) return;
 		delete this.threads[threadKey];
 		this.save();
@@ -211,12 +262,19 @@ export class AgentTurns {
 	private prune(): void {
 		const cutoff = this.now() - TURN_TTL_MS;
 		for (const [k, v] of Object.entries(this.threads)) {
-			if (!v || !Array.isArray(v.ts) || (v.updatedAt || 0) < cutoff) delete this.threads[k];
+			if ((v.updatedAt || 0) < cutoff) delete this.threads[k];
+		}
+		const keys = Object.keys(this.threads);
+		if (keys.length > MAX_TURN_THREADS) {
+			keys.sort((a, b) => this.threads[a].updatedAt - this.threads[b].updatedAt)
+				.slice(0, keys.length - MAX_TURN_THREADS)
+				.forEach((k) => delete this.threads[k]);
 		}
 	}
 
 	private save(): void {
-		if (!this.file) return;
+		if (!this.file || this.broken !== null) return;
+		this.prune();
 		try {
 			mkdirSync(path.dirname(this.file), { recursive: true });
 			const tmp = `${this.file}.tmp-${process.pid}`;
@@ -243,7 +301,7 @@ export class BotEventSeen {
 
 export type BotDecision =
 	| { kind: "human" }
-	| { kind: "drop"; reason: "own" | "not-allowed" | "not-addressed" | "duplicate" | "cap"; log?: string }
+	| { kind: "drop"; reason: "own" | "not-allowed" | "not-addressed" | "duplicate" | "cap" | "turns-unreadable"; log?: string }
 	| { kind: "accept"; via: "mention" | "handoff"; bot: AcceptedBot; sender: BotSenderInfo; senderLine: string };
 
 export function admitBotMessage(args: {
@@ -252,10 +310,11 @@ export function admitBotMessage(args: {
 	ev: SlackMsgLike;
 	turns: AgentTurns;
 	seen: BotEventSeen;
+	slackIsBot?: boolean; // users.info is_bot for ev.user (an untagged event from a bot user is a bot)
 }): BotDecision {
 	const { agent, policy, ev, turns, seen } = args;
 	if (isOwnMessage(agent, ev)) return { kind: "drop", reason: "own" };
-	if (!isBotMessage(ev, policy)) return { kind: "human" };
+	if (!isBotMessage(ev, policy, args.slackIsBot)) return { kind: "human" };
 
 	const bot = matchAcceptedBot(ev, policy);
 	if (!bot) return { kind: "drop", reason: "not-allowed" };
@@ -270,6 +329,15 @@ export function admitBotMessage(args: {
 	const threadTs = ev.thread_ts || ts;
 	const key = `${ev.channel || ""}:${threadTs}`;
 	const taken = turns.take(key, ts, policy.agentTurnCap);
+	if (!taken.ok && taken.broken) {
+		return {
+			kind: "drop",
+			reason: "turns-unreadable",
+			...(taken.firstHit ? {
+				log: `[${agent.name}] agent-turns file unreadable or corrupt (${taken.broken}): ignoring ALL bot messages until it is fixed or removed`,
+			} : {}),
+		};
+	}
 	if (!taken.ok) {
 		return {
 			kind: "drop",
