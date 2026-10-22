@@ -23,6 +23,14 @@ Edit `./memory/rules.md` immediately. One line. Edit-in-place — if a similar r
 Good: `- All reports in English only. (operator, permanent.)`
 Bad: `- 2026-04-19 11:00: operator said English today ...`
 
+**Then confirm in the same thread**, right after the edit, with the exact line you wrote:
+`נרשם: <the line>` (the line as it now stands in `rules.md`). One reply, nothing else in it. If you
+could not write the file, say so instead; never confirm a rule you did not save.
+
+**Never delete a rule.** A rule leaves `rules.md` only when the user explicitly asks to drop it.
+A newer rule that contradicts an older one amends that line (newer wins, keep the old *why* if it
+still applies); it does not remove it silently. Consolidation may merge rules, never delete one.
+
 **When something happens during a session** (scan result, action, observation, follow-up):
 Append to the current quarter's episode file.
 
@@ -60,4 +68,4 @@ grep -n -B1 -A4 'daniel-goldberg' ./memory/episodes/2026-Q2.md | head -60
 
 ## Consolidation (nightly cron only)
 
-If you ARE the nightly `memory-consolidate` cron session, the full consolidation procedure lives at `/workspace/.shared/skills/memory-curation/consolidation-routine.md`. `cat` that file and follow it. Live sessions do not need it.
+If you ARE the nightly `memory-consolidate` cron session, the full consolidation procedure lives at `/workspace/.framework/skills/memory-curation/consolidation-routine.md`. `cat` that file and follow it. Live sessions do not need it.
