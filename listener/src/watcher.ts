@@ -2,8 +2,9 @@
  * Watcher — ginnie-agents framework watchdog.
  *
  * Long-running Slack Socket Mode bot that:
- *  - Periodically runs deterministic health checks (token age, framework update,
- *    PM2 listener health, disk, memory caps)
+ *  - Periodically runs deterministic health checks (token age, PM2 listener
+ *    health, disk, memory caps, scheduler rejects, run failures, dead Slack
+ *    sockets, and framework updates when opted in)
  *  - DMs the operator only when a check fires
  *  - Posts interactive buttons on actionable alerts (update now, ack, restart)
  *  - Responds to /watcher slash commands for on-demand status / pause / doctor
@@ -16,7 +17,9 @@
  *   OPERATOR_SLACK_ID   — U0XXXXXXXXX (the human to DM)
  *
  * Optional:
- *   WATCHER_CHECK_INTERVAL_MIN — minutes between automatic checks (default 60)
+ *   WATCHER_CHECK_INTERVAL_MIN: minutes between automatic checks (default 60)
+ *   WATCHER_FRAMEWORK_UPDATES: "on" to DM when the framework upstream has new
+ *                              commits (default off)
  */
 
 import { App, type SlackAction } from "@slack/bolt";

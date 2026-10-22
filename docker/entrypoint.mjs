@@ -17,8 +17,19 @@
  *   AGENT_MESSAGE          — The prompt/task for the agent
  *   AGENT_NAME             — Agent name (for logging + system prompt headers)
  *   RESUME_SESSION_ID      — Optional: session ID to resume
+ *   RESUME_STRICT          — Optional: "1" when the resume continues an
+ *                             interrupted run (after a usage limit). If that
+ *                             session is gone the run fails instead of
+ *                             starting over, so no action is repeated.
+ *   WHATSAPP_API_URL       — Optional: the WhatsApp gateway's agent API as
+ *   WHATSAPP_ACCOUNT_ID       seen from the container; loads the whatsapp
+ *                             framework skill. The token stays in
+ *                             credentials.json (whatsapp_token).
  *   MAX_TURNS              — Optional: max agentic turns (default: 50)
  *   ALLOWED_TOOLS          — Optional: comma-separated tool list
+ *   AGENT_MODEL            — Optional: model or alias (e.g. "opus"). The model
+ *                             the SDK actually resolved is logged at session
+ *                             start and returned as `model` in the result JSON.
  *   TZ                     — Optional: container timezone (default: UTC)
  *   DELIVERY_INSTRUCTION   — Optional: extra system-prompt text appended after
  *                             PROMPT.md, telling the agent how to deliver its
@@ -28,6 +39,9 @@
  */
 
 import { createRequire } from "module";
+import { bottomLineSkill, whatsappSkill } from "./prompt-skills.mjs";
+import { createLimitTracker } from "./limit-detect.mjs";
+import { CONTINUE_AFTER_ERROR_MESSAGE, nextStep } from "./run-policy.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -67,6 +81,9 @@ if (!message) {
 //   4. /workspace/.framework/skills/           — framework-shipped runtime skills
 //      memory-curation/SKILL.md                  (canonical memory model)
 //      routines/SKILL.md                         (canonical schedules.json schema)
+//      bottom-line/SKILL.md                      (routine summary post; only when
+//                                                BOTTOM_LINE_CHANNEL is set, with the
+//                                                channel filled in)
 //   5. /workspace/PROMPT.md                    — agent-specific role & behaviors
 //   6. DELIVERY_INSTRUCTION env var (if set)   — how to deliver THIS turn's answer;
 //                                                sits right after PROMPT.md so it
@@ -148,6 +165,8 @@ const localKnownUsersPath = "/workspace/known-users.json";
 const soulPath = "/workspace/SOUL.md";
 const memorySkillPath = "/workspace/.framework/skills/memory-curation/SKILL.md";
 const routinesSkillPath = "/workspace/.framework/skills/routines/SKILL.md";
+const bottomLineSkillPath = "/workspace/.framework/skills/bottom-line/SKILL.md";
+const whatsappSkillPath = "/workspace/.framework/skills/whatsapp/SKILL.md";
 const promptPath = "/workspace/PROMPT.md";
 const rulesPath = "/workspace/memory/rules.md";
 const playbookPath = "/workspace/memory/playbook.md";
@@ -173,6 +192,17 @@ if (existsSync(soulPath)) {
 
 if (existsSync(memorySkillPath)) parts.push(readFileSync(memorySkillPath, "utf-8"));
 if (existsSync(routinesSkillPath)) parts.push(readFileSync(routinesSkillPath, "utf-8"));
+const bottomLine = bottomLineSkill(
+	existsSync(bottomLineSkillPath) ? readFileSync(bottomLineSkillPath, "utf-8") : null,
+	process.env.BOTTOM_LINE_CHANNEL,
+);
+if (bottomLine) parts.push(bottomLine);
+const whatsapp = whatsappSkill(
+	existsSync(whatsappSkillPath) ? readFileSync(whatsappSkillPath, "utf-8") : null,
+	process.env.WHATSAPP_API_URL,
+	process.env.WHATSAPP_ACCOUNT_ID,
+);
+if (whatsapp) parts.push(whatsapp);
 if (existsSync(promptPath)) parts.push(readFileSync(promptPath, "utf-8"));
 
 // Delivery instruction — MUST come after PROMPT.md so it overrides rather
@@ -206,11 +236,21 @@ console.error(`[${agentName}] Starting session${resumeId ? ` (resume: ${resumeId
 console.error(`[${agentName}] Tools: ${allowedTools.join(", ")}`);
 console.error(`[${agentName}] Max turns: ${maxTurns}`);
 
-async function runSession(resumeSessionId) {
-	let sessionId = resumeSessionId || "";
+// Usage-limit detection and tool-call count for this run. On a limit the
+// listener cools this subscription and retries on another one: from scratch
+// when no tool ran yet, else by resuming this session (so actions already
+// taken are not repeated). See listener/src/claude-accounts.ts.
+const tracker = createLimitTracker();
+let resolvedModel = "";
+// Latest known session id; also reported on the failure paths so the
+// listener can resume it.
+let sessionId = resumeId || "";
+
+async function runSession(resumeSessionId, prompt) {
+	sessionId = resumeSessionId || sessionId;
 
 	for await (const msg of query({
-		prompt: message,
+		prompt,
 		options: {
 			systemPrompt,
 			allowedTools,
@@ -223,9 +263,15 @@ async function runSession(resumeSessionId) {
 			model: process.env.AGENT_MODEL || undefined,
 		},
 	})) {
-		if (msg.type === "system" && msg.subtype === "init" && msg.session_id) {
-			sessionId = msg.session_id;
+		if (msg.type === "system" && msg.subtype === "init") {
+			if (msg.session_id) sessionId = msg.session_id;
+			if (msg.model && msg.model !== resolvedModel) {
+				resolvedModel = msg.model;
+				console.error(`[${agentName}] Model: ${resolvedModel}${process.env.AGENT_MODEL ? ` (requested: ${process.env.AGENT_MODEL})` : ""}`);
+			}
 		}
+
+		tracker.observe(msg);
 
 		if (msg.type === "result") {
 			const output = {
@@ -234,6 +280,9 @@ async function runSession(resumeSessionId) {
 				is_error: msg.is_error || false,
 				num_turns: msg.num_turns || 0,
 				cost_usd: msg.total_cost_usd || 0,
+				model: resolvedModel || undefined,
+				tool_calls: tracker.toolCalls,
+				...tracker.outcome(msg.is_error || false, msg.result || ""),
 			};
 			console.log(JSON.stringify(output));
 			console.error(`[${agentName}] Done — ${msg.num_turns} turns, $${(msg.total_cost_usd || 0).toFixed(4)}`);
@@ -241,44 +290,70 @@ async function runSession(resumeSessionId) {
 	}
 }
 
-// Transient/ambiguous API failures that are worth one or two automatic retries.
-// "Could not process image" is nominally a 400, but in practice it's an
-// intermittent server-side decode hiccup (verified: the same image + container
-// + model succeeds on every re-run), so we treat it as retryable. Genuinely
-// deterministic 400s (bad request shape, unsupported param) won't match and
-// still fail fast — no infinite loops.
-const TRANSIENT_ERROR =
-	/could not process image|overloaded|rate.?limit|\b429\b|\b5\d\d\b|internal server error|timed? ?out|ETIMEDOUT|ECONNRESET|ECONNREFUSED|fetch failed|socket hang up/i;
-const MAX_TRANSIENT_RETRIES = 2;
-
+// Retry rules (docker/run-policy.mjs): after any tool call the original
+// request is never replayed; the run continues its own session or fails.
 let transientRetries = 0;
 let sessionArg = resumeId;
+let prompt = message;
+let strictResume = !!resumeId && process.env.RESUME_STRICT === "1";
 while (true) {
 	try {
-		await runSession(sessionArg);
+		await runSession(sessionArg, prompt);
 		break;
 	} catch (err) {
 		const msg = String(err);
 
-		// Stale resume → start a fresh session (does not consume retry budget).
-		if (sessionArg && msg.includes("No conversation found")) {
-			console.error(`[${agentName}] Session ${String(sessionArg).slice(0, 20)}... expired, starting fresh`);
+		// Usage limit -> never retry here (it will not clear in seconds). The
+		// listener cools this subscription and retries on another one.
+		const limitFields = tracker.outcome(true, msg);
+		if (limitFields) {
+			console.error(`[${agentName}] usage limit hit${limitFields.limit_type ? ` (${limitFields.limit_type})` : ""}: ${msg.slice(0, 200)}`);
+			console.log(JSON.stringify({
+				session_id: sessionId,
+				is_error: true,
+				result: msg,
+				model: resolvedModel || undefined,
+				tool_calls: tracker.toolCalls,
+				...limitFields,
+			}));
+			process.exit(1);
+		}
+
+		const step = nextStep({
+			error: msg,
+			sessionArg,
+			strictResume,
+			toolCalls: tracker.toolCalls,
+			sessionId,
+			transientRetries,
+		});
+
+		if (step.action === "fresh") {
+			// Stale thread session and nothing done yet (does not consume retry budget).
+			console.error(`[${agentName}] Session ${String(sessionArg).slice(0, 20)}... not found, starting a new session (no tool calls yet)`);
 			sessionArg = undefined;
+			sessionId = "";
 			continue;
 		}
 
-		// Transient API error → brief backoff, then retry the same run.
-		if (TRANSIENT_ERROR.test(msg) && transientRetries < MAX_TRANSIENT_RETRIES) {
+		if (step.action === "retry" || step.action === "continue") {
 			transientRetries++;
 			const delay = 1500 * transientRetries;
-			console.error(`[${agentName}] transient error (retry ${transientRetries}/${MAX_TRANSIENT_RETRIES} in ${delay}ms): ${msg.slice(0, 200)}`);
+			if (step.action === "continue") {
+				// Tool calls already ran: resume this run's own session and ask it to
+				// continue, never re-send the original request.
+				sessionArg = step.sessionId;
+				prompt = CONTINUE_AFTER_ERROR_MESSAGE;
+				strictResume = true;
+			}
+			console.error(`[${agentName}] transient error (${step.action} ${transientRetries} in ${delay}ms): ${msg.slice(0, 200)}`);
 			await new Promise((r) => setTimeout(r, delay));
 			continue;
 		}
 
-		// Non-transient, or retries exhausted → fail (listener posts a fallback).
-		console.error(`[${agentName}] FATAL:`, err);
-		console.log(JSON.stringify({ session_id: "", is_error: true, result: String(err) }));
+		// Non-transient, retries exhausted, or a continuation that cannot resume.
+		console.error(`[${agentName}] FATAL${step.reason ? ` (${step.reason})` : ""}:`, err);
+		console.log(JSON.stringify({ session_id: sessionId, is_error: true, result: step.reason ? `${step.reason}: ${msg}` : String(err), tool_calls: tracker.toolCalls }));
 		process.exit(1);
 	}
 }

@@ -35,6 +35,9 @@ RUN npm install --production
 
 # Copy entrypoint
 COPY docker/entrypoint.mjs /app/entrypoint.mjs
+COPY docker/prompt-skills.mjs /app/prompt-skills.mjs
+COPY docker/limit-detect.mjs /app/limit-detect.mjs
+COPY docker/run-policy.mjs /app/run-policy.mjs
 
 # Create workspace and Claude config dirs
 RUN mkdir -p /workspace /home/node/.claude && chown -R node:node /workspace /home/node/.claude
