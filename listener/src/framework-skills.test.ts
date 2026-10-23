@@ -198,6 +198,32 @@ describe("bottom-line: prompt assembly includes the skill only when configured",
 	});
 });
 
+describe("bottom-line: never repeats what the reader already got directly", () => {
+	const body = () => readFileSync(path.join(skillsDir, "bottom-line", "SKILL.md"), "utf-8");
+	const section = (title: string) => {
+		const b = body();
+		const start = b.indexOf(`## ${title}`);
+		assert.ok(start >= 0, `missing section: ${title}`);
+		const end = b.indexOf("\n## ", start + 3);
+		return b.slice(start, end < 0 ? undefined : end);
+	};
+
+	test("no longer says it is posted on top of reports sent elsewhere", () => {
+		assert.doesNotMatch(body(), /does not replace any report/i);
+	});
+
+	test("skips a finding or question already sent directly to the channel's reader", () => {
+		const s = section("When to post").replace(/\s+/g, " ");
+		assert.match(s, /already sent .*directly to the person who reads/is);
+		assert.match(s, /do not post it here/i);
+		assert.match(s, /only for findings .*not received directly/is);
+	});
+
+	test("the pre-post check repeats the rule", () => {
+		assert.match(section("Plain words").replace(/\s+/g, " "), /already (got|received) it directly/i);
+	});
+});
+
 describe("consolidation: rules survival check fails closed (review B3)", () => {
 	const { spawnSync } = require("node:child_process");
 	const { mkdtempSync, writeFileSync, rmSync } = require("node:fs");

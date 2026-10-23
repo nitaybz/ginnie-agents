@@ -7,8 +7,8 @@ description: Every routine that ends with a material finding posts a short plain
 
 The operator reads one channel to know what every agent found: `{{BOTTOM_LINE_CHANNEL}}`.
 This applies only to turns started by the scheduler: the message opens with the sender line `From: scheduler | role: system | schedule_id: <id>` (some routine messages also carry `[ROUTINE: <id>]`). The routine id is that `schedule_id`.
-It does not apply to live conversations, and it does not replace any report your PROMPT asks
-you to post elsewhere.
+It does not apply to live conversations. Reports your PROMPT asks you to send elsewhere still go
+there; this channel only adds what its reader has not already received (see "When to post").
 
 ## When to post
 
@@ -16,6 +16,12 @@ Post only when the routine produced a **material finding**: something the operat
 to know or act on (a change in a key number, a problem, a decision needed, an action you took).
 If nothing material happened, post nothing here. Never post "all clear", "nothing new" or
 "routine complete". Memory consolidation and other silent routines never post.
+
+**No duplicates.** If this run already sent the finding or question directly to the person who reads
+this channel (a direct message, an email to them, a message to them on another app), do not post it
+here as well, not even as "I asked them privately, waiting for an answer". They would read the same
+thing twice. This channel is only for findings that reader has not received directly. A message to
+someone else (a supplier, a colleague, a group) does not count: the reader still needs the finding here.
 
 At most **one** bottom-line post per routine run, and at most one per day per `schedule_id`
 unless the finding changed. Routines that run often (every 30 minutes, every hour) must not
@@ -54,7 +60,8 @@ understand is a failure, even if every fact in it is right.
 4. **One clear ask.** If you need something, end with one question that can be answered yes or no,
    saying what happens on yes. If you need nothing, say nothing about it (no "no action needed").
 5. **Check before posting:** could someone who has never seen your systems repeat the post back in one
-   sentence? If not, rewrite it.
+   sentence? If not, rewrite it. And if the reader already got it directly from you in this run, do not
+   post it at all.
 
 ## How to post
 
