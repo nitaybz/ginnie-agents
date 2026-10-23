@@ -2,7 +2,7 @@
  * Contract tests for the framework-shipped runtime skills and how they reach
  * the agent container.
  *
- *   - bottom-line: routines with a material finding post a 2-4 line summary to
+ *   - bottom-line: routines with a material finding post a short summary to
  *     the channel in BOTTOM_LINE_CHANNEL, details in a thread. The listener
  *     forwards the env var into the container; the entrypoint loads the skill
  *     (like `routines`) only when the channel is configured.
@@ -37,9 +37,9 @@ describe("bottom-line skill", () => {
 		assert.doesNotMatch(body, /\bC0[A-Z0-9]{8,}\b/, "no hard-coded Slack channel id");
 	});
 
-	test("states the post shape: 2-4 lines, details in a thread, only on material findings", () => {
+	test("states the post shape: up to 3 short lines, details in a thread, only on material findings", () => {
 		const body = readFileSync(skillPath, "utf-8");
-		assert.match(body, /2-4 lines/);
+		assert.match(body, /up to 3 short lines/);
 		assert.match(body, /thread/i);
 		assert.match(body, /material/i);
 	});
@@ -130,6 +130,43 @@ describe("bottom-line: posting guard (review minor)", () => {
 		assert.ok(b.includes("date +%F"));
 		assert.ok(b.includes("$SCHEDULE_ID"));
 		assert.ok(b.includes("grep -qxF"));
+	});
+});
+
+describe("bottom-line: plain words for the reader (no internal ids on the post)", () => {
+	const body = () => readFileSync(path.join(skillsDir, "bottom-line", "SKILL.md"), "utf-8");
+	const shape = () => {
+		const b = body();
+		const start = b.indexOf("## The shape");
+		return b.slice(start, b.indexOf("## ", start + 3));
+	};
+	const firstLine = () => {
+		const block = shape().split("```")[1] || "";
+		return block.split("\n").map((l) => l.trim()).filter(Boolean)[0] || "";
+	};
+
+	test("the post starts with the agent name and the finding, with no date or schedule id", () => {
+		const first = firstLine();
+		assert.match(first, /^\[<your name>\] /);
+		assert.ok(/finding/i.test(first), `first line must carry the finding: ${first}`);
+		assert.doesNotMatch(first, /YYYY|<date>|schedule_id|routine id/i);
+	});
+
+	test("the post body never shows the routine id or a date header", () => {
+		assert.match(shape(), /never show the date, the routine id/i);
+	});
+
+	test("states the plain-words rules generically", () => {
+		const b = body();
+		assert.match(b, /## Plain words/);
+		assert.match(b, /first time/i);
+		assert.match(b, /No internal words/i);
+		assert.match(b, /yes\/no/i);
+		assert.match(b, /up to 3 short lines/i);
+	});
+
+	test("the dedup key still uses the date and schedule_id (only the post text changed)", () => {
+		assert.ok(body().includes('KEY="$(date +%F) $SCHEDULE_ID'));
 	});
 });
 
