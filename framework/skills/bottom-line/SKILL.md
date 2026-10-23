@@ -1,6 +1,6 @@
 ---
 name: bottom-line
-description: Every routine that ends with a material finding posts a 2-4 line summary to one shared Slack channel, with the details in a thread under it. Loaded automatically when the operator sets BOTTOM_LINE_CHANNEL.
+description: Every routine that ends with a material finding posts a short plain-words summary (up to 3 lines) to one shared Slack channel, with any detail a human would act on in a thread under it. Loaded automatically when the operator sets BOTTOM_LINE_CHANNEL.
 ---
 
 # Bottom Line: one short post per routine that found something
@@ -23,23 +23,43 @@ repeat the same finding; the guard below enforces this.
 
 ## The shape
 
-A top-level message in `{{BOTTOM_LINE_CHANNEL}}`, **2-4 lines**, plain words, no tables, no buttons:
+A top-level message in `{{BOTTOM_LINE_CHANNEL}}`, **up to 3 short lines**, plain words, no tables, no buttons:
 
 ```
-[<your name>] <YYYY-MM-DD> <schedule_id>
-<the finding, with the one number that matters>
+[<your name>] <the finding in plain words, with the one number that matters>
 <optional: why it matters, or what you did>
-<optional: what you need from a human, or "no action needed">
+<optional: one yes/no question for a human, saying what happens on yes>
 ```
 
-Then put the details (numbers, lists, evidence, links) in **one reply in the thread** of that
-post. If the routine already posted a full report elsewhere, the thread reply can be a link to
-it plus anything not in it. Write in the language your PROMPT and rules use for reports.
+Never show the date, the routine id or the `schedule_id` in the post. Slack already shows when and
+who, and the reader does not know your routines. They are used only in the dedup key below.
+
+Then, only if a human would act on it or check it, put the detail in **one reply in the thread** of
+that post, in the same plain words. If the routine already posted a full report elsewhere, the thread
+reply can be a link to it. Your technical record (queries, ids, logs) belongs in your own memory, not
+here. Write in the language your PROMPT and rules use for reports.
+
+## Plain words
+
+The reader is a busy person hearing about this topic for the first time. They do not know your files,
+skills, routines, scripts, versions or ids, and should never need to. A short post they cannot
+understand is a failure, even if every fact in it is right.
+
+1. **The first line says what it means for the business**: money, customers, a risk, or what you need.
+   Not what you ran or how.
+2. **No internal words.** No file, skill or routine names, no ids, no code, API or field names, no
+   version names, no internal nicknames, no acronyms the reader did not use first. If something must be
+   named, say what it is ("the chat button on the website"), not what it is called inside.
+3. **Short.** Up to 3 short lines. One number that matters beats five. No arrows, no shorthand.
+4. **One clear ask.** If you need something, end with one question that can be answered yes or no,
+   saying what happens on yes. If you need nothing, say nothing about it (no "no action needed").
+5. **Check before posting:** could someone who has never seen your systems repeat the post back in one
+   sentence? If not, rewrite it.
 
 ## How to post
 
 Set `SCHEDULE_ID` (from the sender line), `FINDING` (the finding line alone, without dates or
-times, so the same finding gives the same key), `SUMMARY` (the 2-4 lines) and `DETAILS`. Then:
+times, so the same finding gives the same key), `SUMMARY` (the post lines) and `DETAILS` (the thread reply, or empty when there is nothing a human would act on). Then:
 
 ```bash
 export SLACK_BOT_TOKEN=$(jq -r .slack_bot_token ./credentials.json)
@@ -56,9 +76,11 @@ else
   if [ -z "$TS" ]; then
     echo "bottom-line: post failed: $(printf '%s' "$RESP" | jq -r '.error // "no response"')"
   else
-    curl -s -X POST https://slack.com/api/chat.postMessage \
-      -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H "Content-Type: application/json; charset=utf-8" \
-      -d "$(jq -n --arg c "$CH" --arg ts "$TS" --arg t "$DETAILS" '{channel:$c, thread_ts:$ts, text:$t}')" >/dev/null
+    if [ -n "$DETAILS" ]; then
+      curl -s -X POST https://slack.com/api/chat.postMessage \
+        -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H "Content-Type: application/json; charset=utf-8" \
+        -d "$(jq -n --arg c "$CH" --arg ts "$TS" --arg t "$DETAILS" '{channel:$c, thread_ts:$ts, text:$t}')" >/dev/null
+    fi
     echo "$KEY" >> "$SENT"
   fi
 fi

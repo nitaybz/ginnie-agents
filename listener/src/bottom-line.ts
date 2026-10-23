@@ -1,5 +1,5 @@
 /**
- * Bottom line: the channel where routines post their 2-4 line summary.
+ * Bottom line: the channel where routines post their short plain-words summary.
  *
  * Configured once per install with BOTTOM_LINE_CHANNEL in the listener .env
  * (a Slack channel id or #name). The runner forwards it into every agent
