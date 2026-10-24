@@ -10,6 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     ca-certificates \
     python3 \
+    poppler-utils \
+    tesseract-ocr \
+    tesseract-ocr-heb \
+    tesseract-ocr-eng \
     && rm -rf /var/lib/apt/lists/*
 
 # Supabase CLI — agents use this for read-only DB queries via their own PAT.
