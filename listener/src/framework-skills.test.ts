@@ -2,8 +2,8 @@
  * Contract tests for the framework-shipped runtime skills and how they reach
  * the agent container.
  *
- *   - bottom-line: routines with a material finding post a short summary to
- *     the channel in BOTTOM_LINE_CHANNEL, details in a thread. The listener
+ *   - bottom-line: routines with a material finding post one short summary to
+ *     the channel in BOTTOM_LINE_CHANNEL (no name prefix, no thread reply). The listener
  *     forwards the env var into the container; the entrypoint loads the skill
  *     (like `routines`) only when the channel is configured.
  *   - memory-curation: consolidation may merge rules but never delete one;
@@ -37,10 +37,11 @@ describe("bottom-line skill", () => {
 		assert.doesNotMatch(body, /\bC0[A-Z0-9]{8,}\b/, "no hard-coded Slack channel id");
 	});
 
-	test("states the post shape: up to 3 short lines, details in a thread, only on material findings", () => {
+	test("states the post shape: up to 3 short lines, one message, no thread reply, only on material findings", () => {
 		const body = readFileSync(skillPath, "utf-8");
 		assert.match(body, /up to 3 short lines/);
-		assert.match(body, /thread/i);
+		assert.match(body, /No thread reply/);
+		assert.match(body, /never reply to your own post/i);
 		assert.match(body, /material/i);
 	});
 
@@ -120,9 +121,16 @@ describe("bottom-line: triggers on scheduler turns (review B1)", () => {
 describe("bottom-line: posting guard (review minor)", () => {
 	const body = () => readFileSync(path.join(skillsDir, "bottom-line", "SKILL.md"), "utf-8");
 
-	test("only posts the thread reply when the first post returned a ts", () => {
+	test("records the dedup key only when the post returned a ts", () => {
 		assert.ok(body().includes(".ts // empty"));
 		assert.match(body(), /if \[ -z "\$TS" \]/);
+	});
+
+	test("sends exactly one message: no DETAILS variable and no thread_ts call", () => {
+		const b = body();
+		assert.ok(!b.includes("$DETAILS"), "DETAILS thread reply must be gone");
+		assert.ok(!b.includes("thread_ts:$ts"), "no second chat.postMessage into the thread");
+		assert.equal((b.match(/chat\.postMessage/g) || []).length, 1, "exactly one chat.postMessage in the snippet");
 	});
 
 	test("at most once per day per schedule_id unless the finding changed", () => {
@@ -145,11 +153,19 @@ describe("bottom-line: plain words for the reader (no internal ids on the post)"
 		return block.split("\n").map((l) => l.trim()).filter(Boolean)[0] || "";
 	};
 
-	test("the post starts with the agent name and the finding, with no date or schedule id", () => {
+	test("the post starts with the finding itself: no name prefix, no date or schedule id", () => {
 		const first = firstLine();
-		assert.match(first, /^\[<your name>\] /);
+		assert.doesNotMatch(first, /^\[/, `no [name] prefix, Slack shows the sender: ${first}`);
 		assert.ok(/finding/i.test(first), `first line must carry the finding: ${first}`);
 		assert.doesNotMatch(first, /YYYY|<date>|schedule_id|routine id/i);
+		assert.match(shape(), /never start the post with your name/i);
+	});
+
+	test("one message only: any detail worth acting on is a short 4th line, never a thread reply", () => {
+		const s = shape().replace(/\s+/g, " ");
+		assert.match(s, /No thread reply/);
+		assert.match(s, /same message as a short 4th line/i);
+		assert.doesNotMatch(s, /reply in the thread/i);
 	});
 
 	test("the post body never shows the routine id or a date header", () => {

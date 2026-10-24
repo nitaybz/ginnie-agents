@@ -1,6 +1,6 @@
 ---
 name: bottom-line
-description: Every routine that ends with a material finding posts a short plain-words summary (up to 3 lines) to one shared Slack channel, with any detail a human would act on in a thread under it. Loaded automatically when the operator sets BOTTOM_LINE_CHANNEL.
+description: Every routine that ends with a material finding posts one short plain-words message (up to 3 lines) to one shared Slack channel. One message per finding, no thread reply, no name prefix. Loaded automatically when the operator sets BOTTOM_LINE_CHANNEL.
 ---
 
 # Bottom Line: one short post per routine that found something
@@ -29,21 +29,23 @@ repeat the same finding; the guard below enforces this.
 
 ## The shape
 
-A top-level message in `{{BOTTOM_LINE_CHANNEL}}`, **up to 3 short lines**, plain words, no tables, no buttons:
+**One** top-level message in `{{BOTTOM_LINE_CHANNEL}}`, **up to 3 short lines**, plain words, no tables, no buttons:
 
 ```
-[<your name>] <the finding in plain words, with the one number that matters>
+<the finding in plain words, with the one number that matters>
 <optional: why it matters, or what you did>
 <optional: one yes/no question for a human, saying what happens on yes>
 ```
 
+Never start the post with your name in brackets or any other prefix: Slack already shows who sent it.
 Never show the date, the routine id or the `schedule_id` in the post. Slack already shows when and
 who, and the reader does not know your routines. They are used only in the dedup key below.
 
-Then, only if a human would act on it or check it, put the detail in **one reply in the thread** of
-that post, in the same plain words. If the routine already posted a full report elsewhere, the thread
-reply can be a link to it. Your technical record (queries, ids, logs) belongs in your own memory, not
-here. Write in the language your PROMPT and rules use for reports.
+**No thread reply.** The post is the whole message; never reply to your own post. If there is one detail
+a human would act on or check (an amount, a name, a link to the full report), it goes into the same
+message as a short 4th line, and only when truly needed. Everything else is dropped: your full report
+already lives in your own channel, and your technical record (queries, ids, logs) belongs in your own
+memory, not here. Write in the language your PROMPT and rules use for reports.
 
 ## Plain words
 
@@ -66,7 +68,7 @@ understand is a failure, even if every fact in it is right.
 ## How to post
 
 Set `SCHEDULE_ID` (from the sender line), `FINDING` (the finding line alone, without dates or
-times, so the same finding gives the same key), `SUMMARY` (the post lines) and `DETAILS` (the thread reply, or empty when there is nothing a human would act on). Then:
+times, so the same finding gives the same key) and `SUMMARY` (the post lines, the whole message). Then:
 
 ```bash
 export SLACK_BOT_TOKEN=$(jq -r .slack_bot_token ./credentials.json)
@@ -83,15 +85,11 @@ else
   if [ -z "$TS" ]; then
     echo "bottom-line: post failed: $(printf '%s' "$RESP" | jq -r '.error // "no response"')"
   else
-    if [ -n "$DETAILS" ]; then
-      curl -s -X POST https://slack.com/api/chat.postMessage \
-        -H "Authorization: Bearer $SLACK_BOT_TOKEN" -H "Content-Type: application/json; charset=utf-8" \
-        -d "$(jq -n --arg c "$CH" --arg ts "$TS" --arg t "$DETAILS" '{channel:$c, thread_ts:$ts, text:$t}')" >/dev/null
-    fi
     echo "$KEY" >> "$SENT"
   fi
 fi
 ```
 
-If the post fails (for example `not_in_channel`), do not retry in a loop and do not post the
-thread reply. Note it in your episode log and carry on; the routine's own work still counts.
+That is the only message this routine sends to `{{BOTTOM_LINE_CHANNEL}}`: no second call with `thread_ts`.
+If the post fails (for example `not_in_channel`), do not retry in a loop. Note it in your episode log
+and carry on; the routine's own work still counts.
