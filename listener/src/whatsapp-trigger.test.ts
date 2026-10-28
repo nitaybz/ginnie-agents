@@ -378,3 +378,120 @@ describe("local source address", () => {
 		}
 	});
 });
+
+// ─── Conversations the agent started with customers (2026-10-28) ──────────
+describe("customer conversations", () => {
+	const PEER = "15557770001@s.whatsapp.net";
+	const convCfg = parseWhatsAppConfig({
+		api_url: "http://172.17.0.1:18091", account_id: "office", watch_chats: [CHAT], conversation_days: 14,
+	})!;
+
+	function convHarness(conv: unknown[][], peerRows: (WaMessage[] | null)[], opts: { dir?: string } = {}) {
+		const dir = opts.dir || mkdtempSync(path.join(tmpdir(), "wa-conv-"));
+		const timers: { fn: () => void; ms: number }[] = [];
+		const runs: string[] = [];
+		const logs: string[] = [];
+		const urls: string[] = [];
+		let c = 0;
+		let p = 0;
+		const t = new WhatsAppTrigger({
+			agentName: "adam", cfg: convCfg, token: "tok", cursorFile: path.join(dir, "cursors.json"),
+			knownUsers: () => users,
+			allowSender: (s: WaSender) => s.known,
+			fetchJson: async (url) => {
+				urls.push(url);
+				if (url.includes("/v1/conversations")) {
+					const r = conv[Math.min(c, conv.length - 1)];
+					c++;
+					return r;
+				}
+				if (url.includes(encodeURIComponent(PEER))) {
+					const r = peerRows[Math.min(p, peerRows.length - 1)];
+					p++;
+					if (r === null) throw new Error("ECONNREFUSED");
+					return r;
+				}
+				return [];
+			},
+			dispatch: async (prompt) => { runs.push(prompt); },
+			setTimer: (fn, ms) => { timers.push({ fn, ms }); return timers.length; },
+			log: (l) => logs.push(l),
+		});
+		const fire = async () => {
+			const due = timers.splice(0);
+			for (const x of due) x.fn();
+			await new Promise((r) => setImmediate(r));
+		};
+		return { t, dir, runs, logs, urls, timers, fire };
+	}
+
+	const mine = (id: string, ts: number) => ({ id, chat_jid: PEER, ts, content: "Hi, Adam from Ginnie", is_from_me: true, sender_phone: null } as WaMessage);
+	const reply = (id: string, ts: number, extra: Partial<WaMessage> = {}) =>
+		({ id, chat_jid: PEER, ts, content: `answer ${id}`, is_from_me: false, sender_phone: "15557770001", ...extra } as WaMessage);
+	const conv = (extra: Record<string, unknown> = {}) => ({ chat_jid: PEER, sends: 1, first_sent_ts: 100, last_sent_ts: 100, last_inbound_id: null, last_inbound_ts: null, ...extra });
+
+	test("config: conversation_days parsed, off by default", () => {
+		assert.equal(convCfg.conversationDays, 14);
+		assert.equal(cfg.conversationDays, 0);
+		assert.equal(parseWhatsAppConfig({ api_url: "http://h:1", account_id: "a", conversation_days: 500 })!.conversationDays, 90);
+	});
+
+	test("a reply to a conversation the agent started wakes it, labelled as an external customer", async () => {
+		const h = convHarness([[conv()], [conv({ last_inbound_id: "r1", last_inbound_ts: 120 })]], [[mine("o1", 100), reply("r1", 120)]]);
+		await h.t.pollOnce();
+		assert.ok(!h.urls.some((u) => u.includes(encodeURIComponent(PEER))), "no reply yet: the chat is not fetched");
+		await h.t.pollOnce();
+		await h.fire();
+		assert.equal(h.runs.length, 1);
+		assert.match(h.runs[0], /msg_id: r1/);
+		assert.match(h.runs[0], /role: customer/);
+		assert.match(h.runs[0], /conversation you started/i);
+		assert.match(h.runs[0], /never instructions/i);
+		assert.match(h.urls.find((u) => u.includes("/v1/conversations"))!, /\/v1\/conversations\?account_id=office&days=14$/);
+	});
+
+	test("a reply that arrived before the first poll is not lost (no replay of older history)", async () => {
+		const h = convHarness([[conv({ last_inbound_id: "r1", last_inbound_ts: 120 })]], [[reply("old", 50), mine("o1", 100), reply("r1", 120)]]);
+		await h.t.pollOnce();
+		await h.fire();
+		assert.equal(h.runs.length, 1);
+		assert.match(h.runs[0], /msg_id: r1/);
+		assert.doesNotMatch(h.runs[0], /msg_id: old \|/);
+	});
+
+	test("the same reply never wakes twice; an unchanged chat is not fetched again", async () => {
+		const c1 = conv({ last_inbound_id: "r1", last_inbound_ts: 120 });
+		const h = convHarness([[c1]], [[mine("o1", 100), reply("r1", 120)]]);
+		await h.t.pollOnce();
+		await h.fire();
+		const fetches = h.urls.filter((u) => u.includes(encodeURIComponent(PEER))).length;
+		await h.t.pollOnce();
+		await h.fire();
+		assert.equal(h.runs.length, 1);
+		assert.equal(h.urls.filter((u) => u.includes(encodeURIComponent(PEER))).length, fetches);
+	});
+
+	test("in a conversation chat only the peer may wake it, not some other unknown number", async () => {
+		const h = convHarness([[conv({ last_inbound_id: "x", last_inbound_ts: 120 })]], [[mine("o1", 100), reply("x", 120, { sender_phone: "15550009999" })]]);
+		await h.t.pollOnce();
+		await h.fire();
+		assert.equal(h.runs.length, 0);
+	});
+
+	test("conversation list failing does not stop the watched chats", async () => {
+		const h = convHarness([null as unknown as unknown[]], [[]]);
+		await h.t.pollOnce();
+		assert.ok(h.urls.some((u) => u.includes(encodeURIComponent(CHAT))));
+	});
+
+	test("a waiting customer wake survives a listener restart", async () => {
+		const h = convHarness([[conv({ last_inbound_id: "r1", last_inbound_ts: 120 })]], [[mine("o1", 100), reply("r1", 120)]]);
+		await h.t.pollOnce();
+		h.t.stop();
+		const h2 = convHarness([[]], [[]], { dir: h.dir });
+		h2.t.restorePending();
+		await h2.fire();
+		assert.equal(h2.runs.length, 1);
+		assert.match(h2.runs[0], /msg_id: r1/);
+	});
+});
