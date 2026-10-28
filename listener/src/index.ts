@@ -729,7 +729,7 @@ function startWhatsAppTriggers(): void {
 			},
 		});
 		trigger.start();
-		console.log(`   WhatsApp wake-up: ${agent.name} (${cfg.accountId}, ${cfg.watchChats.length} chat${cfg.watchChats.length > 1 ? "s" : ""}, ${cfg.conversationDays ? ` + conversations it started in the last ${cfg.conversationDays} days` : ""}, every ${cfg.pollSeconds}s)`);
+		console.log(`   WhatsApp wake-up: ${agent.name} (${cfg.accountId}, ${cfg.watchChats.length} chat${cfg.watchChats.length > 1 ? "s" : ""}, ${cfg.conversationDays ? ` + conversations it started ${cfg.conversationDays < 0 ? "(all time)" : `in the last ${cfg.conversationDays} days`}` : ""}${cfg.presence ? ", read+typing" : ""}, every ${cfg.pollSeconds}s)`);
 	}
 }
 

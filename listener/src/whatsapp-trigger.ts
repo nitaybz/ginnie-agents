@@ -14,8 +14,14 @@
  *     "debounce_seconds": 4,                  // optional: a burst becomes one run
  *     "context_messages": 15,                 // optional: recent history shown with the wake
  *     "local_address": "127.0.0.1",           // optional: source IP for the listener's polls
- *     "conversation_days": 14                 // optional: also watch 1:1 chats the agent started
+ *     "conversation_days": 14,                // optional: also watch 1:1 chats the agent started ("all" = ever)
+ *     "presence": true                        // optional: blue ticks + "typing..." while the agent works
  *   }
+ *
+ * presence: when a batch wakes the agent, its messages are marked read and the
+ * chat shows "typing..." (POST /v1/read, /v1/typing), refreshed every 20 s
+ * until the run ends, then cleared. Best effort: a failing call is logged and
+ * never delays or blocks the run.
  *
  * conversation_days (1-90, 0/absent = off): each poll also asks the gateway
  * for the 1:1 chats this agent sent to in that many days (GET
@@ -76,8 +82,10 @@ export interface WhatsAppConfig {
 	contextMessages: number;
 	// Source IP for polls; undefined = system default (plain fetch).
 	localAddress?: string;
-	// Days of agent-started 1:1 chats to watch too; 0 = off.
+	// Days of agent-started 1:1 chats to watch too; 0 = off, -1 = all time.
 	conversationDays: number;
+	// Mark woken messages read and show "typing..." during the run.
+	presence: boolean;
 }
 
 export interface WaConversation {
@@ -145,8 +153,10 @@ export function parseWhatsAppConfig(raw: unknown): WhatsAppConfig | undefined {
 		debounceSeconds: num(r.debounce_seconds, 4, 0, 120),
 		contextMessages: num(r.context_messages, 15, 0, 50),
 		localAddress: isIP(local) ? local : undefined,
-		conversationDays: typeof r.conversation_days === "number" && r.conversation_days > 0
-			? Math.round(num(r.conversation_days, 0, 1, 90)) : 0,
+		conversationDays: r.conversation_days === "all" ? -1
+			: typeof r.conversation_days === "number" && r.conversation_days > 0
+				? Math.round(num(r.conversation_days, 0, 1, 90)) : 0,
+		presence: r.presence === true,
 	};
 }
 
@@ -329,11 +339,29 @@ export interface TriggerDeps {
 	knownUsers: () => Record<string, WaKnownUser>;
 	dispatch: (prompt: string, chat: string) => Promise<void>;
 	fetchJson?: (url: string, token: string) => Promise<unknown>;
+	// POST JSON (read receipts, typing); default: fetch with a short timeout.
+	postJson?: (url: string, token: string, body: Record<string, unknown>) => Promise<unknown>;
+	// Repeat fn every ms until the returned stop() is called; default setInterval.
+	setRepeat?: (fn: () => void, ms: number) => () => void;
 	setTimer?: (fn: () => void, ms: number) => unknown;
 	log?: (line: string) => void;
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
+const SIGNAL_TIMEOUT_MS = 8_000;
+const TYPING_REFRESH_MS = 20_000;
+
+async function defaultPostJson(url: string, token: string, body: Record<string, unknown>, localAddress?: string): Promise<unknown> {
+	if (localAddress) return requestJson(url, token, localAddress, body);
+	const r = await fetch(url, {
+		method: "POST",
+		headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+		body: JSON.stringify(body),
+		signal: AbortSignal.timeout(SIGNAL_TIMEOUT_MS),
+	});
+	if (!r.ok) throw new Error(`HTTP ${r.status}`);
+	return r.json();
+}
 
 /**
  * GET url as JSON with the Bearer token. With localAddress the connection is
@@ -349,15 +377,22 @@ export async function defaultFetchJson(url: string, token: string, localAddress?
 	return r.json();
 }
 
-function requestJson(url: string, token: string, localAddress: string): Promise<unknown> {
+function requestJson(url: string, token: string, localAddress: string, body?: Record<string, unknown>): Promise<unknown> {
 	const u = new URL(url);
 	const request = u.protocol === "https:" ? httpsRequest : httpRequest;
+	const payload = body ? JSON.stringify(body) : undefined;
+	const headers: Record<string, string> = { Authorization: `Bearer ${token}`, Accept: "application/json" };
+	if (payload) {
+		headers["Content-Type"] = "application/json";
+		headers["Content-Length"] = String(Buffer.byteLength(payload));
+	}
+	const timeout = payload ? SIGNAL_TIMEOUT_MS : FETCH_TIMEOUT_MS;
 	return new Promise((resolve, reject) => {
 		const req = request(u, {
-			method: "GET",
-			headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+			method: payload ? "POST" : "GET",
+			headers,
 			localAddress,
-			timeout: FETCH_TIMEOUT_MS,
+			timeout,
 		}, (res) => {
 			const status = res.statusCode || 0;
 			const chunks: Buffer[] = [];
@@ -372,9 +407,9 @@ function requestJson(url: string, token: string, localAddress: string): Promise<
 				}
 			});
 		});
-		req.on("timeout", () => req.destroy(new Error(`timeout after ${FETCH_TIMEOUT_MS / 1000}s`)));
+		req.on("timeout", () => req.destroy(new Error(`timeout after ${timeout / 1000}s`)));
 		req.on("error", reject);
-		req.end();
+		req.end(payload);
 	});
 }
 
@@ -411,6 +446,8 @@ export class WhatsAppTrigger {
 	private failures = 0;
 	private stopped = false;
 	private readonly fetchJson: (url: string, token: string) => Promise<unknown>;
+	private readonly postJson: (url: string, token: string, body: Record<string, unknown>) => Promise<unknown>;
+	private readonly setRepeat: (fn: () => void, ms: number) => () => void;
 	private readonly setTimer: (fn: () => void, ms: number) => unknown;
 	private readonly log: (line: string) => void;
 	private readonly pendingFile: string;
@@ -419,6 +456,11 @@ export class WhatsAppTrigger {
 		this.pendingFile = deps.pendingFile || path.join(path.dirname(deps.cursorFile), "whatsapp-pending.json");
 		const localAddress = deps.cfg.localAddress;
 		this.fetchJson = deps.fetchJson || ((url, token) => defaultFetchJson(url, token, localAddress));
+		this.postJson = deps.postJson || ((url, token, body) => defaultPostJson(url, token, body, localAddress));
+		this.setRepeat = deps.setRepeat || ((fn, ms) => {
+			const h = setInterval(fn, ms);
+			return () => clearInterval(h);
+		});
 		this.setTimer = deps.setTimer || ((fn, ms) => setTimeout(fn, ms));
 		this.log = deps.log || ((l) => console.log(l));
 	}
@@ -434,7 +476,7 @@ export class WhatsAppTrigger {
 		const targets: { chat: string; conv?: WaConversation }[] = cfg.watchChats.map((chat) => ({ chat }));
 		if (cfg.conversationDays) {
 			try {
-				const url = `${cfg.apiUrl}/v1/conversations?account_id=${encodeURIComponent(cfg.accountId)}&days=${cfg.conversationDays}`;
+				const url = `${cfg.apiUrl}/v1/conversations?account_id=${encodeURIComponent(cfg.accountId)}&days=${Math.max(0, cfg.conversationDays)}`;
 				const body = await this.fetchJson(url, this.deps.token);
 				if (!Array.isArray(body)) throw new Error("unexpected conversations response");
 				for (const c of body as WaConversation[]) {
@@ -543,6 +585,7 @@ export class WhatsAppTrigger {
 		q.active = true;
 		// The run starts now: it is no longer pending (never replayed after a restart).
 		this.persistPending();
+		const stopPresence = this.presenceStart(chat, batch.map((b) => b.message.id));
 		try {
 			const prompt = buildWakePrompt({
 				cfg: this.deps.cfg, chat, batch, history: q.history, users: this.deps.knownUsers(), skipped,
@@ -553,6 +596,7 @@ export class WhatsAppTrigger {
 			this.log(`[${this.deps.agentName}] whatsapp wake failed: ${err instanceof Error ? err.message : String(err)}`);
 		} finally {
 			q.active = false;
+			stopPresence();
 		}
 		if ((q.pending.length || q.skipped) && !q.timer) {
 			q.timer = this.setTimer(() => {
@@ -560,6 +604,26 @@ export class WhatsAppTrigger {
 				void this.flush(chat);
 			}, this.deps.cfg.debounceSeconds * 1000);
 		}
+	}
+
+	/** Best-effort POST to the gateway; a failure is logged, never thrown. */
+	private signal(path: string, body: Record<string, unknown>): void {
+		const { cfg } = this.deps;
+		this.postJson(`${cfg.apiUrl}${path}`, this.deps.token, { account_id: cfg.accountId, ...body }).catch((err) => {
+			this.log(`[${this.deps.agentName}] whatsapp ${path} failed: ${err instanceof Error ? err.message : String(err)}`);
+		});
+	}
+
+	/** Blue ticks for the batch and "typing..." until the returned stop() runs. */
+	private presenceStart(chat: string, ids: string[]): () => void {
+		if (!this.deps.cfg.presence) return () => {};
+		if (ids.length) this.signal("/v1/read", { chat_jid: chat, message_ids: ids.slice(-100) });
+		this.signal("/v1/typing", { chat_jid: chat, on: true });
+		const stopRepeat = this.setRepeat(() => this.signal("/v1/typing", { chat_jid: chat, on: true }), TYPING_REFRESH_MS);
+		return () => {
+			stopRepeat();
+			this.signal("/v1/typing", { chat_jid: chat, on: false });
+		};
 	}
 
 	/** Write this agent's waiting wakes to disk (other agents' entries are kept). */

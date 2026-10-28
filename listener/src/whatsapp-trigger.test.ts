@@ -495,3 +495,85 @@ describe("customer conversations", () => {
 		assert.match(h2.runs[0], /msg_id: r1/);
 	});
 });
+
+// ─── All-time conversations; read receipts and "typing" while the agent works (2026-10-28) ───
+describe("all-time conversations and presence", () => {
+	test("conversation_days \"all\" asks the gateway for every chat ever (days=0)", async () => {
+		const c = parseWhatsAppConfig({ api_url: "http://h:1", account_id: "office", conversation_days: "all" })!;
+		assert.equal(c.conversationDays, -1);
+		const urls: string[] = [];
+		const t = new WhatsAppTrigger({
+			agentName: "adam", cfg: c, token: "tok", cursorFile: path.join(mkdtempSync(path.join(tmpdir(), "wa-all-")), "c.json"),
+			knownUsers: () => users, allowSender: () => true,
+			fetchJson: async (url) => { urls.push(url); return []; },
+			dispatch: async () => {}, setTimer: () => 0, log: () => {},
+		});
+		await t.pollOnce();
+		assert.match(urls[0], /\/v1\/conversations\?account_id=office&days=0$/);
+	});
+
+	test("presence is off unless configured", () => {
+		assert.equal(cfg.presence, false);
+		assert.equal(parseWhatsAppConfig({ api_url: "http://h:1", account_id: "a", presence: true })!.presence, true);
+	});
+
+	test("on wake: blue ticks for the batch, typing on and kept alive during the run, off at the end", async () => {
+		const pc = parseWhatsAppConfig({ api_url: "http://h:1", account_id: "office", watch_chats: [CHAT], presence: true, debounce_seconds: 1 })!;
+		const posts: { url: string; body: Record<string, unknown> }[] = [];
+		const repeats: (() => void)[] = [];
+		let stopped = 0;
+		let release: () => void = () => {};
+		let poll = 0;
+		const rows = [[msg("a", 10)], [msg("a", 10), msg("b", 20), msg("c", 21)]];
+		const timers: (() => void)[] = [];
+		const t = new WhatsAppTrigger({
+			agentName: "adam", cfg: pc, token: "tok", cursorFile: path.join(mkdtempSync(path.join(tmpdir(), "wa-pres-")), "c.json"),
+			knownUsers: () => users, allowSender: (s) => s.known,
+			fetchJson: async () => rows[Math.min(poll++, rows.length - 1)],
+			postJson: async (url, token, body) => { assert.equal(token, "tok"); posts.push({ url, body }); return { state: "done" }; },
+			setRepeat: (fn) => { repeats.push(fn); return () => { stopped++; }; },
+			dispatch: async () => { await new Promise<void>((r) => { release = r; }); },
+			setTimer: (fn) => { timers.push(fn); return 0; },
+			log: () => {},
+		});
+		await t.pollOnce();
+		await t.pollOnce();
+		timers.splice(0).forEach((f) => f());
+		await new Promise((r) => setImmediate(r));
+		assert.deepEqual(posts.map((p) => p.url.replace("http://h:1", "")), ["/v1/read", "/v1/typing"]);
+		assert.deepEqual(posts[0].body, { account_id: "office", chat_jid: CHAT, message_ids: ["b", "c"] });
+		assert.deepEqual(posts[1].body, { account_id: "office", chat_jid: CHAT, on: true });
+		assert.equal(repeats.length, 1, "typing is refreshed while the run lasts");
+		repeats[0]();
+		await new Promise((r) => setImmediate(r));
+		assert.equal(posts[2].body.on, true);
+		release();
+		await new Promise((r) => setImmediate(r));
+		await new Promise((r) => setImmediate(r));
+		assert.equal(stopped, 1);
+		assert.deepEqual(posts[posts.length - 1].body, { account_id: "office", chat_jid: CHAT, on: false });
+	});
+
+	test("a failing read/typing call never blocks or fails the wake", async () => {
+		const pc = parseWhatsAppConfig({ api_url: "http://h:1", account_id: "office", watch_chats: [CHAT], presence: true })!;
+		let poll = 0;
+		const runs: string[] = [];
+		const timers: (() => void)[] = [];
+		const rows = [[msg("a", 10)], [msg("a", 10), msg("b", 20)]];
+		const t = new WhatsAppTrigger({
+			agentName: "adam", cfg: pc, token: "tok", cursorFile: path.join(mkdtempSync(path.join(tmpdir(), "wa-pres2-")), "c.json"),
+			knownUsers: () => users, allowSender: (s) => s.known,
+			fetchJson: async () => rows[Math.min(poll++, rows.length - 1)],
+			postJson: async () => { throw new Error("timeout"); },
+			setRepeat: () => () => {},
+			dispatch: async (p) => { runs.push(p); },
+			setTimer: (fn) => { timers.push(fn); return 0; },
+			log: () => {},
+		});
+		await t.pollOnce();
+		await t.pollOnce();
+		timers.splice(0).forEach((f) => f());
+		await new Promise((r) => setImmediate(r));
+		assert.equal(runs.length, 1);
+	});
+});
