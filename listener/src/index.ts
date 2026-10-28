@@ -19,6 +19,7 @@ import path from "path";
 import { loadStore, getThread, setThread } from "./store";
 import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
 import { isSlackThreadTs } from "./run-failures";
+import { buildSlackPrompt, scheduledThreadKey } from "./slack-prompt";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
 import { getSenderInfo, formatSenderLine, slackUserIsBot } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
@@ -639,7 +640,7 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 			const existing = getThread(channel, threadTs);
 			if (existing && existing.agentName === agent.name) {
 				console.log(`[${agent.name}] Resuming session for thread ${threadTs}`);
-				const agentMessage = `Slack reply (channel: ${channel}, thread: ${threadTs}):\n\n${message}\n\nReply in Slack channel ${channel}, thread ${threadTs}.`;
+				const agentMessage = buildSlackPrompt({ channel, threadTs, message, resumed: true });
 				const r = await resumeAgent(agent, existing.sessionId, agentMessage);
 				if (r.isError) await postRunFailure(agent, channel, threadTs, r.result);
 				return;
@@ -654,7 +655,7 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 			}
 		}
 
-		const agentMessage = `Slack message (channel: ${channel}, thread: ${threadTs}):${threadContext}\n\n${message}\n\nReply in Slack channel ${channel}, thread ${threadTs}.`;
+		const agentMessage = buildSlackPrompt({ channel, threadTs, message, threadContext });
 		const { sessionId, isError, result } = await runAgent(agent, agentMessage);
 
 		// The agent posts its own reply during the run. If the run errored, it
@@ -686,7 +687,8 @@ function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {
 		return;
 	}
 
-	const threadTs = `scheduled_${entry.id}_${Date.now()}`;
+	// Queue key only; buildSlackPrompt keeps it away from the agent.
+	const threadTs = scheduledThreadKey(entry.id);
 
 	enqueueOrProcess({
 		agent,
