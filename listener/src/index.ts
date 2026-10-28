@@ -710,7 +710,7 @@ function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {
 function startWhatsAppTriggers(): void {
 	for (const agent of agents) {
 		const cfg = agent.whatsapp;
-		if (!cfg || !cfg.watchChats.length) continue;
+		if (!cfg || (!cfg.watchChats.length && !cfg.conversationDays)) continue;
 		if (!agent.whatsappToken) {
 			console.log(`[${agent.name}] whatsapp: configured but credentials.json has no whatsapp_token; wake-up off`);
 			continue;
@@ -729,7 +729,7 @@ function startWhatsAppTriggers(): void {
 			},
 		});
 		trigger.start();
-		console.log(`   WhatsApp wake-up: ${agent.name} (${cfg.accountId}, ${cfg.watchChats.length} chat${cfg.watchChats.length > 1 ? "s" : ""}, every ${cfg.pollSeconds}s)`);
+		console.log(`   WhatsApp wake-up: ${agent.name} (${cfg.accountId}, ${cfg.watchChats.length} chat${cfg.watchChats.length > 1 ? "s" : ""}, ${cfg.conversationDays ? ` + conversations it started in the last ${cfg.conversationDays} days` : ""}, every ${cfg.pollSeconds}s)`);
 	}
 }
 
