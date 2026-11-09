@@ -18,6 +18,7 @@ import {
 	isBotMessage,
 	isOwnMessage,
 	isRealHuman,
+	matchAcceptedBot,
 	mentionsAgent,
 	type AgentTurns,
 	type BotDecision,
@@ -95,7 +96,9 @@ export async function resolveInbound(args: {
 			const inHandoff = policy.handoffChannels.includes(event.channel);
 			const dmMention = event.channel_type === "im" && mentionsAgent(event.text, agent.slackBotId);
 			const channelReply = Boolean(event.thread_ts) && (event.channel_type === "channel" || event.channel_type === "group");
-			if (!inHandoff && !dmMention && channelReply && args.lookupInvolved && !isOwnMessage(agent, event)) {
+			// Only listed bots are worth a thread lookup (saves the Slack read budget).
+			const listed = Boolean(matchAcceptedBot(event, policy));
+			if (!inHandoff && !dmMention && channelReply && listed && args.lookupInvolved && !isOwnMessage(agent, event)) {
 				involved = await args.lookupInvolved(event.channel, event.thread_ts).catch(() => false);
 			}
 			if (!inHandoff && !dmMention && !involved) return { kind: "drop" };

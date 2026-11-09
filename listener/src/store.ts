@@ -6,7 +6,16 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import path from "path";
 
-const STORE_PATH = path.join(__dirname, "..", "..", "data", "threads.json");
+// GINNIE_THREAD_STORE overrides the file (tests). Read at use, not at import.
+function storePath(): string {
+	return process.env.GINNIE_THREAD_STORE || path.join(__dirname, "..", "..", "data", "threads.json");
+}
+
+// One saved session per agent per thread (review 2026-11-09: two agents in
+// one thread used to overwrite each other's entry on every run).
+function entryKey(agentName: string, channel: string, threadTs: string): string {
+	return `${agentName}|${channel}:${threadTs}`;
+}
 
 interface ThreadEntry {
 	sessionId: string;
@@ -17,14 +26,15 @@ interface ThreadEntry {
 let store: Record<string, ThreadEntry> = {};
 
 export function loadStore(): void {
-	const dir = path.dirname(STORE_PATH);
+	const dir = path.dirname(storePath());
 	if (!existsSync(dir)) {
 		mkdirSync(dir, { recursive: true });
 	}
 
 	try {
-		if (existsSync(STORE_PATH)) {
-			store = JSON.parse(readFileSync(STORE_PATH, "utf-8"));
+		store = {};
+		if (existsSync(storePath())) {
+			store = JSON.parse(readFileSync(storePath(), "utf-8"));
 			// Clean entries older than 24 hours
 			const cutoff = Date.now() - 24 * 60 * 60 * 1000;
 			for (const key of Object.keys(store)) {
@@ -40,15 +50,19 @@ export function loadStore(): void {
 }
 
 function saveStore(): void {
-	const dir = path.dirname(STORE_PATH);
+	const dir = path.dirname(storePath());
 	if (!existsSync(dir)) {
 		mkdirSync(dir, { recursive: true });
 	}
-	writeFileSync(STORE_PATH, JSON.stringify(store, null, 2));
+	writeFileSync(storePath(), JSON.stringify(store, null, 2));
 }
 
-export function getThread(channel: string, threadTs: string): ThreadEntry | undefined {
-	return store[`${channel}:${threadTs}`];
+export function getThread(agentName: string, channel: string, threadTs: string): ThreadEntry | undefined {
+	const own = store[entryKey(agentName, channel, threadTs)];
+	if (own) return own;
+	// Entries saved before 2026-11-09 are keyed by thread only.
+	const legacy = store[`${channel}:${threadTs}`];
+	return legacy && legacy.agentName === agentName ? legacy : undefined;
 }
 
 export function setThread(
@@ -57,7 +71,7 @@ export function setThread(
 	sessionId: string,
 	agentName: string,
 ): void {
-	store[`${channel}:${threadTs}`] = {
+	store[entryKey(agentName, channel, threadTs)] = {
 		sessionId,
 		agentName,
 		createdAt: Date.now(),

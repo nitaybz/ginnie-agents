@@ -152,3 +152,20 @@ describe("Nitay 2026-11-09: bot replies in a thread the agent takes part in", ()
 		assert.deepEqual(asked, []);
 	});
 });
+
+describe("review r1: the thread lookup is not spent on bots outside the allow list", () => {
+	test("an unlisted bot reply never triggers the lookup", async () => {
+		const asked: string[] = [];
+		const r = await resolveInbound({
+			agent: agent(), source: "message",
+			event: { type: "message", bot_id: "BSTRANGE9", user: "USTRANGE9", channel: "C1", channel_type: "channel", ts: "40.2", thread_ts: "40.1", text: "x" },
+			turns: new AgentTurns(), seen: new BotEventSeen(),
+			lookupIsBot: async () => true,
+			lookupSender: async (id: string) => ({ userId: id, name: "x", role: "bot", known: false }),
+			lookupInvolved: async (ch: string, ts: string) => { asked.push(`${ch}:${ts}`); return true; },
+			onHumanInThread: () => {},
+		});
+		assert.equal(r.kind, "drop");
+		assert.deepEqual(asked, []);
+	});
+});

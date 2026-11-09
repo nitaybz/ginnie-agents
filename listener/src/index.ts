@@ -64,6 +64,8 @@ interface QueuedMessage {
 	messageTs: string;
 	userId: string;
 	senderLine: string;
+	/** Woken only because it takes part in the thread: no "is thinking" shimmer, since it may stay silent. */
+	quiet?: boolean;
 }
 
 const DEBOUNCE_MS = 20_000; // Wait 20s for additional messages before processing
@@ -98,7 +100,7 @@ const dispatcher = new ThreadDispatcher<QueuedMessage>({
 	// instead of 20s. Optimistically mark active to dedupe concurrent arrivals;
 	// the call is idempotent, so a rare double-set is harmless.
 	onFirst: (msg, key) => {
-		if (activeStatusThreads.has(key)) return;
+		if (msg.quiet || activeStatusThreads.has(key)) return;
 		activeStatusThreads.add(key);
 		setThinking(msg.agent, msg.channel, msg.threadTs)
 			.then((ok) => { if (!ok) activeStatusThreads.delete(key); })
@@ -117,6 +119,7 @@ const dispatcher = new ThreadDispatcher<QueuedMessage>({
 			messageTs: messages[messages.length - 1].messageTs,
 			userId: messages[messages.length - 1].userId,
 			isThreadReply: firstMsg.isThreadReply || messages.length > 1,
+			quiet: messages.every((m) => m.quiet),
 		});
 	},
 });
@@ -129,13 +132,20 @@ function enqueueOrProcess(msg: QueuedMessage): void {
 // there (or holds the thread's stored session)? Then it hears every new
 // message in the thread and decides for itself whether to answer.
 async function threadInvolves(agent: AgentConfig, app: App, channel: string, threadTs: string): Promise<boolean> {
-	const existing = getThread(channel, threadTs);
-	if (existing && existing.agentName === agent.name) return true;
+	if (getThread(agent.name, channel, threadTs)) return true;
 	try {
-		const res = await app.client.conversations.replies({ token: agent.slackBotToken, channel, ts: threadTs, limit: 200, inclusive: true });
-		return agentInvolved((res.messages || []) as any[], agent);
-	} catch (_e) {
-		return false; // cannot read the thread: do not wake on a guess
+		let cursor: string | undefined;
+		for (let page = 0; page < 5; page++) {
+			const res: any = await app.client.conversations.replies({ token: agent.slackBotToken, channel, ts: threadTs, limit: 200, inclusive: true, cursor });
+			if (agentInvolved((res.messages || []) as any[], agent)) return true;
+			cursor = res.response_metadata?.next_cursor;
+			if (!res.has_more || !cursor) return false;
+		}
+		return false;
+	} catch (err) {
+		// Cannot read the thread: do not wake on a guess, but leave a trace.
+		console.warn(`[${agent.name}] thread lookup failed for ${channel}:${threadTs}: ${err instanceof Error ? err.message : err}`);
+		return false;
 	}
 }
 
@@ -234,7 +244,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			const threadTs = event.thread_ts || event.ts;
 			console.log(`[bot:${bot.via}] Agent: ${agent.name}, From: ${bot.sender.name} (agent), Channel: ${channel}, Thread: ${threadTs}`);
 			enqueueOrProcess({
-				agent, channel, threadTs, message: bot.via === "thread" ? withThreadNote(botText) : botText,
+				agent, channel, threadTs, message: bot.via === "thread" ? withThreadNote(botText) : botText, quiet: bot.via === "thread",
 				isThreadReply: !!event.thread_ts, messageTs: event.ts, userId: bot.sender.userId, senderLine: bot.senderLine,
 			});
 			return;
@@ -292,11 +302,13 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		// and decides whether it is meant for it. A message that mentions this
 		// agent is the app_mention handler's job (avoid a second copy).
 		if (event.thread_ts && (event.channel_type === "channel" || event.channel_type === "group")) {
-			if (mentionsAgent(event.text, agent.slackBotId)) return;
+			const withoutMentions = (event.text || "").replace(/<@[A-Z0-9]+(\|[^>]*)?>/g, "").trim();
+			const mentionHandled = Boolean(withoutMentions) || Boolean(event.files && event.files.length > 0);
+			if (mentionsAgent(event.text, agent.slackBotId) && mentionHandled) return;
 			if (!(await threadInvolves(agent, app, channel, event.thread_ts))) return;
 			console.log(`[thread-reply] Agent: ${agent.name}, From: ${sender.name}, Channel: ${channel}, Thread: ${event.thread_ts} (involved)`);
 			enqueueOrProcess({
-				agent, channel, threadTs: event.thread_ts, message: withThreadNote(messageText),
+				agent, channel, threadTs: event.thread_ts, message: withThreadNote(messageText), quiet: true,
 				isThreadReply: true, messageTs: event.ts, userId: event.user, senderLine,
 			});
 		}
@@ -576,18 +588,23 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 	// idempotent, so this is safe whether or not enqueueOrProcess already set it,
 	// and it guards against Slack's ~2min status auto-timeout if this message
 	// waited in a long debounce/queue window.
-	activeStatusThreads.add(key);
-	await setThinking(agent, channel, threadTs);
+	// A quiet run (woken only because it takes part in the thread) shows no
+	// shimmer: it may well end silent.
+	const showStatus = !msg.quiet;
+	if (showStatus) {
+		activeStatusThreads.add(key);
+		await setThinking(agent, channel, threadTs);
+	}
 	// Keep the shimmer alive across the whole run — Slack expires it ~2min after
 	// the last set, and runs frequently take longer than that.
-	const heartbeat = setInterval(() => {
+	const heartbeat = showStatus ? setInterval(() => {
 		void setThinking(agent, channel, threadTs);
-	}, STATUS_HEARTBEAT_MS);
+	}, STATUS_HEARTBEAT_MS) : undefined;
 
 	try {
 		if (isThreadReply) {
-			const existing = getThread(channel, threadTs);
-			if (existing && existing.agentName === agent.name) {
+			const existing = getThread(agent.name, channel, threadTs);
+			if (existing) {
 				console.log(`[${agent.name}] Resuming session for thread ${threadTs}`);
 				const agentMessage = buildSlackPrompt({ channel, threadTs, message, resumed: true });
 				const r = await resumeAgent(agent, existing.sessionId, agentMessage);
@@ -617,14 +634,16 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 		setThread(channel, threadTs, sessionId, agent.name);
 		console.log(`[${agent.name}] New session stored for thread ${threadTs}`);
 	} finally {
-		clearInterval(heartbeat);
-		// Let Slack fan the agent's reply out to clients before we clear the
-		// shimmer — otherwise the clear can win the race and the user sees it
-		// vanish before the answer lands. In channel threads the status does not
-		// auto-clear on reply, so this explicit clear is required.
-		await new Promise((r) => setTimeout(r, STATUS_DELETE_DELAY_MS));
-		await clearThinking(agent, channel, threadTs);
-		activeStatusThreads.delete(key);
+		if (heartbeat) clearInterval(heartbeat);
+		if (showStatus) {
+			// Let Slack fan the agent's reply out to clients before we clear the
+			// shimmer — otherwise the clear can win the race and the user sees it
+			// vanish before the answer lands. In channel threads the status does not
+			// auto-clear on reply, so this explicit clear is required.
+			await new Promise((r) => setTimeout(r, STATUS_DELETE_DELAY_MS));
+			await clearThinking(agent, channel, threadTs);
+			activeStatusThreads.delete(key);
+		}
 	}
 }
 
