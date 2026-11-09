@@ -6,7 +6,7 @@
 
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync } from "fs";
+import { mkdtempSync, readFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import { WhatsAppTrigger, buildWakePrompt, parseWhatsAppConfig, type WaMessage, type WaSender } from "./whatsapp-trigger";
@@ -100,5 +100,41 @@ describe("whisper settings", () => {
 		assert.match(pickWhisperModel("/m", has(["ggml-ivrit-large-v3-turbo-q5_0.bin", "ggml-small.bin"]))!, /ivrit-large-v3-turbo-q5_0/);
 		assert.match(pickWhisperModel("/m", has(["ggml-small.bin"]))!, /ggml-small\.bin$/);
 		assert.equal(pickWhisperModel("/m", has([])), null);
+	});
+});
+
+describe("review r1", () => {
+	test("a voice note stays pending on disk while it is being transcribed (a restart then replays it)", async () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "wa-voice-r1-"));
+		const pendingFile = path.join(dir, "whatsapp-pending.json");
+		let finish!: (t: string) => void;
+		const timers: (() => void)[] = [];
+		const runs: string[] = [];
+		let poll = 0;
+		const base = [msg("a", 1, { content: "hi" })];
+		const rows = [base, [...base, msg("v", 2, { media_type: "audio" })]];
+		const t = new WhatsAppTrigger({
+			agentName: "office", cfg, token: "tok", cursorFile: path.join(dir, "c.json"), pendingFile,
+			knownUsers: () => users, allowSender: (s) => s.known,
+			fetchJson: async () => rows[Math.min(poll++, rows.length - 1)],
+			dispatch: async (p) => { runs.push(p); },
+			setTimer: (fn) => { timers.push(fn); return 1; },
+			log: () => {},
+			transcribe: () => new Promise<string>((r) => { finish = r; }),
+		});
+		await t.pollOnce(); await t.pollOnce();
+		for (const f of timers.splice(0)) f();
+		await new Promise((r) => setTimeout(r, 5));
+		assert.equal(runs.length, 0, "still transcribing");
+		assert.match(readFileSync(pendingFile, "utf-8"), /"v"/, "the wake is still saved as pending");
+		finish("שלום");
+		await new Promise((r) => setTimeout(r, 5));
+		assert.equal(runs.length, 1);
+		assert.doesNotMatch(readFileSync(pendingFile, "utf-8"), /"v"/, "cleared once the run starts");
+	});
+	test("tool calls around whisper have a time limit", () => {
+		const src = readFileSync(path.join(__dirname, "..", "src", "transcribe.ts"), "utf-8");
+		assert.match(src, /run\("ffmpeg", \[[^\]]*\], \{ timeoutMs:/);
+		assert.match(src, /run\("ffprobe", \[[^\]]*\], \{ timeoutMs:/);
 	});
 });

@@ -638,15 +638,20 @@ export class WhatsAppTrigger {
 	async flush(chat: string): Promise<void> {
 		const q = this.queue(chat);
 		if (q.active || (!q.pending.length && !q.skipped)) return;
+		q.active = true;
+		const stopPresence = this.presenceStart(chat, q.pending.map((b) => b.message.id));
+		// Voice notes become text while they are still saved as pending, so a
+		// restart during a slow transcription replays the wake (review r1).
+		try {
+			await this.transcribeBatch(q.pending.slice());
+		} catch { /* transcribeBatch never throws; belt and braces */ }
 		const batch = q.pending.splice(0);
 		const skipped = q.skipped;
 		q.skipped = false;
-		q.active = true;
 		// The run starts now: it is no longer pending (never replayed after a restart).
 		this.persistPending();
-		const stopPresence = this.presenceStart(chat, batch.map((b) => b.message.id));
 		try {
-			await this.transcribeBatch(batch);
+			await this.transcribeBatch(batch); // anything that arrived meanwhile
 			const prompt = buildWakePrompt({
 				cfg: this.deps.cfg, chat, batch, history: q.history, users: this.deps.knownUsers(), skipped,
 				conversation: q.conversation, transcripts: this.transcripts,

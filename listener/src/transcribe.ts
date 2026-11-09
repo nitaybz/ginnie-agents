@@ -59,6 +59,8 @@ const BIN_CANDIDATES = [
 
 const MAX_AUDIO_BYTES = 25 * 1024 * 1024; // 25MB — well above any Slack voice memo
 const TRANSCRIBE_TIMEOUT_MS = 5 * 60_000; // 5min cap for very long audio
+// ffmpeg / ffprobe: a corrupt file must never hold the one-at-a-time queue (review r1).
+const TOOL_TIMEOUT_MS = 60_000;
 
 let warnedMissing = false;
 
@@ -71,7 +73,7 @@ export function whisperReady(): boolean {
 }
 
 /** Transcribe audio bytes (any format ffmpeg reads). null when whisper is missing or fails. */
-export async function transcribeBuffer(audio: Buffer): Promise<string | null> {
+export async function transcribeBuffer(audio: Buffer, opts: { language?: string } = {}): Promise<string | null> {
 	const bin = findBinary();
 	const model = pickWhisperModel(MODEL_DIR);
 	if (!bin || !model) {
@@ -90,7 +92,7 @@ export async function transcribeBuffer(audio: Buffer): Promise<string | null> {
 			fs.writeFileSync(audioPath, audio);
 			await convertToWav(audioPath, wavPath);
 			const seconds = await durationOf(wavPath);
-			const text = await runWhisper(bin, model, wavPath, audioContextFor(seconds));
+			const text = await runWhisper(bin, model, wavPath, audioContextFor(seconds), opts.language || "auto");
 			return text.trim() || null;
 		} catch (e) {
 			console.error("[transcribe] failed:", (e as Error).message);
@@ -140,22 +142,21 @@ function findBinary(): string | null {
 
 async function convertToWav(src: string, dst: string): Promise<void> {
 	// whisper.cpp requires 16kHz mono 16-bit PCM WAV.
-	await run("ffmpeg", ["-y", "-i", src, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", dst]);
+	await run("ffmpeg", ["-y", "-i", src, "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", dst], { timeoutMs: TOOL_TIMEOUT_MS });
 }
 
 async function durationOf(wavPath: string): Promise<number> {
 	try {
-		const out = await run("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", wavPath]);
+		const out = await run("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", wavPath], { timeoutMs: TOOL_TIMEOUT_MS });
 		return parseFloat(out.trim());
 	} catch {
 		return NaN; // unknown length: full window
 	}
 }
 
-async function runWhisper(bin: string, model: string, wavPath: string, audioCtx: number): Promise<string> {
+async function runWhisper(bin: string, model: string, wavPath: string, audioCtx: number, lang: string): Promise<string> {
 	// `-otxt` writes <wav>.txt next to the input; `-nt` suppresses timestamps.
-	// The Hebrew model is told the language; the stock model detects it.
-	const lang = /ivrit/.test(path.basename(model)) ? "he" : "auto";
+	// Language: "he" for WhatsApp (office chats are Hebrew), "auto" elsewhere.
 	const args = ["-m", model, "-f", wavPath, "-otxt", "-nt", "-np", "-l", lang, "-t", WHISPER_THREADS];
 	if (audioCtx > 0) args.push("-ac", String(audioCtx));
 	const out = await run(bin, args, { timeoutMs: TRANSCRIBE_TIMEOUT_MS });

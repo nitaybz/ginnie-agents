@@ -695,7 +695,7 @@ function startWhatsAppTriggers(): void {
 			allowSender: (s) => s.known || agent.boundaries === "read-only" || agent.allowUnverifiedSenders,
 			// Voice notes become text on this machine before the agent wakes (Nitay 2026-11-09).
 			transcribe: whisperReady()
-				? async (m) => transcribeBuffer(await fetchMedia(mediaUrl(cfg, m), agent.whatsappToken || "", cfg.localAddress))
+				? async (m) => transcribeBuffer(await fetchMedia(mediaUrl(cfg, m), agent.whatsappToken || "", cfg.localAddress), { language: "he" })
 				: undefined,
 			dispatch: async (prompt, chat) => {
 				console.log(`[${agent.name}] whatsapp wake for ${chat}`);
@@ -704,6 +704,7 @@ function startWhatsAppTriggers(): void {
 			},
 		});
 		trigger.start();
+		if (!whisperReady()) console.warn(`   [${agent.name}] voice notes: whisper or its model is missing, WhatsApp voice notes arrive without text`);
 		console.log(`   WhatsApp wake-up: ${agent.name} (${cfg.accountId}, ${cfg.watchChats.length} chat${cfg.watchChats.length > 1 ? "s" : ""}, ${cfg.conversationDays ? ` + conversations it started ${cfg.conversationDays < 0 ? "(all time)" : `in the last ${cfg.conversationDays} days`}` : ""}${cfg.presence ? ", read+typing" : ""}, every ${cfg.pollSeconds}s)`);
 	}
 }
