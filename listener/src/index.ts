@@ -191,7 +191,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		const threadTs = event.thread_ts || event.ts;
 		const isThreadReply = !!event.thread_ts;
 
-		const baseText = (event.text || "").replace(/<@[A-Z0-9]+>/g, "").trim();
+		const baseText = (event.text || "").replace(/<@[A-Z0-9]+(\|[^>]*)?>/g, "").trim();
 		const hasFiles = !!(event.files && event.files.length > 0);
 		// A voice-only @mention has no text after stripping the mention.
 		// Drop messages that have neither text nor any attached file.
@@ -304,11 +304,13 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		if (event.thread_ts && (event.channel_type === "channel" || event.channel_type === "group")) {
 			const withoutMentions = (event.text || "").replace(/<@[A-Z0-9]+(\|[^>]*)?>/g, "").trim();
 			const mentionHandled = Boolean(withoutMentions) || Boolean(event.files && event.files.length > 0);
-			if (mentionsAgent(event.text, agent.slackBotId) && mentionHandled) return;
+			const mentioned = mentionsAgent(event.text, agent.slackBotId);
+			if (mentioned && mentionHandled) return;
 			if (!(await threadInvolves(agent, app, channel, event.thread_ts))) return;
 			console.log(`[thread-reply] Agent: ${agent.name}, From: ${sender.name}, Channel: ${channel}, Thread: ${event.thread_ts} (involved)`);
 			enqueueOrProcess({
-				agent, channel, threadTs: event.thread_ts, message: withThreadNote(messageText), quiet: true,
+				agent, channel, threadTs: event.thread_ts,
+				message: mentioned ? messageText : withThreadNote(messageText), quiet: !mentioned,
 				isThreadReply: true, messageTs: event.ts, userId: event.user, senderLine,
 			});
 		}
