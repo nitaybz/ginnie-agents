@@ -72,6 +72,8 @@ export async function resolveInbound(args: {
 	lookupIsBot: (userId: string | undefined) => Promise<boolean | undefined>;
 	lookupSender: (userId: string) => Promise<SenderInfo>;
 	onHumanInThread: (channel: string, threadTs: string) => void;
+	/** Does the agent take part in this thread? Asked only for bot replies in channel threads. */
+	lookupInvolved?: (channel: string, threadTs: string) => Promise<boolean>;
 }): Promise<InboundResult> {
 	const { agent, source, event } = args;
 	const policy = agent.botPolicy || NO_BOT_POLICY;
@@ -85,14 +87,20 @@ export async function resolveInbound(args: {
 	// An event without bot tags from a Slack bot user is still a bot.
 	const slackIsBot = tagged ? true : await args.lookupIsBot(event.user);
 	if (tagged || slackIsBot === true) {
-		// In the message handler a bot counts only in a hand-off channel or as
-		// a DM mention; a channel mention is the app_mention handler's job.
+		// In the message handler a bot counts in a hand-off channel, as a DM
+		// mention, or as a reply in a thread the agent takes part in; a plain
+		// channel mention is the app_mention handler's job.
+		let involved = false;
 		if (source === "message") {
 			const inHandoff = policy.handoffChannels.includes(event.channel);
 			const dmMention = event.channel_type === "im" && mentionsAgent(event.text, agent.slackBotId);
-			if (!inHandoff && !dmMention) return { kind: "drop" };
+			const channelReply = Boolean(event.thread_ts) && (event.channel_type === "channel" || event.channel_type === "group");
+			if (!inHandoff && !dmMention && channelReply && args.lookupInvolved && !isOwnMessage(agent, event)) {
+				involved = await args.lookupInvolved(event.channel, event.thread_ts).catch(() => false);
+			}
+			if (!inHandoff && !dmMention && !involved) return { kind: "drop" };
 		}
-		const d = admitBotMessage({ agent, policy, ev: event, turns: args.turns, seen: args.seen, slackIsBot });
+		const d = admitBotMessage({ agent, policy, ev: event, turns: args.turns, seen: args.seen, slackIsBot, involved });
 		if (d.kind === "drop" && d.log) console.log(d.log);
 		return d.kind === "accept" ? { kind: "bot", decision: d } : { kind: "drop" };
 	}

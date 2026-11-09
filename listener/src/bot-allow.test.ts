@@ -382,3 +382,27 @@ describe("r1 wiring", () => {
 		assert.match(src, /lookupIsBot: \(userId\) => slackUserIsBot\(/);
 	});
 });
+
+describe("Nitay 2026-11-09: a listed bot in a thread the agent takes part in", () => {
+	test("wakes it without a mention (via thread), and only when involved", () => {
+		const { turns } = freshTurns();
+		const reply = fromBot(B, { ts: "20.2", thread_ts: "20.1", text: "טופל: נשלח לניתאי" });
+		assert.equal((admitBotMessage({ agent: A, policy: policyA, ev: reply, turns, seen: new BotEventSeen(), involved: false }) as any).reason, "not-addressed");
+		const d = admitBotMessage({ agent: A, policy: policyA, ev: { ...reply, ts: "20.3" }, turns, seen: new BotEventSeen(), involved: true });
+		assert.equal(d.kind, "accept");
+		assert.equal(d.kind === "accept" && d.via, "thread");
+	});
+	test("still counts toward the per-thread cap", () => {
+		const { turns } = freshTurns();
+		const capped = parseBotPolicy({ accept_bots: [{ bot_id: B.slackBotMsgId, user_id: B.slackBotId, name: "Beta" }], agent_turn_cap: 1 }).policy;
+		const first = admitBotMessage({ agent: A, policy: capped, ev: fromBot(B, { ts: "21.2", thread_ts: "21.1" }), turns, seen: new BotEventSeen(), involved: true });
+		assert.equal(first.kind, "accept");
+		const second = admitBotMessage({ agent: A, policy: capped, ev: fromBot(B, { ts: "21.3", thread_ts: "21.1" }), turns, seen: new BotEventSeen(), involved: true });
+		assert.equal((second as any).reason, "cap");
+	});
+	test("an unlisted bot is still refused even when the agent is involved", () => {
+		const { turns } = freshTurns();
+		const stranger = { bot_id: "BSTRANGE1", user: "USTRANGE1", channel: OTHER_CH, ts: "22.2", thread_ts: "22.1", text: "x" };
+		assert.equal((admitBotMessage({ agent: A, policy: policyA, ev: stranger, turns, seen: new BotEventSeen(), involved: true }) as any).reason, "not-allowed");
+	});
+});

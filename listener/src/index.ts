@@ -29,6 +29,8 @@ import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger } from "./whatsapp-trigger";
 import { getKnownUsersFor } from "./users";
 import { AGENT_TURNS_FILE, AgentTurns, BotEventSeen } from "./bot-allow";
 import { passesSenderPolicy, resolveInbound, type InboundResult } from "./inbound-gate";
+import { mentionsAgent } from "./bot-allow";
+import { ThreadDispatcher, agentInvolved, queueKey, withThreadNote } from "./thread-routing";
 import {
 	SLACK_HEARTBEAT_DIR,
 	SLACK_HEARTBEAT_INTERVAL_MS,
@@ -76,10 +78,7 @@ const STATUS_DELETE_DELAY_MS = 1500;
 // vanishes while the user is still waiting for the reply.
 const STATUS_HEARTBEAT_MS = 90_000;
 
-const activeThreads = new Set<string>(); // threads currently being processed
-const messageQueues = new Map<string, QueuedMessage[]>(); // pending messages per thread
-const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>(); // debounce timers
-const activeStatusThreads = new Set<string>(); // thread-keys with an active "thinking" shimmer
+const activeStatusThreads = new Set<string>(); // agent+thread keys with an active "thinking" shimmer
 
 // One Bolt App per agent (keyed by agent name)
 const apps = new Map<string, App>();
@@ -88,84 +87,55 @@ function threadKey(channel: string, threadTs: string): string {
 	return `${channel}:${threadTs}`;
 }
 
-function enqueueOrProcess(msg: QueuedMessage): void {
-	const key = threadKey(msg.channel, msg.threadTs);
-
-	// Always add to the queue
-	const queue = messageQueues.get(key) || [];
-	queue.push(msg);
-	messageQueues.set(key, queue);
-
+// One waiting line per agent per thread (thread-routing.ts). A shared line per
+// thread ran a reply meant for two agents only once, as the first of them.
+const dispatcher = new ThreadDispatcher<QueuedMessage>({
+	debounceMs: DEBOUNCE_MS,
+	log: (line) => console.log(line),
+	onError: (agentName, err) => console.error(`[${agentName}] Queue drain error:`, err),
 	// Show the "is thinking…" shimmer immediately on first arrival — before the
 	// debounce window closes — so the user sees acknowledgement within ~200ms
 	// instead of 20s. Optimistically mark active to dedupe concurrent arrivals;
 	// the call is idempotent, so a rare double-set is harmless.
-	if (queue.length === 1 && !activeStatusThreads.has(key)) {
+	onFirst: (msg, key) => {
+		if (activeStatusThreads.has(key)) return;
 		activeStatusThreads.add(key);
 		setThinking(msg.agent, msg.channel, msg.threadTs)
 			.then((ok) => { if (!ok) activeStatusThreads.delete(key); })
 			.catch(() => { activeStatusThreads.delete(key); });
-	}
+	},
+	process: async (_agentName, messages) => {
+		const firstMsg = messages[0];
+		// Preserve each message's sender line so the agent can tell who said what
+		const combinedText = messages.length === 1
+			? `${messages[0].senderLine}\n${messages[0].message}`
+			: messages.map((m) => `${m.senderLine}\n${m.message}`).join("\n\n---\n\n");
+		await processMessage({
+			...firstMsg,
+			message: combinedText,
+			senderLine: messages[messages.length - 1].senderLine, // latest sender
+			messageTs: messages[messages.length - 1].messageTs,
+			userId: messages[messages.length - 1].userId,
+			isThreadReply: firstMsg.isThreadReply || messages.length > 1,
+		});
+	},
+});
 
-	if (activeThreads.has(key)) {
-		console.log(`[${msg.agent.name}] Queued message for busy thread ${msg.threadTs} (${queue.length} in queue)`);
-		return;
-	}
-
-	const existingTimer = debounceTimers.get(key);
-	if (existingTimer) {
-		clearTimeout(existingTimer);
-		console.log(`[${msg.agent.name}] Debounce reset for thread ${msg.threadTs} (${queue.length} messages waiting)`);
-	}
-
-	const timer = setTimeout(() => {
-		debounceTimers.delete(key);
-		drainQueue(key).catch((err) => console.error(`[${msg.agent.name}] Queue drain error:`, err));
-	}, DEBOUNCE_MS);
-
-	debounceTimers.set(key, timer);
-	if (queue.length === 1) {
-		console.log(`[${msg.agent.name}] Message received, waiting ${DEBOUNCE_MS / 1000}s for more...`);
-	}
+function enqueueOrProcess(msg: QueuedMessage): void {
+	dispatcher.enqueue(msg);
 }
 
-async function drainQueue(key: string): Promise<void> {
-	const queue = messageQueues.get(key);
-	if (!queue || queue.length === 0) return;
-
-	const messages = [...queue];
-	messageQueues.delete(key);
-
-	const firstMsg = messages[0];
-	// Preserve each message's sender line so the agent can tell who said what
-	const combinedText = messages.length === 1
-		? `${messages[0].senderLine}\n${messages[0].message}`
-		: messages.map((m) => `${m.senderLine}\n${m.message}`).join("\n\n---\n\n");
-
-	const combined: QueuedMessage = {
-		...firstMsg,
-		message: combinedText,
-		senderLine: messages[messages.length - 1].senderLine, // latest sender
-		messageTs: messages[messages.length - 1].messageTs,
-		userId: messages[messages.length - 1].userId,
-		isThreadReply: firstMsg.isThreadReply || messages.length > 1,
-	};
-
-	if (messages.length > 1) {
-		console.log(`[${firstMsg.agent.name}] Batched ${messages.length} messages for thread ${firstMsg.threadTs}`);
-	}
-
-	activeThreads.add(key);
+// Does this agent take part in the thread: it posted there or was mentioned
+// there (or holds the thread's stored session)? Then it hears every new
+// message in the thread and decides for itself whether to answer.
+async function threadInvolves(agent: AgentConfig, app: App, channel: string, threadTs: string): Promise<boolean> {
+	const existing = getThread(channel, threadTs);
+	if (existing && existing.agentName === agent.name) return true;
 	try {
-		await processMessage(combined);
-	} finally {
-		activeThreads.delete(key);
-
-		const newQueue = messageQueues.get(key);
-		if (newQueue && newQueue.length > 0) {
-			console.log(`[${firstMsg.agent.name}] ${newQueue.length} messages arrived during processing, draining...`);
-			await drainQueue(key);
-		}
+		const res = await app.client.conversations.replies({ token: agent.slackBotToken, channel, ts: threadTs, limit: 200, inclusive: true });
+		return agentInvolved((res.messages || []) as any[], agent);
+	} catch (_e) {
+		return false; // cannot read the thread: do not wake on a guess
 	}
 }
 
@@ -186,6 +156,7 @@ function gateInbound(agent: AgentConfig, app: App, source: "mention" | "message"
 		lookupIsBot: (userId) => slackUserIsBot(app, userId),
 		lookupSender: (userId) => getSenderInfo(app, userId, agent),
 		onHumanInThread: (channel, threadTs) => agentTurns.humanSpoke(threadKey(channel, threadTs)),
+		lookupInvolved: (channel, threadTs) => threadInvolves(agent, app, channel, threadTs),
 	});
 }
 
@@ -263,7 +234,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			const threadTs = event.thread_ts || event.ts;
 			console.log(`[bot:${bot.via}] Agent: ${agent.name}, From: ${bot.sender.name} (agent), Channel: ${channel}, Thread: ${threadTs}`);
 			enqueueOrProcess({
-				agent, channel, threadTs, message: botText,
+				agent, channel, threadTs, message: bot.via === "thread" ? withThreadNote(botText) : botText,
 				isThreadReply: !!event.thread_ts, messageTs: event.ts, userId: bot.sender.userId, senderLine: bot.senderLine,
 			});
 			return;
@@ -316,40 +287,18 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			return;
 		}
 
-		// ── Channel thread reply (without @mention) ──
+		// ── Channel thread reply (without @mention of this agent) ──
+		// Nitay 2026-11-09: every agent that takes part in the thread hears it
+		// and decides whether it is meant for it. A message that mentions this
+		// agent is the app_mention handler's job (avoid a second copy).
 		if (event.thread_ts && (event.channel_type === "channel" || event.channel_type === "group")) {
-			// Check tracked sessions first
-			const existing = getThread(channel, event.thread_ts);
-			if (existing && existing.agentName === agent.name) {
-				console.log(`[thread-reply] Agent: ${agent.name}, From: ${sender.name}, Channel: ${channel}, Thread: ${event.thread_ts} (tracked)`);
-				enqueueOrProcess({
-					agent, channel, threadTs: event.thread_ts, message: messageText,
-					isThreadReply: true, messageTs: event.ts, userId: event.user, senderLine,
-				});
-				return;
-			}
-
-			// Check if parent message was posted by this agent
-			try {
-				const parentResult = await app.client.conversations.replies({
-					token: agent.slackBotToken,
-					channel,
-					ts: event.thread_ts,
-					limit: 1,
-					inclusive: true,
-				});
-				const parentMsg = parentResult.messages?.[0];
-				if (parentMsg?.bot_id && parentMsg.bot_id === agent.slackBotMsgId) {
-					console.log(`[thread-reply] Agent: ${agent.name}, From: ${sender.name}, Channel: ${channel}, Thread: ${event.thread_ts} (bot_id match)`);
-					enqueueOrProcess({
-						agent, channel, threadTs: event.thread_ts, message: messageText,
-						isThreadReply: true, messageTs: event.ts, userId: event.user, senderLine,
-					});
-					return;
-				}
-			} catch (_e) {
-				// Failed to fetch parent — ignore
-			}
+			if (mentionsAgent(event.text, agent.slackBotId)) return;
+			if (!(await threadInvolves(agent, app, channel, event.thread_ts))) return;
+			console.log(`[thread-reply] Agent: ${agent.name}, From: ${sender.name}, Channel: ${channel}, Thread: ${event.thread_ts} (involved)`);
+			enqueueOrProcess({
+				agent, channel, threadTs: event.thread_ts, message: withThreadNote(messageText),
+				isThreadReply: true, messageTs: event.ts, userId: event.user, senderLine,
+			});
 		}
 	});
 
@@ -460,7 +409,7 @@ function hasAudioAttachment(files: any[] | undefined): boolean {
 // user sees feedback in <200ms. Marked active so the later enqueueOrProcess call
 // reuses it instead of re-setting the status.
 async function postEarlyAudioAck(agent: AgentConfig, channel: string, threadTs: string): Promise<void> {
-	const key = threadKey(channel, threadTs);
+	const key = queueKey(agent.name, channel, threadTs);
 	if (activeStatusThreads.has(key)) return;
 	activeStatusThreads.add(key);
 	const ok = await setThinking(agent, channel, threadTs);
@@ -621,7 +570,7 @@ async function getThreadContext(agent: AgentConfig, channel: string, threadTs: s
 // ─── Core message processor ────────────────────────────────
 async function processMessage(msg: QueuedMessage): Promise<void> {
 	const { agent, channel, threadTs, message, isThreadReply } = msg;
-	const key = threadKey(channel, threadTs);
+	const key = queueKey(agent.name, channel, threadTs);
 
 	// Re-assert the "is thinking…" shimmer at processing start. setStatus is
 	// idempotent, so this is safe whether or not enqueueOrProcess already set it,

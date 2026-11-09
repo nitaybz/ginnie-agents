@@ -119,3 +119,36 @@ describe("r2 wiring", () => {
 		assert.doesNotMatch(messageHandler, /getSenderInfo\(/, "no second sender lookup that skips the gate");
 	});
 });
+
+describe("Nitay 2026-11-09: bot replies in a thread the agent takes part in", () => {
+	const botLookups = {
+		lookupIsBot: async () => true,
+		lookupSender: async (id: string) => ({ userId: id, name: "x", role: "bot", known: false }),
+	};
+	const reply = { type: "message", bot_id: ALLOWED_BOT.bot_id, user: ALLOWED_BOT.user_id, channel: "C1", channel_type: "channel", ts: "30.2", thread_ts: "30.1", text: "טופל" };
+	function run(event: any, involved: boolean) {
+		const asked: string[] = [];
+		return resolveInbound({
+			agent: agent(), source: "message", event,
+			turns: new AgentTurns(), seen: new BotEventSeen(),
+			...botLookups,
+			lookupInvolved: async (ch: string, ts: string) => { asked.push(`${ch}:${ts}`); return involved; },
+			onHumanInThread: () => {},
+		}).then((r) => ({ r, asked }));
+	}
+	test("involved: the bot reply wakes the agent", async () => {
+		const { r, asked } = await run(reply, true);
+		assert.equal(r.kind, "bot");
+		assert.equal(r.kind === "bot" && r.decision.via, "thread");
+		assert.deepEqual(asked, ["C1:30.1"]);
+	});
+	test("not involved: dropped", async () => {
+		const { r } = await run(reply, false);
+		assert.equal(r.kind, "drop");
+	});
+	test("a top-level bot post never triggers the thread lookup", async () => {
+		const { r, asked } = await run({ ...reply, thread_ts: undefined, ts: "31.1" }, true);
+		assert.equal(r.kind, "drop");
+		assert.deepEqual(asked, []);
+	});
+});

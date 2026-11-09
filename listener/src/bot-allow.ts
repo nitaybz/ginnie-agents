@@ -13,8 +13,9 @@
  *  - the agent never processes its own messages;
  *  - only bots in accept_bots wake it (matched by bot_id, and by user_id when
  *    both the entry and the event carry one); missing or empty = no bots;
- *  - only when the bot message mentions the agent, or sits in one of the
- *    agent's handoff_channels;
+ *  - only when the bot message mentions the agent, sits in one of the
+ *    agent's handoff_channels, or is a reply in a thread the agent takes part
+ *    in (it posted there or was mentioned there; Nitay 2026-11-09);
  *  - at most agent_turn_cap (default 3) bot messages per thread, counted once
  *    per message across every agent in this listener; after that only a
  *    real human (known person, not a Slack bot, no bot tags) posting in the
@@ -302,7 +303,7 @@ export class BotEventSeen {
 export type BotDecision =
 	| { kind: "human" }
 	| { kind: "drop"; reason: "own" | "not-allowed" | "not-addressed" | "duplicate" | "cap" | "turns-unreadable"; log?: string }
-	| { kind: "accept"; via: "mention" | "handoff"; bot: AcceptedBot; sender: BotSenderInfo; senderLine: string };
+	| { kind: "accept"; via: "mention" | "handoff" | "thread"; bot: AcceptedBot; sender: BotSenderInfo; senderLine: string };
 
 export function admitBotMessage(args: {
 	agent: AgentIds;
@@ -311,6 +312,7 @@ export function admitBotMessage(args: {
 	turns: AgentTurns;
 	seen: BotEventSeen;
 	slackIsBot?: boolean; // users.info is_bot for ev.user (an untagged event from a bot user is a bot)
+	involved?: boolean; // the agent posted in this thread or was mentioned there (thread-routing.ts)
 }): BotDecision {
 	const { agent, policy, ev, turns, seen } = args;
 	if (isOwnMessage(agent, ev)) return { kind: "drop", reason: "own" };
@@ -321,7 +323,9 @@ export function admitBotMessage(args: {
 
 	const mention = mentionsAgent(ev.text, agent.slackBotId);
 	const handoff = Boolean(ev.channel && policy.handoffChannels.includes(ev.channel));
-	if (!mention && !handoff) return { kind: "drop", reason: "not-addressed" };
+	// Nitay 2026-11-09: a reply in a thread the agent takes part in reaches it too.
+	const thread = Boolean(args.involved && ev.thread_ts);
+	if (!mention && !handoff && !thread) return { kind: "drop", reason: "not-addressed" };
 
 	const ts = ev.ts || "";
 	if (ts && seen.has(agent.name, ts)) return { kind: "drop", reason: "duplicate" };
@@ -350,7 +354,7 @@ export function admitBotMessage(args: {
 	if (ts) seen.add(agent.name, ts);
 	return {
 		kind: "accept",
-		via: mention ? "mention" : "handoff",
+		via: mention ? "mention" : handoff ? "handoff" : "thread",
 		bot,
 		sender: botSenderInfo(bot, ev),
 		senderLine: formatBotSenderLine(bot, ev),
