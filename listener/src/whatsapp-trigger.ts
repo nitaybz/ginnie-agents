@@ -233,10 +233,25 @@ export function formatWhatsAppSenderLine(s: WaSender, m: WaMessage): string {
 	return parts.join(" | ") + (s.known ? "" : " (unverified)");
 }
 
-function messageText(m: WaMessage): string {
+const VOICE_TYPES = new Set(["audio", "ptt", "voice"]);
+
+export function isVoiceNote(m: WaMessage): boolean {
+	return Boolean(m.media_type && VOICE_TYPES.has(m.media_type));
+}
+
+/** id -> transcript (null = tried and failed). */
+export type Transcripts = ReadonlyMap<string, string | null>;
+
+function messageText(m: WaMessage, transcripts?: Transcripts): string {
 	const text = (m.content || "").trim();
 	if (!m.media_type) return text;
-	const media = `[media: ${m.media_type}${m.filename ? ` ${JSON.stringify(m.filename)}` : ""}; msg_id ${m.id}]`;
+	let media = `[media: ${m.media_type}${m.filename ? ` ${JSON.stringify(m.filename)}` : ""}; msg_id ${m.id}]`;
+	if (isVoiceNote(m) && transcripts?.has(m.id)) {
+		const t = transcripts.get(m.id);
+		media = t
+			? `[voice message, transcribed: ${JSON.stringify(t.replace(/\s+/g, " ").trim())}; msg_id ${m.id}]`
+			: `[voice message (could not be transcribed); msg_id ${m.id}]`;
+	}
 	return text ? `${text}\n${media}` : media;
 }
 
@@ -259,6 +274,8 @@ export function buildWakePrompt(opts: {
 	skipped?: boolean;
 	// A 1:1 chat this agent started (customer conversation).
 	conversation?: boolean;
+	// Voice-note transcripts by message id (wa-voice).
+	transcripts?: Transcripts;
 }): string {
 	const tz = opts.tz || process.env.TZ || "UTC";
 	const batchIds = new Set(opts.batch.map((b) => b.message.id));
@@ -281,7 +298,7 @@ export function buildWakePrompt(opts: {
 			const who = mine ? "(You)" : resolveWhatsAppSender(opts.users, m.sender_phone || "").known
 				? resolveWhatsAppSender(opts.users, m.sender_phone || "").name
 				: (m.sender_phone || "unknown");
-			const text = messageText(m).replace(/\s+/g, " ").slice(0, 300);
+			const text = messageText(m, opts.transcripts).replace(/\s+/g, " ").slice(0, 300);
 			lines.push(`[${clock(m, tz)}] ${who} (msg_id ${m.id}${m.quoted_message_id ? `, quoting ${m.quoted_message_id}` : ""}): ${text}`);
 		}
 	}
@@ -296,7 +313,7 @@ export function buildWakePrompt(opts: {
 	lines.push("", "New:");
 	opts.batch.forEach((b, i) => {
 		if (i) lines.push("", "---");
-		lines.push(formatWhatsAppSenderLine(b.sender, b.message), messageText(b.message));
+		lines.push(formatWhatsAppSenderLine(b.sender, b.message), messageText(b.message, opts.transcripts));
 	});
 	lines.push(
 		"",
@@ -345,6 +362,8 @@ export interface TriggerDeps {
 	setRepeat?: (fn: () => void, ms: number) => () => void;
 	setTimer?: (fn: () => void, ms: number) => unknown;
 	log?: (line: string) => void;
+	// Turn a voice note into text before the agent wakes (null = could not).
+	transcribe?: (m: WaMessage) => Promise<string | null>;
 }
 
 const FETCH_TIMEOUT_MS = 15_000;
@@ -413,6 +432,45 @@ function requestJson(url: string, token: string, localAddress: string, body?: Re
 	});
 }
 
+const MEDIA_TIMEOUT_MS = 60_000;
+const MAX_MEDIA_BYTES = 25 * 1024 * 1024;
+
+/** GET a media file from the gateway as bytes (Bearer token; optional source IP). */
+export function fetchMedia(url: string, token: string, localAddress?: string): Promise<Buffer> {
+	const u = new URL(url);
+	const request = u.protocol === "https:" ? httpsRequest : httpRequest;
+	return new Promise((resolve, reject) => {
+		const req = request(u, {
+			method: "GET",
+			headers: { Authorization: `Bearer ${token}` },
+			...(localAddress ? { localAddress } : {}),
+			timeout: MEDIA_TIMEOUT_MS,
+		}, (res) => {
+			const status = res.statusCode || 0;
+			const chunks: Buffer[] = [];
+			let size = 0;
+			res.on("data", (c: Buffer) => {
+				size += c.length;
+				if (size > MAX_MEDIA_BYTES) { req.destroy(new Error("media too large")); return; }
+				chunks.push(c);
+			});
+			res.on("error", reject);
+			res.on("end", () => {
+				if (status < 200 || status >= 300) return reject(new Error(`HTTP ${status}`));
+				resolve(Buffer.concat(chunks));
+			});
+		});
+		req.on("timeout", () => req.destroy(new Error(`timeout after ${MEDIA_TIMEOUT_MS / 1000}s`)));
+		req.on("error", reject);
+		req.end();
+	});
+}
+
+export function mediaUrl(cfg: WhatsAppConfig, m: WaMessage): string {
+	const q = new URLSearchParams({ account_id: cfg.accountId, chat_jid: m.chat_jid, message_id: m.id });
+	return `${cfg.apiUrl}/v1/media?${q.toString()}`;
+}
+
 interface WakeItem {
 	message: WaMessage;
 	sender: WaSender;
@@ -451,6 +509,7 @@ export class WhatsAppTrigger {
 	private readonly setTimer: (fn: () => void, ms: number) => unknown;
 	private readonly log: (line: string) => void;
 	private readonly pendingFile: string;
+	private readonly transcripts = new Map<string, string | null>();
 
 	constructor(private deps: TriggerDeps) {
 		this.pendingFile = deps.pendingFile || path.join(path.dirname(deps.cursorFile), "whatsapp-pending.json");
@@ -587,9 +646,10 @@ export class WhatsAppTrigger {
 		this.persistPending();
 		const stopPresence = this.presenceStart(chat, batch.map((b) => b.message.id));
 		try {
+			await this.transcribeBatch(batch);
 			const prompt = buildWakePrompt({
 				cfg: this.deps.cfg, chat, batch, history: q.history, users: this.deps.knownUsers(), skipped,
-				conversation: q.conversation,
+				conversation: q.conversation, transcripts: this.transcripts,
 			});
 			await this.deps.dispatch(prompt, chat);
 		} catch (err) {
@@ -603,6 +663,24 @@ export class WhatsAppTrigger {
 				q.timer = null;
 				void this.flush(chat);
 			}, this.deps.cfg.debounceSeconds * 1000);
+		}
+	}
+
+	/** Voice notes in the batch become text (one at a time); a failure is marked, never thrown. */
+	private async transcribeBatch(batch: WakeItem[]): Promise<void> {
+		const transcribe = this.deps.transcribe;
+		if (!transcribe) return;
+		for (const { message: m } of batch) {
+			if (!isVoiceNote(m) || this.transcripts.has(m.id)) continue;
+			let text: string | null = null;
+			try {
+				text = await transcribe(m);
+			} catch (err) {
+				this.log(`[${this.deps.agentName}] whatsapp voice note ${m.id} not transcribed: ${err instanceof Error ? err.message : String(err)}`);
+			}
+			this.transcripts.set(m.id, text);
+			this.log(`[${this.deps.agentName}] whatsapp voice note ${m.id}: ${text ? `transcribed (${text.length} chars)` : "no transcript"}`);
+			if (this.transcripts.size > 500) this.transcripts.delete(this.transcripts.keys().next().value as string);
 		}
 	}
 

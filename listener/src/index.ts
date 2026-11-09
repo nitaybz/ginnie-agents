@@ -25,7 +25,8 @@ import { getSenderInfo, formatSenderLine, slackUserIsBot } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
-import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger } from "./whatsapp-trigger";
+import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger, fetchMedia, mediaUrl } from "./whatsapp-trigger";
+import { transcribeBuffer, whisperReady } from "./transcribe";
 import { getKnownUsersFor } from "./users";
 import { AGENT_TURNS_FILE, AgentTurns, BotEventSeen } from "./bot-allow";
 import { passesSenderPolicy, resolveInbound, type InboundResult } from "./inbound-gate";
@@ -692,6 +693,10 @@ function startWhatsAppTriggers(): void {
 			cursorFile: WHATSAPP_CURSORS_FILE,
 			knownUsers: () => getKnownUsersFor(agent),
 			allowSender: (s) => s.known || agent.boundaries === "read-only" || agent.allowUnverifiedSenders,
+			// Voice notes become text on this machine before the agent wakes (Nitay 2026-11-09).
+			transcribe: whisperReady()
+				? async (m) => transcribeBuffer(await fetchMedia(mediaUrl(cfg, m), agent.whatsappToken || "", cfg.localAddress))
+				: undefined,
 			dispatch: async (prompt, chat) => {
 				console.log(`[${agent.name}] whatsapp wake for ${chat}`);
 				const r = await runAgent(agent, prompt, "whatsapp");
