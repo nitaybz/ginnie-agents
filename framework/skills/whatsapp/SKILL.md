@@ -31,7 +31,20 @@ jq -n --arg chat "<chat_jid>" --arg text "<message>" --arg key "<idempotency_key
   '{account_id: "{{WHATSAPP_ACCOUNT_ID}}", chat_jid: $chat, message: $text, idempotency_key: $key}
    + (if $quote == "" then {} else {reply_to_message_id: $quote} end)' \
 | curl -sS -H "$WA_AUTH" -H "Content-Type: application/json" --data-binary @- "$WA/v1/send"
+
+# Send an image or a file (up to 20 MB), optional caption, from a file you have...
+jq -n --arg chat "<chat_jid>" --arg key "<idempotency_key>" --arg cap "<caption or empty>" --arg name "<file name, e.g. photo.jpg>" \
+  --rawfile b64 <(base64 -w0 <path to the file>) \
+  '{account_id: "{{WHATSAPP_ACCOUNT_ID}}", chat_jid: $chat, idempotency_key: $key, caption: $cap, file_name: $name, data_base64: $b64}' \
+| curl -sS -H "$WA_AUTH" -H "Content-Type: application/json" --data-binary @- "$WA/v1/send_media"
+# ...or from a public https link (the gateway downloads it; same body with url instead of data_base64)
+jq -n --arg chat "<chat_jid>" --arg key "<idempotency_key>" --arg cap "<caption or empty>" --arg url "<https link to the image or file>" \
+  '{account_id: "{{WHATSAPP_ACCOUNT_ID}}", chat_jid: $chat, idempotency_key: $key, caption: $cap, url: $url}' \
+| curl -sS -H "$WA_AUTH" -H "Content-Type: application/json" --data-binary @- "$WA/v1/send_media"
 ```
+
+Images (jpg, png, webp) arrive as photos, videos as videos, anything else (pdf, docx) as a document.
+`send_media` follows the same rules as `send` below (allowed chats, idempotency_key, states, dry_run).
 
 Never print the token or put it in a message, file or log.
 
