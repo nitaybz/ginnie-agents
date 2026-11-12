@@ -27,6 +27,10 @@
  *                             credentials.json (whatsapp_token).
  *   MAX_TURNS              — Optional: max agentic turns (default: 50)
  *   ALLOWED_TOOLS          — Optional: comma-separated tool list
+ *   AGENT_TOOL_SERVERS     - Optional: JSON { name: { url, token_key } } of MCP
+ *                             tool servers (config.json "tool_servers"). The
+ *                             token is read from /workspace/credentials.json;
+ *                             each server's tools are allowed as mcp__<name>__*.
  *   AGENT_MODEL            — Optional: model or alias (e.g. "opus"). The model
  *                             the SDK actually resolved is logged at session
  *                             start and returned as `model` in the result JSON.
@@ -42,6 +46,7 @@ import { createRequire } from "module";
 import { bottomLineSkill, whatsappSkill } from "./prompt-skills.mjs";
 import { createLimitTracker } from "./limit-detect.mjs";
 import { CONTINUE_AFTER_ERROR_MESSAGE, nextStep } from "./run-policy.mjs";
+import { toolServerOptions } from "./tool-servers.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -59,6 +64,22 @@ const defaultTools = [
 const allowedTools = process.env.ALLOWED_TOOLS
 	? process.env.ALLOWED_TOOLS.split(",").map((t) => t.trim())
 	: defaultTools;
+
+// MCP tool servers (optional). The token comes from the read-only
+// credentials.json mount, never from env. Unset = nothing changes.
+let mcpServers = undefined;
+if (process.env.AGENT_TOOL_SERVERS) {
+	let agentCredentials = null;
+	try {
+		agentCredentials = JSON.parse(readFileSync("/workspace/credentials.json", "utf-8"));
+	} catch {
+		console.error(`[${agentName}] Warning: cannot read /workspace/credentials.json for tool servers`);
+	}
+	const ts = toolServerOptions(process.env.AGENT_TOOL_SERVERS, agentCredentials, (line) => console.error(`[${agentName}] ${line}`));
+	mcpServers = ts.mcpServers;
+	allowedTools.push(...ts.allowedTools);
+	if (mcpServers) console.error(`[${agentName}] Tool servers: ${Object.keys(mcpServers).join(", ")}`);
+}
 
 if (!message) {
 	console.error(`[${agentName}] ERROR: AGENT_MESSAGE not set`);
@@ -261,6 +282,7 @@ async function runSession(resumeSessionId, prompt) {
 			resume: resumeSessionId,
 			persistSession: true,
 			model: process.env.AGENT_MODEL || undefined,
+			...(mcpServers ? { mcpServers } : {}),
 		},
 	})) {
 		if (msg.type === "system" && msg.subtype === "init") {

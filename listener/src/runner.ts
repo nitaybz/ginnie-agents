@@ -18,6 +18,7 @@ import { bottomLineDockerEnv } from "./bottom-line";
 import { parseWhatsAppConfig, whatsappDockerArgs, type WhatsAppConfig } from "./whatsapp-trigger";
 import { parseExtraMounts, checkHostPaths, extraMountDockerArgs, type ExtraMount, type HostEnv } from "./extra-mounts";
 import { parseBotPolicy, type BotPolicy } from "./bot-allow";
+import { parseToolServers, toolServerRefs, toolServersDockerEnv, type ToolServerRef } from "./tool-servers";
 import {
 	ACCOUNT_COOLDOWNS_FILE,
 	accountDockerAuth,
@@ -80,6 +81,9 @@ export interface AgentConfig {
 	// Which other bots may wake this agent (config.json "accept_bots",
 	// "handoff_channels", "agent_turn_cap"). Missing or empty = none. See bot-allow.ts.
 	botPolicy?: BotPolicy;
+	// MCP tool servers this agent may use (config.json "tool_servers"; token
+	// in credentials.json under token_key). See tool-servers.ts.
+	toolServers?: Record<string, ToolServerRef>;
 }
 
 interface AgentManifest {
@@ -98,6 +102,7 @@ interface AgentManifest {
 	accept_bots?: unknown;
 	handoff_channels?: unknown;
 	agent_turn_cap?: unknown;
+	tool_servers?: unknown;
 }
 
 // How long an interactive (actions) block stays live before the listener's
@@ -167,12 +172,14 @@ export function loadAgents(): AgentConfig[] {
 		let slackBotToken = "";
 		let slackAppToken = "";
 		let whatsappToken = "";
+		let creds: Record<string, unknown> | null = null;
 		if (existsSync(credsPath)) {
 			try {
-				const creds = JSON.parse(readFileSync(credsPath, "utf-8"));
-				slackBotToken = creds.slack_bot_token || "";
-				slackAppToken = creds.slack_app_token || "";
-				whatsappToken = typeof creds.whatsapp_token === "string" ? creds.whatsapp_token.trim() : "";
+				creds = JSON.parse(readFileSync(credsPath, "utf-8"));
+				const c = (creds || {}) as Record<string, any>;
+				slackBotToken = c.slack_bot_token || "";
+				slackAppToken = c.slack_app_token || "";
+				whatsappToken = typeof c.whatsapp_token === "string" ? c.whatsapp_token.trim() : "";
 			} catch {}
 		}
 		if (!slackBotToken) slackBotToken = process.env.SLACK_BOT_TOKEN || "";
@@ -186,6 +193,10 @@ export function loadAgents(): AgentConfig[] {
 		];
 		const bots = parseBotPolicy(manifest);
 		for (const w of bots.warnings) console.warn(`[${entry.name}] ${w}`);
+		const tools = parseToolServers(manifest, creds && typeof creds === "object" ? creds : null);
+		for (const e of tools.errors) console.warn(`[${entry.name}] ${e}`);
+		const toolServerNames = Object.keys(tools.servers);
+		if (toolServerNames.length) console.log(`[${entry.name}] Tool servers: ${toolServerNames.join(", ")}`);
 		const wh = manifest.work_hours || {};
 		const workHours: AgentWorkHours = {
 			enabled: wh.enabled === true,
@@ -221,6 +232,7 @@ export function loadAgents(): AgentConfig[] {
 				(line) => console.warn(`[${entry.name}] ${line}`),
 			),
 			botPolicy: bots.policy,
+			toolServers: toolServerNames.length ? toolServerRefs(manifest, tools.servers) : undefined,
 		});
 	}
 
@@ -413,6 +425,10 @@ export function spawnAttempt(
 		// WhatsApp gateway agent API (framework/skills/whatsapp). The token is
 		// not passed here; the agent reads it from its credentials.json mount.
 		dockerArgs.push(...whatsappDockerArgs(agent.whatsapp));
+
+		// MCP tool servers (config.json "tool_servers"): url + token_key only;
+		// the entrypoint reads the token from the credentials.json mount.
+		dockerArgs.push(...toolServersDockerEnv(agent.toolServers));
 
 		// Mount agent's .claude directory (session persistence, settings).
 		// Only overlay host credentials.json when neither auth env var is set —

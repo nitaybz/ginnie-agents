@@ -106,6 +106,24 @@ Each agent's `config.json` declares `"boundaries": "read-only"` or `"write"` (de
 
 This is not a sandbox. Agents still run as their declared identity in their container, and `read-only` does not prevent outbound data exfiltration: a read-only agent can `Read` files and `WebFetch` them out of the container. What `read-only` does guarantee is that the agent cannot *mutate* state — no `Bash`, no `Write`, no `Edit` regardless of what the prompt says. Use it to contain blast radius from agent misbehavior, not as a leak-proof barrier. See [Threat model](#threat-model) below for what each layer protects against.
 
+## Tool servers
+
+An agent can use tools served by an MCP server (a "tool server") that the operator runs, usually on the docker host. Name the servers in the agent's `config.json`:
+
+```json
+"tool_servers": {
+  "sasha_tools": { "url": "http://172.17.0.1:8765/mcp", "token_key": "sasha_tools_token" }
+}
+```
+
+- The name matches `[a-z][a-z0-9_]{1,30}`. The agent sees each tool as `mcp__<name>__<tool>`, and every tool of a listed server is added to its allowed tools.
+- `url` is `http://172.17.0.1:<port>/...` (the docker host as seen from the container) or any `https://...` address.
+- The token lives in the agent's `credentials.json` under `token_key` and is sent as `Authorization: Bearer <token>`. The runner passes only the url and the key name to the container (`AGENT_TOOL_SERVERS`); the entrypoint reads the token from the read-only `credentials.json` mount, so it never shows up in `docker inspect`.
+- A bad entry (bad name, other http host, missing `token_key` or token) is logged and skipped; the agent still starts. The listener logs `Tool servers: <names>` for each agent that has any.
+- Read-only agents may use tool servers too. The server decides what it offers, so a server that can change things gives a read-only agent that power.
+- The framework does not start, stop or secure these servers. Running them, keeping them up and deciding what each tool may do is the operator's responsibility.
+- Without `tool_servers` nothing changes: the container gets no extra env and the SDK gets no `mcpServers`.
+
 ## Work hours
 
 `config.json.work_hours` does **not** gate inbound user messages. An @mention, DM, or thread reply reaches the agent and gets answered at any hour, any day — there is no config that silences that.

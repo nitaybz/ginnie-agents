@@ -19,5 +19,9 @@
     "days": ["mon", "tue", "wed", "thu", "fri"]
   },
   "model": "claude-sonnet-4-6",
-  "button_ttl_hours": 48
+  "button_ttl_hours": 48,
+  "_tool_servers_example": {
+    "_comment": "Optional. Rename this key to tool_servers to give the agent the tools of MCP servers you run. url: http://172.17.0.1:<port>/... (the docker host) or https://...; token_key: the key in credentials.json that holds the bearer token. See ARCHITECTURE.md, Tool servers.",
+    "my_tools": { "url": "http://172.17.0.1:8765/mcp", "token_key": "my_tools_token" }
+  }
 }
