@@ -21,6 +21,7 @@ import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
 import { isSlackThreadTs } from "./run-failures";
 import { buildSlackPrompt, scheduledThreadKey } from "./slack-prompt";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
+import { WakeInbox } from "./wake-inbox";
 import { getSenderInfo, formatSenderLine, slackUserIsBot } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
@@ -673,6 +674,22 @@ function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {
 	});
 }
 
+// ─── Wake inbox ────────────────────────────────────────────
+// Host jobs with no model (order and mail watchers) wake an agent at once by dropping a file in
+// <agent dir>/data/wake/ (wake-inbox.ts). Each file is one run, queued like a schedule fire.
+function startWakeInboxes(): void {
+	for (const agent of agents) {
+		if (!agent.wakeInbox) continue;
+		const inbox = new WakeInbox({
+			agentName: agent.name,
+			dir: path.join(agent.dir, "data", "wake"),
+			onWake: (e) => onScheduleFire(agent, { id: `wake-${e.id}`, cron: "", message: e.message, enabled: true } as ScheduleEntry),
+		});
+		inbox.start();
+		console.log(`   Wake inbox: ${agent.name} (data/wake, every 10s)`);
+	}
+}
+
 // ─── WhatsApp wake-up ──────────────────────────────────────
 // Agents with a "whatsapp" block in config.json (and whatsapp_token in
 // credentials.json) are woken by new messages in the chats they watch. Each
@@ -766,6 +783,7 @@ function startSlackHeartbeat(agentName: string, receiver: SocketModeReceiver): v
 	}
 
 	startWhatsAppTriggers();
+	startWakeInboxes();
 
 	// Periodically retire stale, never-clicked buttons from agent messages.
 	if (started.length) startButtonSweep(apps, agents);

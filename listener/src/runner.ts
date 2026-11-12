@@ -66,6 +66,8 @@ export interface AgentConfig {
 	boundaries: AgentBoundaries;
 	workHours: AgentWorkHours;
 	allowUnverifiedSenders: boolean;
+	/** config.json "wake_inbox": true = host jobs may wake the agent via <dir>/data/wake/*.json (wake-inbox.ts). */
+	wakeInbox?: boolean;
 	model?: string;
 	buttonTtlHours: number;
 	// Optional WhatsApp access + wake-up (config.json "whatsapp"; token in
@@ -88,6 +90,7 @@ interface AgentManifest {
 	boundaries?: AgentBoundaries;
 	work_hours?: Partial<AgentWorkHours>;
 	allow_unverified_senders?: boolean;
+	wake_inbox?: boolean;
 	model?: string;
 	button_ttl_hours?: number;
 	whatsapp?: unknown;
@@ -204,6 +207,7 @@ export function loadAgents(): AgentConfig[] {
 			boundaries,
 			workHours,
 			allowUnverifiedSenders: manifest.allow_unverified_senders === true,
+			wakeInbox: manifest.wake_inbox === true,
 			model: manifest.model,
 			buttonTtlHours: typeof manifest.button_ttl_hours === "number" && manifest.button_ttl_hours > 0
 				? manifest.button_ttl_hours
