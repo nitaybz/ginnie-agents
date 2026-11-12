@@ -76,6 +76,21 @@ describe("parseToolServers", () => {
 		}
 	});
 
+	test("the normalized url is what is kept (and later handed to the container)", () => {
+		const manifest = { tool_servers: { sasha_tools: { ...good, url: "HTTP://172.17.0.1:8765/a/../mcp" } } };
+		const r = parseToolServers(manifest, creds);
+		assert.deepEqual(r.errors, []);
+		assert.equal(r.servers.sasha_tools.url, "http://172.17.0.1:8765/mcp");
+		assert.equal(toolServerRefs(manifest, r.servers).sasha_tools.url, "http://172.17.0.1:8765/mcp");
+	});
+
+	test("token_key with characters outside [A-Za-z0-9_.-] is refused (it goes into a shell command)", () => {
+		const badKey = "x'; touch /tmp/pwn; '";
+		const r = parseToolServers({ tool_servers: { sasha_tools: { url: good.url, token_key: badKey } } }, { [badKey]: "t" });
+		assert.deepEqual(r.servers, {});
+		assert.match(r.errors[0], /tool_servers\.sasha_tools\.token_key/);
+	});
+
 	test("errors never contain the token value", () => {
 		const r = parseToolServers({ tool_servers: { sasha_tools: { ...good, url: "http://evil.example:1/x" } } }, creds);
 		assert.ok(!r.errors.join("\n").includes(creds.sasha_tools_token));
@@ -192,13 +207,41 @@ describe("entrypoint helper (docker/tool-servers.mjs)", () => {
 		assert.equal(lines.length, 0);
 	});
 
-	test("valid env: SDK http server with bearer header, and a wildcard allowed-tool per server", async () => {
+	test("valid env: SDK http server with a headersHelper command, and a wildcard allowed-tool per server", async () => {
 		const { toolServerOptions } = await entrypointHelper();
-		const r = toolServerOptions(env, creds, () => {});
+		const helper = { node: "/usr/local/bin/node", script: "/app/tool-server-headers.mjs", credentialsFile: "/workspace/credentials.json" };
+		const r = toolServerOptions(env, creds, () => {}, helper);
 		assert.deepEqual(r, {
-			mcpServers: { sasha_tools: { type: "http", url: good.url, headers: { Authorization: "Bearer tok-test-123" } } },
+			mcpServers: { sasha_tools: {
+				type: "http",
+				url: good.url,
+				headersHelper: "'/usr/local/bin/node' '/app/tool-server-headers.mjs' 'sasha_tools_token' '/workspace/credentials.json'",
+			} },
 			allowedTools: ["mcp__sasha_tools__*"],
 		});
+	});
+
+	test("the token is nowhere in what is handed to the SDK (it goes on the program's command line)", async () => {
+		const { toolServerOptions } = await entrypointHelper();
+		const r = toolServerOptions(env, creds, () => {});
+		assert.ok(r.mcpServers.sasha_tools.headersHelper);
+		assert.equal(r.mcpServers.sasha_tools.headers, undefined);
+		assert.ok(!JSON.stringify(r).includes(creds.sasha_tools_token));
+	});
+
+	test("default helper paths point at the file next to the module, run by this node", async () => {
+		const { toolServerOptions } = await entrypointHelper();
+		const cmd: string = toolServerOptions(env, creds, () => {}).mcpServers.sasha_tools.headersHelper;
+		assert.ok(cmd.startsWith(`'${process.execPath}' '${path.join(repoRoot, "docker", "tool-server-headers.mjs")}' 'sasha_tools_token' '/workspace/credentials.json'`));
+	});
+
+	test("a token_key with shell characters is refused", async () => {
+		const { toolServerOptions } = await entrypointHelper();
+		const lines: string[] = [];
+		const badKey = "x'; touch /tmp/pwn; '";
+		const r = toolServerOptions(JSON.stringify({ sasha_tools: { url: good.url, token_key: badKey } }), { [badKey]: "t" }, (l: string) => lines.push(l));
+		assert.deepEqual(r, { mcpServers: undefined, allowedTools: [] });
+		assert.equal(lines.length, 1);
 	});
 
 	test("token missing in the mounted credentials: server skipped with one log line, no token in log", async () => {
@@ -219,7 +262,43 @@ describe("entrypoint helper (docker/tool-servers.mjs)", () => {
 		assert.equal(lines.length, 2);
 	});
 
-	test("Dockerfile copies the helper into the image", () => {
-		assert.ok(readFileSync(path.join(repoRoot, "docker", "Dockerfile"), "utf-8").includes("COPY docker/tool-servers.mjs /app/tool-servers.mjs"));
+	test("Dockerfile copies both helpers into the image", () => {
+		const df = readFileSync(path.join(repoRoot, "docker", "Dockerfile"), "utf-8");
+		assert.ok(df.includes("COPY docker/tool-servers.mjs /app/tool-servers.mjs"));
+		assert.ok(df.includes("COPY docker/tool-server-headers.mjs /app/tool-server-headers.mjs"));
+	});
+
+	test("entrypoint does not mutate the default tool list", () => {
+		const src = readFileSync(path.join(repoRoot, "docker", "entrypoint.mjs"), "utf-8");
+		assert.ok(src.includes(": [...defaultTools];"));
+	});
+});
+
+describe("headers helper (docker/tool-server-headers.mjs)", () => {
+	const { spawnSync } = require("child_process");
+	const script = path.join(repoRoot, "docker", "tool-server-headers.mjs");
+	function run(args: string[]) {
+		return spawnSync(process.execPath, [script, ...args], { encoding: "utf-8" });
+	}
+
+	test("prints the Authorization header read from the credentials file", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "tool-headers-"));
+		const file = path.join(dir, "credentials.json");
+		writeFileSync(file, JSON.stringify({ sasha_tools_token: " tok-test-123\n" }));
+		const r = run(["sasha_tools_token", file]);
+		assert.equal(r.status, 0);
+		assert.deepEqual(JSON.parse(r.stdout), { Authorization: "Bearer tok-test-123" });
+	});
+
+	test("missing key or file: exit 1, nothing on stdout, token never in stderr", () => {
+		const dir = mkdtempSync(path.join(tmpdir(), "tool-headers-"));
+		const file = path.join(dir, "credentials.json");
+		writeFileSync(file, JSON.stringify({ other: "tok-test-123" }));
+		for (const args of [["sasha_tools_token", file], ["sasha_tools_token", path.join(dir, "nope.json")]]) {
+			const r = run(args);
+			assert.equal(r.status, 1);
+			assert.equal(r.stdout, "");
+			assert.ok(!r.stderr.includes("tok-test-123"));
+		}
 	});
 });

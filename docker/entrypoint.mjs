@@ -29,7 +29,8 @@
  *   ALLOWED_TOOLS          — Optional: comma-separated tool list
  *   AGENT_TOOL_SERVERS     - Optional: JSON { name: { url, token_key } } of MCP
  *                             tool servers (config.json "tool_servers"). The
- *                             token is read from /workspace/credentials.json;
+ *                             token is read from /workspace/credentials.json by
+ *                             a headersHelper, never put on a command line;
  *                             each server's tools are allowed as mcp__<name>__*.
  *   AGENT_MODEL            — Optional: model or alias (e.g. "opus"). The model
  *                             the SDK actually resolved is logged at session
@@ -63,10 +64,12 @@ const defaultTools = [
 ];
 const allowedTools = process.env.ALLOWED_TOOLS
 	? process.env.ALLOWED_TOOLS.split(",").map((t) => t.trim())
-	: defaultTools;
+	: [...defaultTools];
 
-// MCP tool servers (optional). The token comes from the read-only
-// credentials.json mount, never from env. Unset = nothing changes.
+// MCP tool servers (optional). The token stays in the read-only
+// credentials.json mount: it is read here only to check it exists, and
+// docker/tool-server-headers.mjs reads it again when the Claude program
+// connects. Never in env or on a command line. Unset = nothing changes.
 let mcpServers = undefined;
 if (process.env.AGENT_TOOL_SERVERS) {
 	let agentCredentials = null;

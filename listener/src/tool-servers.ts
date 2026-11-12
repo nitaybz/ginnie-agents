@@ -14,14 +14,18 @@
  *  - token_key names a non-empty string in the agent's credentials.json. It
  *    is sent as "Authorization: Bearer <token>".
  *
- * The token never goes into docker args or env: the runner passes only
- * {url, token_key} (AGENT_TOOL_SERVERS), and the entrypoint reads the token
- * from the read-only credentials.json mount (docker/tool-servers.mjs).
+ * The token never goes into docker args, env or any command line: the
+ * runner passes only {url, token_key} (AGENT_TOOL_SERVERS), and inside the
+ * container a headersHelper (docker/tool-server-headers.mjs) reads it from
+ * the read-only credentials.json mount when the Claude program connects.
+ * token_key is limited to [A-Za-z0-9_.-] because it is part of that helper
+ * command. The url handed on is the normalized one that was validated.
  * Read-only agents may use tool servers too: the server decides what it offers.
  */
 
 export const TOOL_SERVER_NAME = /^[a-z][a-z0-9_]{1,30}$/;
 export const DOCKER_HOST_IP = "172.17.0.1";
+export const TOKEN_KEY = /^[A-Za-z0-9_.-]{1,64}$/;
 
 export interface ToolServer {
 	url: string;
@@ -34,17 +38,18 @@ export interface ToolServerRef {
 	token_key: string;
 }
 
-function urlProblem(raw: unknown): string | null {
-	if (typeof raw !== "string" || !raw) return "is missing";
+/** The normalized url when allowed, else { problem }. */
+function checkUrl(raw: unknown): { url: string } | { problem: string } {
+	if (typeof raw !== "string" || !raw) return { problem: "is missing" };
 	let u: URL;
 	try {
 		u = new URL(raw);
 	} catch {
-		return "is not a valid URL";
+		return { problem: "is not a valid URL" };
 	}
-	if (u.protocol === "https:") return null;
-	if (u.protocol === "http:" && u.hostname === DOCKER_HOST_IP && u.port !== "") return null;
-	return `must be http://${DOCKER_HOST_IP}:<port>/... or https://...`;
+	if (u.protocol === "https:") return { url: u.href };
+	if (u.protocol === "http:" && u.hostname === DOCKER_HOST_IP && u.port !== "") return { url: u.href };
+	return { problem: `must be http://${DOCKER_HOST_IP}:<port>/... or https://...` };
 }
 
 export function parseToolServers(
@@ -65,9 +70,9 @@ export function parseToolServers(
 			continue;
 		}
 		const e = (entry && typeof entry === "object" ? entry : {}) as Record<string, unknown>;
-		const badUrl = urlProblem(e.url);
-		if (badUrl) {
-			errors.push(`tool_servers.${name}.url ${badUrl}; server skipped`);
+		const url = checkUrl(e.url);
+		if ("problem" in url) {
+			errors.push(`tool_servers.${name}.url ${url.problem}; server skipped`);
 			continue;
 		}
 		const key = e.token_key;
@@ -75,12 +80,16 @@ export function parseToolServers(
 			errors.push(`tool_servers.${name}.token_key is missing; server skipped`);
 			continue;
 		}
+		if (!TOKEN_KEY.test(key)) {
+			errors.push(`tool_servers.${name}.token_key may only use letters, digits, "_", "." and "-"; server skipped`);
+			continue;
+		}
 		const token = credentials ? credentials[key] : undefined;
 		if (typeof token !== "string" || !token.trim()) {
 			errors.push(`tool_servers.${name}.token_key "${key}" not found in credentials.json; server skipped`);
 			continue;
 		}
-		servers[name] = { url: e.url as string, headers: { Authorization: `Bearer ${token.trim()}` } };
+		servers[name] = { url: url.url, headers: { Authorization: `Bearer ${token.trim()}` } };
 	}
 	return { servers, errors };
 }
