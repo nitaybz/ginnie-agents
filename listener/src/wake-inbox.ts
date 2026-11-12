@@ -30,7 +30,8 @@ export function takeWakeFiles(dir: string, now = Date.now()): WakeEntry[] {
 	if (!existsSync(dir)) return [];
 	const names = readdirSync(dir)
 		.filter((n) => n.endsWith(".json") && !n.startsWith("."))
-		.map((n) => ({ n, t: statSync(path.join(dir, n)).mtimeMs }))
+		.map((n) => { try { return { n, t: statSync(path.join(dir, n)).mtimeMs }; } catch { return null; } })
+		.filter((x): x is { n: string; t: number } => x !== null)
 		.sort((a, b) => a.t - b.t || a.n.localeCompare(b.n))
 		.map((x) => x.n);
 	const out: WakeEntry[] = [];
@@ -49,11 +50,12 @@ export function takeWakeFiles(dir: string, now = Date.now()): WakeEntry[] {
 		}
 		if (moveTo(dir, "done", name)) out.push({ id: entry!.id as string, message: entry!.message as string, file: name });
 	}
-	// done/ is a short audit trail, not an archive.
-	const done = path.join(dir, "done");
-	if (existsSync(done)) {
-		for (const n of readdirSync(done)) {
-			const p = path.join(done, n);
+	// done/ and rejected/ are a short audit trail, not an archive.
+	for (const sub of ["done", "rejected"]) {
+		const d = path.join(dir, sub);
+		if (!existsSync(d)) continue;
+		for (const n of readdirSync(d)) {
+			const p = path.join(d, n);
 			try { if (now - statSync(p).mtimeMs > KEEP_DONE_MS) unlinkSync(p); } catch { /* gone */ }
 		}
 	}
