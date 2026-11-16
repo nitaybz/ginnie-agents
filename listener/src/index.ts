@@ -16,10 +16,13 @@
 import { App, LogLevel, SocketModeReceiver } from "@slack/bolt";
 import dotenv from "dotenv";
 import path from "path";
+import { rmSync } from "fs";
 import { loadStore, getThread, setThread } from "./store";
 import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
 import { isSlackThreadTs } from "./run-failures";
-import { buildSlackPrompt, scheduledThreadKey } from "./slack-prompt";
+import { buildMidRunPrompt, buildSlackPrompt, scheduledThreadKey } from "./slack-prompt";
+import { MIDRUN_ROOT, MidRunInbox } from "./midrun-inbox";
+import { WorkingSign } from "./working-sign";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
 import { WakeInbox } from "./wake-inbox";
 import { getSenderInfo, formatSenderLine, slackUserIsBot } from "./users";
@@ -68,6 +71,8 @@ interface QueuedMessage {
 	senderLine: string;
 	/** Woken only because it takes part in the thread: no "is thinking" shimmer, since it may stay silent. */
 	quiet?: boolean;
+	/** The messages batched into this run (set when the run starts). */
+	parts?: QueuedMessage[];
 }
 
 const DEBOUNCE_MS = 20_000; // Wait 20s for additional messages before processing
@@ -76,13 +81,14 @@ const DEBOUNCE_MS = 20_000; // Wait 20s for additional messages before processin
 // ahead of the reply event and the user sees the shimmer disappear before the
 // answer lands.
 const STATUS_DELETE_DELAY_MS = 1500;
-// Slack auto-clears an assistant status ~2min after it was last set. Agent runs
-// routinely exceed that, so re-assert the "is thinking…" status on this cadence
-// (comfortably under 2min) until the run completes — otherwise the shimmer
-// vanishes while the user is still waiting for the reply.
-const STATUS_HEARTBEAT_MS = 90_000;
+// Slack clears the status two minutes after it was last set AND every time the
+// bot posts a message, and agents post while they work. So re-set it often
+// (Slack allows 600 of these calls a minute per app); the same beat moves the
+// reaction on a mid-run message once the run has taken it. See working-sign.ts.
+const STATUS_HEARTBEAT_MS = 15_000;
 
-const activeStatusThreads = new Set<string>(); // agent+thread keys with an active "thinking" shimmer
+// Inboxes of the runs working right now, by agent+thread (midrun-inbox.ts).
+const midRunInboxes = new Map<string, MidRunInbox<QueuedMessage>>();
 
 // One Bolt App per agent (keyed by agent name)
 const apps = new Map<string, App>();
@@ -97,16 +103,14 @@ const dispatcher = new ThreadDispatcher<QueuedMessage>({
 	debounceMs: DEBOUNCE_MS,
 	log: (line) => console.log(line),
 	onError: (agentName, err) => console.error(`[${agentName}] Queue drain error:`, err),
-	// Show the "is thinking…" shimmer immediately on first arrival — before the
-	// debounce window closes — so the user sees acknowledgement within ~200ms
-	// instead of 20s. Optimistically mark active to dedupe concurrent arrivals;
-	// the call is idempotent, so a rare double-set is harmless.
-	onFirst: (msg, key) => {
-		if (msg.quiet || activeStatusThreads.has(key)) return;
-		activeStatusThreads.add(key);
-		setThinking(msg.agent, msg.channel, msg.threadTs)
-			.then((ok) => { if (!ok) activeStatusThreads.delete(key); })
-			.catch(() => { activeStatusThreads.delete(key); });
+	// The agent is working in this thread: hand the message to that run, which
+	// gets it between tool calls. False (no inbox, or the run just ended) leaves
+	// it in line for the next run, as before.
+	offerToRun: (msg, key) => {
+		const inbox = midRunInboxes.get(key);
+		return !!inbox && inbox.offer(msg, buildMidRunPrompt({
+			channel: msg.channel, threadTs: msg.threadTs, message: `${msg.senderLine}\n${msg.message}`,
+		}));
 	},
 	process: async (_agentName, messages) => {
 		const firstMsg = messages[0];
@@ -122,11 +126,14 @@ const dispatcher = new ThreadDispatcher<QueuedMessage>({
 			userId: messages[messages.length - 1].userId,
 			isThreadReply: firstMsg.isThreadReply || messages.length > 1,
 			quiet: messages.every((m) => m.quiet),
+			parts: messages,
 		});
 	},
 });
 
 function enqueueOrProcess(msg: QueuedMessage): void {
+	// Show the sign now, before the debounce wait or the line behind a working run.
+	sign.received(msg);
 	dispatcher.enqueue(msg);
 }
 
@@ -209,7 +216,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		// Post early ack BEFORE transcription so the user sees feedback within
 		// the same ~200ms window non-audio messages get.
 		if (hasFiles && hasAudioAttachment(event.files)) {
-			await postEarlyAudioAck(agent, channel, threadTs);
+			sign.received({ agent, channel, threadTs, messageTs: "" }); // status only; the reaction comes once the message is accepted
 		}
 
 		const messageText = hasFiles
@@ -277,8 +284,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			// dangling status. The sender already passed the gate above, so
 			// we don't ack messages we'll later silently drop.
 			if (event.channel_type === "im" && hasAudioAttachment(event.files)) {
-				const earlyThreadTs = event.thread_ts || event.ts;
-				await postEarlyAudioAck(agent, channel, earlyThreadTs);
+				sign.received({ agent, channel, threadTs: event.thread_ts || event.ts, messageTs: "" }); // status only, as above
 			}
 
 			messageText = await expandFileAttachments(event.files, agent, messageText);
@@ -421,17 +427,6 @@ function hasAudioAttachment(files: any[] | undefined): boolean {
 	);
 }
 
-// Show the "is thinking…" status before a slow operation (transcription) so the
-// user sees feedback in <200ms. Marked active so the later enqueueOrProcess call
-// reuses it instead of re-setting the status.
-async function postEarlyAudioAck(agent: AgentConfig, channel: string, threadTs: string): Promise<void> {
-	const key = queueKey(agent.name, channel, threadTs);
-	if (activeStatusThreads.has(key)) return;
-	activeStatusThreads.add(key);
-	const ok = await setThinking(agent, channel, threadTs);
-	if (!ok) activeStatusThreads.delete(key);
-}
-
 // Expand Slack file attachments into agent-readable text. Audio files are
 // transcribed locally via whisper.cpp and the transcript is spliced inline.
 // Non-audio files keep the standard "[File: …] Download: curl …" stub the
@@ -488,26 +483,25 @@ async function expandFileAttachments(
 	return result;
 }
 
-// ─── Status indicators (scoped to agent) ───────────────────
-// Slack's native assistant "is thinking…" shimmer (assistant.threads.setStatus).
-// It's bound to (channel, thread_ts) — there is no message ts to track or delete.
-// In regular channel threads it does NOT auto-clear on reply (only in the
-// dedicated Assistant pane), so clearThinking() must be called explicitly.
-async function setThinking(agent: AgentConfig, channel: string, threadTs: string): Promise<boolean> {
-	const app = apps.get(agent.name);
-	if (!app) return false;
-	try {
-		await app.client.assistant.threads.setStatus({
-			token: agent.slackBotToken,
-			channel_id: channel,
-			thread_ts: threadTs,
-			status: "is thinking…",
-		});
-		return true;
-	} catch (_e) {
-		return false;
-	}
-}
+// ─── Working sign (scoped to agent) ────────────────────────
+// A reaction on each message (received, then working, removed at the end) plus
+// Slack's "is thinking…" status on the thread. See working-sign.ts.
+const sign = new WorkingSign({
+	status: async (agentName, channel, threadTs, text) => {
+		const app = apps.get(agentName);
+		const agent = agents.find((a) => a.name === agentName);
+		if (!app || !agent) return;
+		await app.client.assistant.threads.setStatus({ token: agent.slackBotToken, channel_id: channel, thread_ts: threadTs, status: text });
+	},
+	react: async (agentName, channel, ts, emoji, add) => {
+		const app = apps.get(agentName);
+		const agent = agents.find((a) => a.name === agentName);
+		if (!app || !agent) return;
+		const args = { token: agent.slackBotToken, channel, timestamp: ts, name: emoji };
+		if (add) await app.client.reactions.add(args);
+		else await app.client.reactions.remove(args);
+	},
+}, { heartbeatMs: STATUS_HEARTBEAT_MS, clearDelayMs: STATUS_DELETE_DELAY_MS, log: (line) => console.log(line) });
 
 // Post a fallback reply when an agent run errored before posting anything of
 // its own (container crash, API rejection, etc.). Without this the user sees
@@ -540,19 +534,6 @@ async function postRunFailure(
 	} catch (e) {
 		console.error(`[${agent.name}] Failed to post run-failure fallback:`, e);
 	}
-}
-
-async function clearThinking(agent: AgentConfig, channel: string, threadTs: string): Promise<void> {
-	const app = apps.get(agent.name);
-	if (!app) return;
-	try {
-		await app.client.assistant.threads.setStatus({
-			token: agent.slackBotToken,
-			channel_id: channel,
-			thread_ts: threadTs,
-			status: "",
-		});
-	} catch (_e) {}
 }
 
 // ─── Fetch thread history from Slack ───────────────────────
@@ -588,67 +569,59 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 	const { agent, channel, threadTs, message, isThreadReply } = msg;
 	const key = queueKey(agent.name, channel, threadTs);
 
-	// Re-assert the "is thinking…" shimmer at processing start. setStatus is
-	// idempotent, so this is safe whether or not enqueueOrProcess already set it,
-	// and it guards against Slack's ~2min status auto-timeout if this message
-	// waited in a long debounce/queue window.
-	// A quiet run (woken only because it takes part in the thread) shows no
-	// shimmer: it may well end silent.
-	const showStatus = !msg.quiet;
-	if (showStatus) {
-		activeStatusThreads.add(key);
-		await setThinking(agent, channel, threadTs);
-	}
-	// Keep the shimmer alive across the whole run — Slack expires it ~2min after
-	// the last set, and runs frequently take longer than that.
-	const heartbeat = showStatus ? setInterval(() => {
-		void setThinking(agent, channel, threadTs);
-	}, STATUS_HEARTBEAT_MS) : undefined;
+	// Messages that arrive for this thread while the run works go into its inbox
+	// and reach the session between tool calls (midrun-inbox.ts). A scheduled run
+	// has no thread a person can reply in, so it gets none.
+	const inbox = agent.midrunMessages !== false && isSlackThreadTs(threadTs)
+		? new MidRunInbox<QueuedMessage>(MIDRUN_ROOT, agent.name)
+		: undefined;
+	if (inbox) midRunInboxes.set(key, inbox);
 
-	try {
-		if (isThreadReply) {
-			const existing = getThread(agent.name, channel, threadTs);
-			if (existing) {
-				console.log(`[${agent.name}] Resuming session for thread ${threadTs}`);
-				const agentMessage = buildSlackPrompt({ channel, threadTs, message, resumed: true });
-				const r = await resumeAgent(agent, existing.sessionId, agentMessage);
-				if (r.isError) await postRunFailure(agent, channel, threadTs, r.result);
-				return;
+	// The sign stays up for the whole run and comes down on every way out
+	// (working-sign.ts). A quiet run shows the reaction only: it may end silent.
+	await sign.during(msg.parts || [msg], async () => {
+		try {
+			if (isThreadReply) {
+				const existing = getThread(agent.name, channel, threadTs);
+				if (existing) {
+					console.log(`[${agent.name}] Resuming session for thread ${threadTs}`);
+					const agentMessage = buildSlackPrompt({ channel, threadTs, message, resumed: true });
+					const r = await resumeAgent(agent, existing.sessionId, agentMessage, "slack", inbox?.dir);
+					if (r.isError) await postRunFailure(agent, channel, threadTs, r.result);
+					return;
+				}
+			}
+
+			let threadContext = "";
+			if (isThreadReply) {
+				threadContext = await getThreadContext(agent, channel, threadTs);
+				if (threadContext) {
+					console.log(`[${agent.name}] Loaded thread history for context`);
+				}
+			}
+
+			const agentMessage = buildSlackPrompt({ channel, threadTs, message, threadContext });
+			const { sessionId, isError, result } = await runAgent(agent, agentMessage, "slack", inbox?.dir);
+
+			// The agent posts its own reply during the run. If the run errored, it
+			// crashed before posting anything — surface a fallback so the user is
+			// never left with a vanished spinner and silence.
+			if (isError) {
+				await postRunFailure(agent, channel, threadTs, result);
+			}
+
+			setThread(channel, threadTs, sessionId, agent.name);
+			console.log(`[${agent.name}] New session stored for thread ${threadTs}`);
+		} finally {
+			if (inbox) {
+				midRunInboxes.delete(key);
+				// What the run was handed but did not get runs next, ahead of later messages.
+				const left = inbox.finish();
+				if (left.length) console.log(`[${agent.name}] ${left.length} mid-run message(s) not taken by the run, queued for the next run`);
+				dispatcher.requeue(key, left);
 			}
 		}
-
-		let threadContext = "";
-		if (isThreadReply) {
-			threadContext = await getThreadContext(agent, channel, threadTs);
-			if (threadContext) {
-				console.log(`[${agent.name}] Loaded thread history for context`);
-			}
-		}
-
-		const agentMessage = buildSlackPrompt({ channel, threadTs, message, threadContext });
-		const { sessionId, isError, result } = await runAgent(agent, agentMessage);
-
-		// The agent posts its own reply during the run. If the run errored, it
-		// crashed before posting anything — surface a fallback so the user is
-		// never left with a vanished spinner and silence.
-		if (isError) {
-			await postRunFailure(agent, channel, threadTs, result);
-		}
-
-		setThread(channel, threadTs, sessionId, agent.name);
-		console.log(`[${agent.name}] New session stored for thread ${threadTs}`);
-	} finally {
-		if (heartbeat) clearInterval(heartbeat);
-		if (showStatus) {
-			// Let Slack fan the agent's reply out to clients before we clear the
-			// shimmer — otherwise the clear can win the race and the user sees it
-			// vanish before the answer lands. In channel threads the status does not
-			// auto-clear on reply, so this explicit clear is required.
-			await new Promise((r) => setTimeout(r, STATUS_DELETE_DELAY_MS));
-			await clearThinking(agent, channel, threadTs);
-			activeStatusThreads.delete(key);
-		}
-	}
+	}, () => inbox?.seen() ?? []);
 }
 
 // ─── Schedule fire handler ─────────────────────────────────
@@ -745,6 +718,8 @@ function startSlackHeartbeat(agentName: string, receiver: SocketModeReceiver): v
 	const skipped: string[] = [];
 
 	pruneSlackHeartbeats(SLACK_HEARTBEAT_DIR, agents.map((a) => a.name));
+	// Inbox folders left by runs that a listener restart cut short.
+	rmSync(MIDRUN_ROOT, { recursive: true, force: true });
 
 	for (const agent of agents) {
 		if (!agent.slackBotToken || !agent.slackAppToken) {

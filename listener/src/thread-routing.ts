@@ -50,14 +50,20 @@ export class ThreadDispatcher<M extends Dispatchable> {
 	constructor(private readonly opts: {
 		debounceMs: number;
 		process: (agentName: string, batch: M[]) => Promise<void>;
-		/** First message in an empty line (show "is thinking"). */
+		/** First message in an empty line. */
 		onFirst?: (msg: M, key: string) => void;
+		/** The agent is working in this thread: hand the message to that run. False = it must wait in line. */
+		offerToRun?: (msg: M, key: string) => boolean;
 		onError?: (agentName: string, err: unknown) => void;
 		log?: (line: string) => void;
 	}) {}
 
 	enqueue(msg: M): void {
 		const key = queueKey(msg.agent.name, msg.channel, msg.threadTs);
+		if (this.active.has(key) && this.opts.offerToRun?.(msg, key)) {
+			this.opts.log?.(`[${msg.agent.name}] Message handed to the working run in thread ${msg.threadTs}`);
+			return;
+		}
 		const queue = this.queues.get(key) || [];
 		queue.push(msg);
 		this.queues.set(key, queue);
@@ -78,6 +84,11 @@ export class ThreadDispatcher<M extends Dispatchable> {
 			this.timers.delete(key);
 			this.track(this.drain(key, msg.agent.name));
 		}, this.opts.debounceMs));
+	}
+
+	/** Messages a run was handed but did not use: back to the head of the line. Call before that run's process() returns. */
+	requeue(key: string, msgs: M[]): void {
+		if (msgs.length) this.queues.set(key, [...msgs, ...(this.queues.get(key) || [])]);
 	}
 
 	/** Resolves when no timer is waiting and no run is going (for tests). */

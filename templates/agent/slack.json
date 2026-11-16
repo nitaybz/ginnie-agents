@@ -21,7 +21,8 @@
     "im:write",
     "users:read",
     "files:read",
-    "files:write"
+    "files:write",
+    "reactions:write"
   ],
   "events": [
     "app_mention",

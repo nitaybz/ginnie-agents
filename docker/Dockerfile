@@ -44,6 +44,7 @@ COPY docker/limit-detect.mjs /app/limit-detect.mjs
 COPY docker/run-policy.mjs /app/run-policy.mjs
 COPY docker/tool-servers.mjs /app/tool-servers.mjs
 COPY docker/tool-server-headers.mjs /app/tool-server-headers.mjs
+COPY docker/midrun.mjs /app/midrun.mjs
 
 # Create workspace and Claude config dirs
 RUN mkdir -p /workspace /home/node/.claude && chown -R node:node /workspace /home/node/.claude

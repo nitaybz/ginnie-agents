@@ -19,6 +19,7 @@ import { parseWhatsAppConfig, whatsappDockerArgs, type WhatsAppConfig } from "./
 import { parseExtraMounts, checkHostPaths, extraMountDockerArgs, type ExtraMount, type HostEnv } from "./extra-mounts";
 import { parseBotPolicy, type BotPolicy } from "./bot-allow";
 import { parseToolServers, toolServerRefs, toolServersDockerEnv, type ToolServerRef } from "./tool-servers";
+import { midrunDockerArgs } from "./midrun-inbox";
 import {
 	ACCOUNT_COOLDOWNS_FILE,
 	accountDockerAuth,
@@ -30,7 +31,8 @@ import {
 } from "./claude-accounts";
 
 const AGENTS_DIR = path.join(__dirname, "..", "..", "agents");
-const DOCKER_IMAGE = "ginnie-agent";
+// GINNIE_AGENT_IMAGE: run another image tag (testing a new image beside the live one).
+const DOCKER_IMAGE = process.env.GINNIE_AGENT_IMAGE || "ginnie-agent";
 
 // Host facts the extra-mount safety check needs (see extra-mounts.ts).
 function extraMountHost(): HostEnv {
@@ -69,6 +71,8 @@ export interface AgentConfig {
 	allowUnverifiedSenders: boolean;
 	/** config.json "wake_inbox": true = host jobs may wake the agent via <dir>/data/wake/*.json (wake-inbox.ts). */
 	wakeInbox?: boolean;
+	/** config.json "midrun_messages": false = a message that arrives while the agent works waits for the run to end (default: handed to the working run, midrun-inbox.ts). */
+	midrunMessages?: boolean;
 	model?: string;
 	buttonTtlHours: number;
 	// Optional WhatsApp access + wake-up (config.json "whatsapp"; token in
@@ -95,6 +99,7 @@ interface AgentManifest {
 	work_hours?: Partial<AgentWorkHours>;
 	allow_unverified_senders?: boolean;
 	wake_inbox?: boolean;
+	midrun_messages?: boolean;
 	model?: string;
 	button_ttl_hours?: number;
 	whatsapp?: unknown;
@@ -219,6 +224,7 @@ export function loadAgents(): AgentConfig[] {
 			workHours,
 			allowUnverifiedSenders: manifest.allow_unverified_senders === true,
 			wakeInbox: manifest.wake_inbox === true,
+			midrunMessages: manifest.midrun_messages !== false,
 			model: manifest.model,
 			buttonTtlHours: typeof manifest.button_ttl_hours === "number" && manifest.button_ttl_hours > 0
 				? manifest.button_ttl_hours
@@ -249,8 +255,10 @@ export async function runAgent(
 	agent: AgentConfig,
 	message: string,
 	origin: DeliveryOrigin = "slack",
+	// Inbox folder for messages that arrive while this run works (midrun-inbox.ts).
+	midrunDir?: string,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, undefined, origin);
+	return spawnContainer(agent, message, undefined, origin, midrunDir);
 }
 
 /**
@@ -261,8 +269,9 @@ export async function resumeAgent(
 	sessionId: string,
 	message: string,
 	origin: DeliveryOrigin = "slack",
+	midrunDir?: string,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, sessionId, origin);
+	return spawnContainer(agent, message, sessionId, origin, midrunDir);
 }
 
 /**
@@ -293,6 +302,7 @@ async function spawnContainer(
 	message: string,
 	resumeId?: string,
 	origin: DeliveryOrigin = "slack",
+	midrunDir?: string,
 ): Promise<AgentRunResult> {
 	let out;
 	try {
@@ -303,7 +313,7 @@ async function spawnContainer(
 			// A continuation resumes the limited try's session on the next
 			// account instead of replaying the original request.
 			attempt: (account, cont) =>
-				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont),
+				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont, midrunDir),
 			log: (line) => console.log(`[${agent.name}] ${line}`),
 		});
 	} catch (err) {
@@ -334,6 +344,7 @@ export function spawnAttempt(
 	// A continuation after a usage limit: if its session is gone the run must
 	// fail, never start over (that would repeat completed actions).
 	strictResume = false,
+	midrunDir?: string,
 ): Promise<AttemptResult> {
 	return new Promise((resolve, reject) => {
 		const containerName = `ginnie-${agent.name}-${Date.now()}`;
@@ -509,6 +520,9 @@ export function spawnAttempt(
 
 		// Read-only extra mounts from config.json (under /workspace/mounts).
 		dockerArgs.push(...extraMountDockerArgs(agent.name, agent.extraMounts ?? [], extraMountHost(), (line) => console.warn(`[${agent.name}] ${line}`)));
+
+		// Inbox for messages that arrive while the run works; none = one prompt, as before.
+		dockerArgs.push(...midrunDockerArgs(midrunDir));
 
 		// Docker image
 		dockerArgs.push(DOCKER_IMAGE);

@@ -35,6 +35,10 @@
  *   AGENT_MODEL            — Optional: model or alias (e.g. "opus"). The model
  *                             the SDK actually resolved is logged at session
  *                             start and returned as `model` in the result JSON.
+ *   MIDRUN_DIR             - Optional: folder where the listener drops messages
+ *                             that arrive while this run is working; they are
+ *                             handed to the session between tool calls
+ *                             (docker/midrun.mjs). Unset = one prompt, as before.
  *   TZ                     — Optional: container timezone (default: UTC)
  *   DELIVERY_INSTRUCTION   — Optional: extra system-prompt text appended after
  *                             PROMPT.md, telling the agent how to deliver its
@@ -48,6 +52,7 @@ import { bottomLineSkill, whatsappSkill } from "./prompt-skills.mjs";
 import { createLimitTracker } from "./limit-detect.mjs";
 import { CONTINUE_AFTER_ERROR_MESSAGE, nextStep } from "./run-policy.mjs";
 import { toolServerOptions } from "./tool-servers.mjs";
+import { createFeed } from "./midrun.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -272,46 +277,58 @@ let sessionId = resumeId || "";
 
 async function runSession(resumeSessionId, prompt) {
 	sessionId = resumeSessionId || sessionId;
+	// With MIDRUN_DIR the prompt is a stream: this message first, then whatever
+	// the listener drops in while the run works. The feed ends the stream.
+	const feed = process.env.MIDRUN_DIR
+		? createFeed(process.env.MIDRUN_DIR, prompt, { log: (line) => console.error(`[${agentName}] ${line}`) })
+		: null;
 
-	for await (const msg of query({
-		prompt,
-		options: {
-			systemPrompt,
-			allowedTools,
-			permissionMode: "bypassPermissions",
-			allowDangerouslySkipPermissions: true,
-			maxTurns,
-			cwd: "/workspace",
-			resume: resumeSessionId,
-			persistSession: true,
-			model: process.env.AGENT_MODEL || undefined,
-			...(mcpServers ? { mcpServers } : {}),
-		},
-	})) {
-		if (msg.type === "system" && msg.subtype === "init") {
-			if (msg.session_id) sessionId = msg.session_id;
-			if (msg.model && msg.model !== resolvedModel) {
-				resolvedModel = msg.model;
-				console.error(`[${agentName}] Model: ${resolvedModel}${process.env.AGENT_MODEL ? ` (requested: ${process.env.AGENT_MODEL})` : ""}`);
+	try {
+		for await (const msg of query({
+			prompt: feed ? feed.input : prompt,
+			options: {
+				systemPrompt,
+				allowedTools,
+				permissionMode: "bypassPermissions",
+				allowDangerouslySkipPermissions: true,
+				maxTurns,
+				cwd: "/workspace",
+				resume: resumeSessionId,
+				persistSession: true,
+				model: process.env.AGENT_MODEL || undefined,
+				...(mcpServers ? { mcpServers } : {}),
+				// Have the program confirm each streamed message it took (isReplay).
+				...(feed ? { extraArgs: { "replay-user-messages": null } } : {}),
+			},
+		})) {
+			feed?.observe(msg);
+			if (msg.type === "system" && msg.subtype === "init") {
+				if (msg.session_id) sessionId = msg.session_id;
+				if (msg.model && msg.model !== resolvedModel) {
+					resolvedModel = msg.model;
+					console.error(`[${agentName}] Model: ${resolvedModel}${process.env.AGENT_MODEL ? ` (requested: ${process.env.AGENT_MODEL})` : ""}`);
+				}
+			}
+
+			tracker.observe(msg);
+
+			if (msg.type === "result") {
+				const output = {
+					session_id: sessionId || msg.session_id,
+					result: msg.result || "",
+					is_error: msg.is_error || false,
+					num_turns: msg.num_turns || 0,
+					cost_usd: msg.total_cost_usd || 0,
+					model: resolvedModel || undefined,
+					tool_calls: tracker.toolCalls,
+					...tracker.outcome(msg.is_error || false, msg.result || ""),
+				};
+				console.log(JSON.stringify(output));
+				console.error(`[${agentName}] Done — ${msg.num_turns} turns, $${(msg.total_cost_usd || 0).toFixed(4)}`);
 			}
 		}
-
-		tracker.observe(msg);
-
-		if (msg.type === "result") {
-			const output = {
-				session_id: sessionId || msg.session_id,
-				result: msg.result || "",
-				is_error: msg.is_error || false,
-				num_turns: msg.num_turns || 0,
-				cost_usd: msg.total_cost_usd || 0,
-				model: resolvedModel || undefined,
-				tool_calls: tracker.toolCalls,
-				...tracker.outcome(msg.is_error || false, msg.result || ""),
-			};
-			console.log(JSON.stringify(output));
-			console.error(`[${agentName}] Done — ${msg.num_turns} turns, $${(msg.total_cost_usd || 0).toFixed(4)}`);
-		}
+	} finally {
+		feed?.stop();
 	}
 }
 
