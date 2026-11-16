@@ -6,10 +6,12 @@
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "fs";
 import os from "os";
 import path from "path";
-import { MIDRUN_CONTAINER_DIR, MidRunInbox, midrunDockerArgs } from "./midrun-inbox";
+import { MIDRUN_CONTAINER_DIR, MidRunInbox, midrunDockerArgs, openMidRunInbox } from "./midrun-inbox";
+import { parseRunOutput } from "./runner";
+import { SDK_DIR, pinnedSdk } from "./sdk-harness";
 import { ThreadDispatcher, queueKey } from "./thread-routing";
 import { MIDRUN_NOTE, buildMidRunPrompt } from "./slack-prompt";
 
@@ -19,8 +21,6 @@ const container = () => esmImport(require("node:url").pathToFileURL(path.join(re
 
 const root = () => mkdtempSync(path.join(os.tmpdir(), "midrun-test-"));
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-const result = { type: "result", is_error: false };
-const replay = (uuid: string) => ({ type: "user", isReplay: true, uuid });
 
 describe("inbox handoff between listener and container", () => {
 	test("taken and seen by the run: not run again", async () => {
@@ -82,115 +82,129 @@ describe("inbox handoff between listener and container", () => {
 	});
 });
 
-describe("container feed: the prompt as a stream", () => {
-	// Reads what the feed gives the session, like the Claude program does.
-	async function reader(feed: any) {
-		const got: any[] = [];
-		const done = (async () => { for await (const m of feed.input) got.push(m); })();
-		await sleep(5);
-		return { got, done };
-	}
-
-	test("first prompt, then a message that arrives while working; ends after the result", async () => {
-		const { createFeed } = await container();
-		const inbox = new MidRunInbox<string>(root(), "r1");
-		const feed = createFeed(inbox.dir, "count to 5", { pollMs: 5 });
-		const { got, done } = await reader(feed);
-		assert.equal(got.length, 1);
-		assert.equal(got[0].message.content, "count to 5");
-
-		inbox.offer("m1", "stop counting");
-		await sleep(30);
-		assert.equal(got.length, 2);
-		assert.equal(got[1].message.content, "stop counting");
-		assert.equal(got[1].priority, "next");
-		assert.deepEqual(inbox.seen(), []);
-
-		feed.observe(replay(got[1].uuid));
-		assert.deepEqual(inbox.seen(), ["m1"]);
-		feed.observe(result);
-		await done; // the stream ended, so the query returns
-		assert.equal(inbox.offer("m2", "too late"), false, "inbox closed with the run");
-		assert.deepEqual(inbox.finish(), []);
-	});
-
-	test("result comes while a handed message is still unseen: wait for its own turn", async () => {
-		const { createFeed } = await container();
-		const inbox = new MidRunInbox<string>(root(), "r2");
-		const feed = createFeed(inbox.dir, "task", { pollMs: 5 });
-		const { got, done } = await reader(feed);
-		inbox.offer("m1", "one more thing");
-		await sleep(30);
-		let ended = false;
-		void done.then(() => { ended = true; });
-		feed.observe(result);
-		await sleep(30);
-		assert.equal(ended, false, "the session has not taken the message yet");
-		feed.observe(replay(got[1].uuid));
-		feed.observe({ type: "assistant" });
-		await sleep(30);
-		assert.equal(ended, false, "its turn is running");
-		feed.observe(result);
-		await done;
-		assert.deepEqual(inbox.finish(), []);
-	});
-
-	test("a message that lands exactly at the result is still taken by this run", async () => {
-		const { createFeed } = await container();
-		const inbox = new MidRunInbox<string>(root(), "r3");
-		const feed = createFeed(inbox.dir, "task", { pollMs: 100000 });
-		const { got } = await reader(feed);
-		inbox.offer("m1", "just in time");
-		feed.observe(result); // the last look before closing finds it
-		await sleep(10);
-		assert.equal(got.length, 2);
-		assert.equal(got[1].message.content, "just in time");
-		feed.stop();
-	});
-
-	test("the session never takes a handed message: give up, it runs next", async () => {
+// How the feed behaves with the real Claude program is tested in midrun-sdk.test.ts. The one case
+// below cannot be produced with the real program (it always takes what it is handed), so it is
+// the only one driven by hand: the safety net for a program that never takes a message.
+describe("container feed: safety net", () => {
+	test("the session never takes a handed message: stop waiting, it runs next", async () => {
 		const { createFeed } = await container();
 		const inbox = new MidRunInbox<string>(root(), "r4");
 		const feed = createFeed(inbox.dir, "task", { pollMs: 5, idleMs: 30 });
-		const { done } = await reader(feed);
+		const done = (async () => { for await (const _m of feed.input) { /* read like the program does */ } })();
 		inbox.offer("m1", "ignored");
 		await sleep(30);
-		feed.observe(result);
+		feed.observe({ type: "result", is_error: false });
 		await done;
 		assert.deepEqual(inbox.finish(), ["m1"]);
 	});
+});
 
-	test("the run fails: the stream ends and what was not seen runs next", async () => {
-		const { createFeed } = await container();
-		const inbox = new MidRunInbox<string>(root(), "r5");
-		const feed = createFeed(inbox.dir, "task", { pollMs: 5 });
-		const { done } = await reader(feed);
-		inbox.offer("m1", "one");
-		await sleep(30);
-		feed.observe({ type: "result", is_error: true });
-		await done;
-		assert.deepEqual(inbox.finish(), ["m1"]);
+describe("the inbox folder", () => {
+	test("private to the listener's user (0700), which is the user the container runs as", () => {
+		const inbox = new MidRunInbox<string>(root(), "sally");
+		for (const d of ["", "inbox", "claimed", "seen"]) {
+			assert.equal(statSync(path.join(inbox.dir, d)).mode & 0o777, 0o700, d || "run folder");
+		}
+		assert.equal(statSync(inbox.dir).uid, process.getuid!());
+		inbox.finish();
 	});
 
-	test("a second try of the same run (usage limit, API error) gets what the first took but never showed", async () => {
-		const { createFeed } = await container();
-		const inbox = new MidRunInbox<string>(root(), "r6");
-		const first = createFeed(inbox.dir, "task", { pollMs: 5 });
-		await reader(first);
-		inbox.offer("m1", "one");
-		await sleep(30);
-		first.observe({ type: "result", is_error: true }); // closed its inbox
+	test("cannot be created: no inbox, said once, and the message is not lost (it waits in line as before)", async () => {
+		const blocked = path.join(root(), "not-a-folder");
+		writeFileSync(blocked, "x"); // the data folder is unusable
+		const logs: string[] = [];
+		assert.equal(openMidRunInbox<string>(blocked, "sally", (l) => logs.push(l)), undefined);
+		assert.equal(openMidRunInbox<string>(blocked, "sally", (l) => logs.push(l)), undefined);
+		assert.equal(logs.length, 1);
 
-		const second = createFeed(inbox.dir, "continue", { pollMs: 5 });
-		const { got, done } = await reader(second);
-		assert.deepEqual(got.map((m) => m.message.content), ["continue", "one"]);
-		assert.equal(inbox.offer("m2", "two"), true, "the inbox is open again");
-		await sleep(30);
-		for (const m of got.slice(1)) second.observe(replay(m.uuid));
-		second.observe(result);
-		await done;
-		assert.deepEqual(inbox.seen().sort(), ["m1", "m2"]);
+		// The listener's wiring: with no inbox the busy thread's message queues and runs next.
+		type Msg = { agent: { name: string }; channel: string; threadTs: string; text: string };
+		const runs: string[][] = [];
+		let release!: () => void;
+		const d = new ThreadDispatcher<Msg>({
+			debounceMs: 5,
+			offerToRun: (msg) => { const inbox = openMidRunInbox<Msg>(blocked, "sally", () => {}); return !!inbox && inbox.offer(msg, msg.text); },
+			process: async (_a, batch) => { runs.push(batch.map((x) => x.text)); if (runs.length === 1) await new Promise<void>((r) => { release = r; }); },
+		});
+		d.enqueue({ agent: { name: "sally" }, channel: "C1", threadTs: "1.1", text: "a1" });
+		await sleep(20);
+		d.enqueue({ agent: { name: "sally" }, channel: "C1", threadTs: "1.1", text: "a2" });
+		release();
+		await d.idle();
+		assert.deepEqual(runs, [["a1"], ["a2"]]);
+	});
+
+	test("a write that fails is refused, not thrown: the caller queues the message", () => {
+		const inbox = new MidRunInbox<string>(root(), "sally");
+		rmSync(inbox.dir, { recursive: true, force: true }); // the folder vanished under the run
+		assert.equal(inbox.offer("m1", "x"), false);
 		assert.deepEqual(inbox.finish(), []);
+	});
+});
+
+describe("the installed SDK is checked before a run feeds mid-run messages", () => {
+	test("the pinned SDK has what the feed needs", async () => {
+		const { feedSupport } = await container();
+		await pinnedSdk(); // the version in docker/package.json is the one installed
+		const inbox = new MidRunInbox<string>(root(), "sally");
+		assert.deepEqual(feedSupport(SDK_DIR, inbox.dir), { ok: true, reason: "" });
+		inbox.finish();
+	});
+
+	test("an SDK without the confirmation: the feed is off and says why", async () => {
+		const { feedSupport } = await container();
+		const fake = path.join(root(), "claude-agent-sdk");
+		mkdirSync(fake);
+		writeFileSync(path.join(fake, "sdk.d.ts"), "export declare type SDKUserMessage = { type: 'user' };");
+		const inbox = new MidRunInbox<string>(root(), "sally");
+		const support = feedSupport(fake, inbox.dir);
+		assert.equal(support.ok, false);
+		assert.match(support.reason, /isReplay/);
+		inbox.finish();
+	});
+
+	test("an inbox the container user cannot write: the feed is off", async () => {
+		const { feedSupport } = await container();
+		const support = feedSupport(SDK_DIR, path.join(root(), "missing"));
+		assert.equal(support.ok, false);
+	});
+
+	test("feed off = inbox closed at once, so the listener queues as before", async () => {
+		const { closeInbox } = await container();
+		const inbox = new MidRunInbox<string>(root(), "sally");
+		closeInbox(inbox.dir); // what the entrypoint does when the check fails
+		assert.equal(inbox.offer("m1", "x"), false);
+	});
+});
+
+describe("run outcome: the last result decides", () => {
+	const line = (o: object) => JSON.stringify({ session_id: "s1", ...o });
+
+	test("max turns, then the handed message was answered: not a failure, no failure notice", () => {
+		const out = parseRunOutput([line({ is_error: true, result: "Reached maximum number of turns (2)" }), line({ is_error: false, result: "stopped" })].join("\n"), 0);
+		assert.equal(out.isError, false);
+		assert.equal(out.result, "stopped");
+	});
+
+	test("a final error is still a failure, also after an earlier success", () => {
+		assert.equal(parseRunOutput([line({ is_error: false, result: "ok" }), line({ is_error: true, result: "boom" })].join("\n"), 0).isError, true);
+		assert.equal(parseRunOutput(line({ is_error: true, result: "boom" }), 0).isError, true);
+	});
+
+	test("a non-zero exit is a failure whatever was printed", () => {
+		assert.equal(parseRunOutput(line({ is_error: false, result: "ok" }), 1).isError, true);
+		assert.equal(parseRunOutput("", 137).isError, true);
+	});
+
+	test("a usage limit counts only when the run ended on it", () => {
+		const limit = line({ is_error: true, result: "limit", limit_hit: true, limit_type: "five_hour", resets_at: 5 });
+		assert.deepEqual(parseRunOutput(limit, 1).limit, { type: "five_hour", resetsAt: 5 });
+		assert.equal(parseRunOutput([limit, line({ is_error: false, result: "ok" })].join("\n"), 0).limit, null);
+	});
+
+	test("one result, as before: session, model and tool calls are read", () => {
+		const out = parseRunOutput(line({ is_error: false, result: "hi", model: "m", tool_calls: 3 }), 0, "old");
+		assert.deepEqual(out, { sessionId: "s1", isError: false, result: "hi", model: "m", limit: null, toolCalls: 3, reportedSessionId: "s1" });
 	});
 });
 

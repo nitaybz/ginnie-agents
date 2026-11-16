@@ -8,7 +8,8 @@
  *
  * Now every message gets a reaction from the agent the moment it is accepted (👀 received), which
  * changes to ⏳ while a run works on it and is removed when that run ends, however it ends. Runs
- * that will answer also keep the "is thinking…" status up, re-set every few seconds. A bot without
+ * that will answer (or that take in a message which mentions the agent) also keep the
+ * "is thinking…" status up, re-set every few seconds, and clear it at the end. A bot without
  * the reactions:write scope simply shows no reaction (logged once); the status still works.
  */
 import { isSlackThreadTs } from "./run-failures";
@@ -32,12 +33,14 @@ export interface SignApi {
 	react(agentName: string, channel: string, ts: string, emoji: string, add: boolean): Promise<void>;
 }
 
+const threadKey = (m: SignMessage): string => `${m.agent.name}|${m.channel}:${m.threadTs}`;
 const errorCode = (err: unknown): string => String((err as any)?.data?.error || (err as any)?.message || err);
 
 export class WorkingSign {
 	private readonly marks = new Map<string, string>();         // message -> reaction it carries now
 	private readonly order = new Map<string, Promise<void>>();  // message -> its last reaction call
 	private readonly noReactions = new Set<string>();           // agents whose bot may not react
+	private readonly statusUp = new Set<string>();              // threads that carry "is thinking…" now
 	private readonly complained = new Set<string>();
 
 	constructor(private readonly api: SignApi, private readonly opts: {
@@ -58,9 +61,14 @@ export class WorkingSign {
 	 * `picked` returns the messages the run took in while working (mid-run messages).
 	 */
 	async during<T>(batch: SignMessage[], run: () => Promise<T>, picked: () => SignMessage[] = () => []): Promise<T> {
+		const first = batch[0];
+		const thread = threadKey(first);
 		const loud = batch.find((m) => !m.quiet);
+		if (loud) void this.status(loud, THINKING);
+		// The status is up when this batch raised it or a message received since did (a mention
+		// that arrives while a quiet run works): keep it up, and take it down at the end.
 		const beat = () => {
-			if (loud) void this.status(loud, THINKING);
+			if (this.statusUp.has(thread)) void this.status(first, THINKING);
 			for (const m of [...batch, ...picked()]) void this.mark(m, WORKING);
 		};
 		beat();
@@ -70,9 +78,9 @@ export class WorkingSign {
 		} finally {
 			clearInterval(timer);
 			for (const m of [...batch, ...picked()]) void this.mark(m, null);
-			if (loud) {
+			if (this.statusUp.has(thread)) {
 				await new Promise((r) => setTimeout(r, this.opts.clearDelayMs));
-				await this.status(loud, "");
+				await this.status(first, "");
 			}
 		}
 	}
@@ -112,6 +120,8 @@ export class WorkingSign {
 
 	private async status(m: SignMessage, text: string): Promise<void> {
 		if (!isSlackThreadTs(m.threadTs)) return;
+		if (text) this.statusUp.add(threadKey(m));
+		else this.statusUp.delete(threadKey(m));
 		try {
 			await this.api.status(m.agent.name, m.channel, m.threadTs, text);
 		} catch (err) {

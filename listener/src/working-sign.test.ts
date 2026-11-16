@@ -126,6 +126,21 @@ describe("working sign", () => {
 		assert.deepEqual(f.calls, [`+${RECEIVED}@100`, `-${RECEIVED}@100`, `+${WORKING}@100`, `-${WORKING}@100`]);
 	});
 
+	test("a quiet run takes in a mention mid-run: the status that message raised is kept up and cleared at the end", async () => {
+		const f = fake();
+		const picked: SignMessage[] = [];
+		f.sign.received(msg(TS1, { quiet: true }));
+		await f.sign.during([msg(TS1, { quiet: true })], async () => {
+			f.sign.received(msg(TS2)); // mentions the agent: raises "is thinking"
+			picked.push(msg(TS2));
+			await sleep(35);
+			assert.ok(f.calls.filter((c) => c === `status:${THINKING}`).length >= 3, "re-set while the run works");
+		}, () => picked);
+		await sleep(5);
+		assert.equal(f.lastStatus(), "status:clear");
+		assert.deepEqual(f.reactions(), []);
+	});
+
 	test("bot without reactions:write: no reactions, said once, status and run unaffected", async () => {
 		const f = fake({ react: "missing_scope" });
 		f.sign.received(msg(TS1));

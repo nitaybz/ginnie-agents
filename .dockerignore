@@ -1,0 +1,2 @@
+# The image installs its own dependencies; keep local ones out of the build context.
+**/node_modules

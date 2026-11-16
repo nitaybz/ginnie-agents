@@ -39,6 +39,8 @@
  *                             that arrive while this run is working; they are
  *                             handed to the session between tool calls
  *                             (docker/midrun.mjs). Unset = one prompt, as before.
+ *                             Also off for the run when the installed SDK or
+ *                             the folder cannot support it (logged).
  *   TZ                     — Optional: container timezone (default: UTC)
  *   DELIVERY_INSTRUCTION   — Optional: extra system-prompt text appended after
  *                             PROMPT.md, telling the agent how to deliver its
@@ -52,7 +54,7 @@ import { bottomLineSkill, whatsappSkill } from "./prompt-skills.mjs";
 import { createLimitTracker } from "./limit-detect.mjs";
 import { CONTINUE_AFTER_ERROR_MESSAGE, nextStep } from "./run-policy.mjs";
 import { toolServerOptions } from "./tool-servers.mjs";
-import { createFeed } from "./midrun.mjs";
+import { closeInbox, createFeed, feedSupport } from "./midrun.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -275,12 +277,29 @@ let resolvedModel = "";
 // listener can resume it.
 let sessionId = resumeId || "";
 
-async function runSession(resumeSessionId, prompt) {
+// Mid-run messages (docker/midrun.mjs) depend on the pinned SDK: the Claude
+// program must confirm each streamed message it took. If this image cannot do
+// that, or cannot write the folder, close the inbox now: the listener's write
+// then fails and it queues the message for the next run, exactly as before.
+let midrunDir = process.env.MIDRUN_DIR || "";
+if (midrunDir) {
+	const support = feedSupport("/app/node_modules/@anthropic-ai/claude-agent-sdk", midrunDir);
+	if (!support.ok) {
+		closeInbox(midrunDir);
+		console.error(`[${agentName}] mid-run messages are off for this run: ${support.reason}`);
+		midrunDir = "";
+	}
+}
+
+// replaysRequest: this try sends the original request to a session that does
+// not hold the previous try's history, so mid-run messages that try had
+// already seen are handed over again.
+async function runSession(resumeSessionId, prompt, replaysRequest) {
 	sessionId = resumeSessionId || sessionId;
-	// With MIDRUN_DIR the prompt is a stream: this message first, then whatever
+	// With an inbox the prompt is a stream: this message first, then whatever
 	// the listener drops in while the run works. The feed ends the stream.
-	const feed = process.env.MIDRUN_DIR
-		? createFeed(process.env.MIDRUN_DIR, prompt, { log: (line) => console.error(`[${agentName}] ${line}`) })
+	const feed = midrunDir
+		? createFeed(midrunDir, prompt, { maxTurns, refeedSeen: replaysRequest, log: (line) => console.error(`[${agentName}] ${line}`) })
 		: null;
 
 	try {
@@ -340,7 +359,7 @@ let prompt = message;
 let strictResume = !!resumeId && process.env.RESUME_STRICT === "1";
 while (true) {
 	try {
-		await runSession(sessionArg, prompt);
+		await runSession(sessionArg, prompt, !strictResume);
 		break;
 	} catch (err) {
 		const msg = String(err);

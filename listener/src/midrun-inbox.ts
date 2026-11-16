@@ -10,8 +10,12 @@
  * fails and offer() returns false: the caller queues the message as a normal next run. finish()
  * returns every message that did not reach seen/, to be run the same way. So a message is run
  * exactly once: inside the working run, or as the next run.
+ *
+ * Trust: the agent can write into its own run's folder (never another thread's or agent's). A
+ * message read back from it is therefore worth no more than the agent's own word: it is only ever
+ * given to the model as user text, and nothing may treat it as an approval or a verified sender.
  */
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, writeFileSync } from "fs";
 import path from "path";
 
 export const MIDRUN_ROOT = path.join(__dirname, "..", "..", "data", "midrun");
@@ -25,12 +29,10 @@ export class MidRunInbox<M> {
 	constructor(root: string, agentName: string) {
 		mkdirSync(root, { recursive: true });
 		this.dir = mkdtempSync(path.join(root, `${agentName.replace(/[^A-Za-z0-9._-]/g, "_")}-`)); // one folder per run
-		for (const sub of ["inbox", "claimed", "seen"]) {
-			const d = path.join(this.dir, sub);
-			mkdirSync(d, { recursive: true });
-			chmodSync(d, 0o777); // the container user renames files between these folders
-		}
-		chmodSync(this.dir, 0o777);
+		// 0700, owned by the listener's user. The container must run as that same uid (1000, the
+		// image's "node" user) to move files here; if it does not, docker/midrun.mjs turns the
+		// feed off for the run and messages wait in line as before.
+		for (const sub of ["inbox", "claimed", "seen"]) mkdirSync(path.join(this.dir, sub), { mode: 0o700 });
 	}
 
 	/** Hand a message to the working run. False = the run no longer takes messages; queue it instead. */
@@ -71,4 +73,19 @@ export class MidRunInbox<M> {
 /** Docker args that give a run its inbox. No inbox = no args, the container runs exactly as before. */
 export function midrunDockerArgs(dir?: string): string[] {
 	return dir ? ["-e", `MIDRUN_DIR=${MIDRUN_CONTAINER_DIR}`, "-v", `${dir}:${MIDRUN_CONTAINER_DIR}`] : [];
+}
+
+let complained = false;
+
+/** A run's inbox, or undefined when the folder cannot be made: the run then goes exactly the old way. Says so once. */
+export function openMidRunInbox<M>(root: string, agentName: string, log: (line: string) => void = console.warn): MidRunInbox<M> | undefined {
+	try {
+		return new MidRunInbox<M>(root, agentName);
+	} catch (err) {
+		if (!complained) {
+			complained = true;
+			log(`[midrun] cannot create an inbox under ${root} (${err instanceof Error ? err.message : err}); messages that arrive mid-run wait for the run to end, as before`);
+		}
+		return undefined;
+	}
 }

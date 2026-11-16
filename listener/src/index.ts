@@ -21,7 +21,7 @@ import { loadStore, getThread, setThread } from "./store";
 import { agents, runAgent, resumeAgent, type AgentConfig } from "./runner";
 import { isSlackThreadTs } from "./run-failures";
 import { buildMidRunPrompt, buildSlackPrompt, scheduledThreadKey } from "./slack-prompt";
-import { MIDRUN_ROOT, MidRunInbox } from "./midrun-inbox";
+import { MIDRUN_ROOT, openMidRunInbox, type MidRunInbox } from "./midrun-inbox";
 import { WorkingSign } from "./working-sign";
 import { loadAgentSchedules, watchAgentSchedules, type ScheduleEntry } from "./scheduler";
 import { WakeInbox } from "./wake-inbox";
@@ -571,9 +571,10 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 
 	// Messages that arrive for this thread while the run works go into its inbox
 	// and reach the session between tool calls (midrun-inbox.ts). A scheduled run
-	// has no thread a person can reply in, so it gets none.
+	// has no thread a person can reply in, so it gets none. If the folder cannot
+	// be made the run goes the old way: no inbox, later messages wait in line.
 	const inbox = agent.midrunMessages !== false && isSlackThreadTs(threadTs)
-		? new MidRunInbox<QueuedMessage>(MIDRUN_ROOT, agent.name)
+		? openMidRunInbox<QueuedMessage>(MIDRUN_ROOT, agent.name, (line) => console.warn(line))
 		: undefined;
 	if (inbox) midRunInboxes.set(key, inbox);
 
@@ -719,7 +720,11 @@ function startSlackHeartbeat(agentName: string, receiver: SocketModeReceiver): v
 
 	pruneSlackHeartbeats(SLACK_HEARTBEAT_DIR, agents.map((a) => a.name));
 	// Inbox folders left by runs that a listener restart cut short.
-	rmSync(MIDRUN_ROOT, { recursive: true, force: true });
+	try {
+		rmSync(MIDRUN_ROOT, { recursive: true, force: true });
+	} catch (err) {
+		console.warn(`[midrun] could not clear ${MIDRUN_ROOT}: ${err instanceof Error ? err.message : err}`);
+	}
 
 	for (const agent of agents) {
 		if (!agent.slackBotToken || !agent.slackAppToken) {

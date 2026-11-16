@@ -335,6 +335,50 @@ async function spawnContainer(
 	};
 }
 
+/**
+ * What a container's stdout says about its run. The entrypoint prints one JSON
+ * line per result, and a run that takes in a mid-run message can have more
+ * than one. The LAST one decides: a run that hit an error, then answered a
+ * message it had been handed, ended well. A non-zero exit is always an error.
+ */
+export function parseRunOutput(stdout: string, exitCode: number | null, resumeId?: string): Omit<AttemptResult, "stderr"> {
+	let sessionId = resumeId || `session_${Date.now()}`;
+	let lastIsError = false;
+	let result = "";
+	let model = "";
+	let limit: AttemptResult["limit"] = null;
+	let toolCalls: number | undefined;
+	let reportedSessionId = "";
+	for (const line of stdout.trim().split("\n")) {
+		try {
+			const parsed = JSON.parse(line);
+			if (parsed.session_id) sessionId = reportedSessionId = parsed.session_id;
+			if (typeof parsed.tool_calls === "number") toolCalls = parsed.tool_calls;
+			if ("is_error" in parsed) lastIsError = !!parsed.is_error;
+			if (typeof parsed.result === "string") result = parsed.result;
+			if (typeof parsed.model === "string" && parsed.model) model = parsed.model;
+			if (parsed.limit_hit) {
+				limit = {
+					type: typeof parsed.limit_type === "string" ? parsed.limit_type : null,
+					resetsAt: typeof parsed.resets_at === "number" ? parsed.resets_at : null,
+				};
+			} else if ("is_error" in parsed) {
+				limit = null;
+			}
+		} catch {}
+	}
+	const isError = exitCode !== 0 || lastIsError;
+	return {
+		sessionId,
+		isError,
+		result,
+		model: model || undefined,
+		limit: isError ? limit : null,
+		toolCalls,
+		reportedSessionId: reportedSessionId || undefined,
+	};
+}
+
 export function spawnAttempt(
 	agent: AgentConfig,
 	message: string,
@@ -557,50 +601,13 @@ export function spawnAttempt(
 				console.error(`[${agent.name}] Container exited with code ${code}`);
 			}
 
-			// Parse structured output from stdout. The entrypoint emits one JSON
-			// line per result: { session_id, is_error, result, ... }.
-			let sessionId = resumeId || `session_${Date.now()}`;
-			let isError = code !== 0; // non-zero exit always counts as an error
-			let result = "";
-			let model = "";
-			let limit: AttemptResult["limit"] = null;
-			let toolCalls: number | undefined;
-			let reportedSessionId = "";
-			try {
-				const lines = stdout.trim().split("\n");
-				for (const line of lines) {
-					try {
-						const parsed = JSON.parse(line);
-						if (parsed.session_id) sessionId = reportedSessionId = parsed.session_id;
-						if (typeof parsed.tool_calls === "number") toolCalls = parsed.tool_calls;
-						if (parsed.is_error) isError = true;
-						if (typeof parsed.result === "string") result = parsed.result;
-						if (typeof parsed.model === "string" && parsed.model) model = parsed.model;
-						if (parsed.limit_hit) {
-							limit = {
-								type: typeof parsed.limit_type === "string" ? parsed.limit_type : null,
-								resetsAt: typeof parsed.resets_at === "number" ? parsed.resets_at : null,
-							};
-						}
-					} catch {}
-				}
-			} catch {}
-
+			const out = parseRunOutput(stdout, code, resumeId);
 			console.log(
-				`[${agent.name}] Container done: ${sessionId.slice(0, 30)}... ` +
-				`model=${model || "unknown"} account=${account ? account.label : "host-credentials"}` +
-				`${limit ? " (USAGE LIMIT)" : isError ? " (ERROR)" : ""}`,
+				`[${agent.name}] Container done: ${out.sessionId.slice(0, 30)}... ` +
+				`model=${out.model || "unknown"} account=${account ? account.label : "host-credentials"}` +
+				`${out.limit ? " (USAGE LIMIT)" : out.isError ? " (ERROR)" : ""}`,
 			);
-			resolve({
-				sessionId,
-				isError,
-				result,
-				model: model || undefined,
-				limit: isError ? limit : null,
-				stderr,
-				toolCalls,
-				reportedSessionId: reportedSessionId || undefined,
-			});
+			resolve({ ...out, stderr });
 		});
 
 		child.on("error", (err) => {

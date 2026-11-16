@@ -1,21 +1,28 @@
 // Mid-run messages, container side. The listener drops a message that arrives
 // while this run is working into <dir>/inbox/ (one JSON file: {"text": "..."},
-// the text already in the usual Slack envelope).
-// This module hands it to the running session as one more user message, which
-// the Claude program delivers at the next turn boundary (between tool calls).
+// the text already in the usual Slack envelope). This module hands it to the
+// running session as one more user message, which the Claude program delivers
+// at the next turn boundary (between tool calls).
 //
 // A file moves through three folders, each move one rename:
 //   inbox/    written by the listener, not taken yet
 //   claimed/  taken by this run, not yet shown to the model
 //   seen/     the Claude program confirmed it put the message in the conversation
-// When the run is done the inbox folder is renamed to closed/, so a message
-// that arrives too late cannot land in it: the listener's write fails and it
-// queues the message as a normal next run. After the container exits the
+// When the run stops taking messages the inbox folder is renamed to closed/, so
+// a message that arrives too late cannot land in it: the listener's write fails
+// and it queues the message as a normal next run. After the container exits the
 // listener runs everything that is not in seen/ the same way (no loss), and
 // never runs what is in seen/ (no duplicate). See listener/src/midrun-inbox.ts.
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync } from "fs";
+//
+// The folder is writable by the agent itself. A message read from it is never
+// more trusted than the agent: it is plain user text for the model, nothing else.
+import { execFileSync } from "child_process";
+import { accessSync, constants, existsSync, mkdirSync, readdirSync, readFileSync, renameSync } from "fs";
 import { randomUUID } from "crypto";
 import path from "path";
+
+// A run takes at most this many mid-run messages; the next one waits for the next run.
+export const MAX_MIDRUN_MESSAGES = 20;
 
 const jsonFiles = (dir) => (existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(".json")).sort() : []);
 
@@ -37,6 +44,34 @@ function readText(dir, name) {
 	}
 }
 
+/**
+ * Can this run feed mid-run messages? It needs three things from the installed
+ * SDK (pinned in docker/package.json): the program confirms each message it
+ * took (--replay-user-messages, isReplay with our uuid) and accepts
+ * priority "next". And the folder must be writable by the container user.
+ * @returns {{ ok: boolean, reason: string }}
+ */
+export function feedSupport(sdkDir, inboxDir) {
+	const no = (reason) => ({ ok: false, reason });
+	try {
+		const types = readFileSync(path.join(sdkDir, "sdk.d.ts"), "utf8");
+		if (!types.includes("isReplay: true")) return no("the SDK does not confirm streamed messages (isReplay)");
+		if (!/priority\?: 'now' \| 'next' \| 'later'/.test(types)) return no('the SDK has no message priority "next"');
+		const parent = path.dirname(sdkDir);
+		const program = readdirSync(parent)
+			.filter((d) => d.startsWith("claude-agent-sdk-"))
+			.map((d) => path.join(parent, d, "claude"))
+			.find((p) => existsSync(p));
+		if (!program) return no("the Claude program was not found next to the SDK");
+		const help = execFileSync(program, ["--help"], { encoding: "utf8", timeout: 15000, stdio: ["ignore", "pipe", "ignore"] });
+		if (!help.includes("--replay-user-messages")) return no("the Claude program has no --replay-user-messages");
+		accessSync(inboxDir, constants.W_OK | constants.X_OK);
+		return { ok: true, reason: "" };
+	} catch (err) {
+		return no(String(err?.message || err));
+	}
+}
+
 /** Make the folders ready; a run that continues an earlier try reopens its inbox. */
 export function openInbox(dir) {
 	for (const sub of ["claimed", "seen"]) mkdirSync(path.join(dir, sub), { recursive: true });
@@ -48,10 +83,11 @@ export function openInbox(dir) {
 	}
 }
 
-/** Take every waiting file. Returns [{ name, text }] in arrival order. */
-export function claim(dir) {
+/** Take waiting files, at most `limit`. Returns [{ name, text }] in arrival order. */
+export function claim(dir, limit = Infinity) {
 	const out = [];
 	for (const name of jsonFiles(path.join(dir, "inbox"))) {
+		if (out.length >= limit) break;
 		if (!move(dir, "inbox", "claimed", name)) continue;
 		const text = readText(dir, name);
 		if (text) out.push({ name, text });
@@ -85,87 +121,118 @@ const userMessage = (text, uuid) => ({
 
 /**
  * The prompt for one query(): the first message, then every mid-run message as
- * it arrives. Call observe() with each message the query yields; the feed ends
- * the input (so the query returns) once a result came, every message it handed
- * over was seen, and the inbox is closed with nothing left in it.
+ * it arrives. Call observe() with EVERY message the query yields, until the
+ * query is over, and stop() after it.
+ *
+ * It stops taking messages (closes the inbox) when the run's turn budget or
+ * its message cap is used up, or a result reports an error. It ends the input
+ * stream once a result is in and nothing it handed over is still unseen. The
+ * program can still take a message it was handed after that (it does so after
+ * a max-turns result), so confirmations are recorded until the query is over.
+ *
+ * @param {object} o
+ * @param {number} o.maxTurns     turn budget of the whole run, follow-up turns included
+ * @param {number} o.maxMessages  cap on mid-run messages
+ * @param {boolean} o.refeedSeen  this try replays the original request in a session that
+ *                                does not have the earlier one's history: hand over again
+ *                                what that one had already seen
  */
-export function createFeed(dir, firstPrompt, { pollMs = 2000, idleMs = 60000, log = () => {} } = {}) {
+export function createFeed(dir, firstPrompt, {
+	pollMs = 2000, idleMs = 60000, maxTurns = Infinity, maxMessages = MAX_MIDRUN_MESSAGES, refeedSeen = false, log = () => {},
+} = {}) {
 	openInbox(dir);
+	if (refeedSeen) for (const name of jsonFiles(path.join(dir, "seen"))) move(dir, "seen", "claimed", name);
+
 	const queue = [userMessage(firstPrompt)];
 	const unseen = new Map(); // uuid -> file name
+	const turns = new Set();  // ids of the model's answers so far
 	let wake = null;
-	let ended = false;
+	let taking = true;        // still accepting new messages
+	let inputEnded = false;
 	let resultIn = false;
+	let handed = 0;
 	let idleTimer = null;
 	let timer = null;
 
+	const stopTaking = (why) => {
+		if (!taking) return;
+		taking = false;
+		clearInterval(timer);
+		closeInbox(dir);
+		if (why) log(`${why}; later messages wait for the next run`);
+	};
+	const endInput = () => {
+		stopTaking();
+		inputEnded = true;
+		clearTimeout(idleTimer);
+		wake?.();
+	};
 	const hand = (m) => {
 		const uuid = randomUUID();
 		unseen.set(uuid, m.name);
 		queue.push(userMessage(m.text, uuid));
+		handed++;
 		log(`mid-run message handed to the session (${m.name})`);
 		wake?.();
 	};
-	const end = () => {
-		ended = true;
-		clearInterval(timer);
-		clearTimeout(idleTimer);
-		wake?.();
+	const take = (messages) => {
+		for (const m of messages) hand(m);
+		if (handed >= maxMessages) stopTaking(`this run took its ${maxMessages} mid-run messages`);
 	};
-	// The result is in: finish unless a message is still on its way to the model.
+	// The result is in: end the input unless a message is still on its way to the model.
 	const settle = () => {
-		if (ended || !resultIn) return;
-		for (const m of claim(dir)) hand(m);
-		if (unseen.size === 0) {
-			closeInbox(dir);
-			return end();
-		}
+		if (inputEnded || !resultIn) return;
+		if (taking) take(claim(dir, maxMessages - handed));
+		if (unseen.size === 0) return endInput();
 		// A handed message starts a new turn. If the program never takes it, stop
 		// waiting: it stays in claimed/ and the listener runs it as a new run.
 		if (idleTimer) return;
 		idleTimer = setTimeout(() => {
 			log("mid-run message not taken by the session; leaving it for the next run");
-			closeInbox(dir);
-			end();
+			endInput();
 		}, idleMs);
 	};
 
-	for (const m of claimedNotSeen(dir)) hand(m);
-	timer = setInterval(() => {
-		if (resultIn) return settle();
-		for (const m of claim(dir)) hand(m);
-	}, pollMs);
+	take(claimedNotSeen(dir));
+	if (taking) {
+		timer = setInterval(() => {
+			if (resultIn) return settle();
+			take(claim(dir, maxMessages - handed));
+		}, pollMs);
+	}
 
 	return {
 		input: (async function* () {
 			while (true) {
 				while (queue.length) yield queue.shift();
-				if (ended) return;
+				if (inputEnded) return;
 				await new Promise((r) => { wake = r; });
 				wake = null;
 			}
 		})(),
 		observe(msg) {
-			if (ended) return;
 			if (msg.type === "user" && msg.isReplay && unseen.has(msg.uuid)) {
+				// Also after the input ended: the program still takes what it was handed.
 				markSeen(dir, unseen.get(msg.uuid));
 				log(`mid-run message seen by the session (${unseen.get(msg.uuid)})`);
 				unseen.delete(msg.uuid);
 				clearTimeout(idleTimer);
 				idleTimer = null;
-			} else if (msg.type === "result") {
-				if (msg.is_error) {
-					closeInbox(dir);
-					return end();
-				}
-				resultIn = true;
-				settle();
-			} else if (msg.type === "assistant") {
-				resultIn = false; // a new turn is running; wait for its result
+			} else if (msg.type === "assistant" && !msg.parent_tool_use_id) {
+				resultIn = false; // a turn is running; wait for its result
 				clearTimeout(idleTimer);
 				idleTimer = null;
+				turns.add(msg.message?.id || turns.size);
+				if (turns.size >= maxTurns) stopTaking(`this run used its ${maxTurns} turns`);
+			} else if (msg.type === "result") {
+				if (msg.is_error) stopTaking();
+				resultIn = true;
+				settle();
 			}
 		},
-		stop: end,
+		/** The query is over. */
+		stop() {
+			endInput();
+		},
 	};
 }
