@@ -35,6 +35,12 @@
  *   AGENT_MODEL            — Optional: model or alias (e.g. "opus"). The model
  *                             the SDK actually resolved is logged at session
  *                             start and returned as `model` in the result JSON.
+ *   MIDRUN_DIR             - Optional: folder where the listener drops messages
+ *                             that arrive while this run is working; they are
+ *                             handed to the session between tool calls
+ *                             (docker/midrun.mjs). Unset = one prompt, as before.
+ *                             Also off for the run when the installed SDK or
+ *                             the folder cannot support it (logged).
  *   TZ                     — Optional: container timezone (default: UTC)
  *   DELIVERY_INSTRUCTION   — Optional: extra system-prompt text appended after
  *                             PROMPT.md, telling the agent how to deliver its
@@ -48,6 +54,7 @@ import { bottomLineSkill, whatsappSkill } from "./prompt-skills.mjs";
 import { createLimitTracker } from "./limit-detect.mjs";
 import { CONTINUE_AFTER_ERROR_MESSAGE, nextStep } from "./run-policy.mjs";
 import { toolServerOptions } from "./tool-servers.mjs";
+import { closeInbox, createFeed, feedSupport } from "./midrun.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -270,48 +277,77 @@ let resolvedModel = "";
 // listener can resume it.
 let sessionId = resumeId || "";
 
-async function runSession(resumeSessionId, prompt) {
-	sessionId = resumeSessionId || sessionId;
+// Mid-run messages (docker/midrun.mjs) depend on the pinned SDK: the Claude
+// program must confirm each streamed message it took. If this image cannot do
+// that, or cannot write the folder, close the inbox now: the listener's write
+// then fails and it queues the message for the next run, exactly as before.
+let midrunDir = process.env.MIDRUN_DIR || "";
+if (midrunDir) {
+	const support = feedSupport("/app/node_modules/@anthropic-ai/claude-agent-sdk", midrunDir);
+	if (!support.ok) {
+		closeInbox(midrunDir);
+		console.error(`[${agentName}] mid-run messages are off for this run: ${support.reason}`);
+		midrunDir = "";
+	}
+}
 
-	for await (const msg of query({
-		prompt,
-		options: {
-			systemPrompt,
-			allowedTools,
-			permissionMode: "bypassPermissions",
-			allowDangerouslySkipPermissions: true,
-			maxTurns,
-			cwd: "/workspace",
-			resume: resumeSessionId,
-			persistSession: true,
-			model: process.env.AGENT_MODEL || undefined,
-			...(mcpServers ? { mcpServers } : {}),
-		},
-	})) {
-		if (msg.type === "system" && msg.subtype === "init") {
-			if (msg.session_id) sessionId = msg.session_id;
-			if (msg.model && msg.model !== resolvedModel) {
-				resolvedModel = msg.model;
-				console.error(`[${agentName}] Model: ${resolvedModel}${process.env.AGENT_MODEL ? ` (requested: ${process.env.AGENT_MODEL})` : ""}`);
+// replaysRequest: this try sends the original request to a session that does
+// not hold the previous try's history, so mid-run messages that try had
+// already seen are handed over again.
+async function runSession(resumeSessionId, prompt, replaysRequest) {
+	sessionId = resumeSessionId || sessionId;
+	// With an inbox the prompt is a stream: this message first, then whatever
+	// the listener drops in while the run works. The feed ends the stream.
+	const feed = midrunDir
+		? createFeed(midrunDir, prompt, { maxTurns, refeedSeen: replaysRequest, log: (line) => console.error(`[${agentName}] ${line}`) })
+		: null;
+
+	try {
+		for await (const msg of query({
+			prompt: feed ? feed.input : prompt,
+			options: {
+				systemPrompt,
+				allowedTools,
+				permissionMode: "bypassPermissions",
+				allowDangerouslySkipPermissions: true,
+				maxTurns,
+				cwd: "/workspace",
+				resume: resumeSessionId,
+				persistSession: true,
+				model: process.env.AGENT_MODEL || undefined,
+				...(mcpServers ? { mcpServers } : {}),
+				// Have the program confirm each streamed message it took (isReplay).
+				...(feed ? { extraArgs: { "replay-user-messages": null } } : {}),
+			},
+		})) {
+			feed?.observe(msg);
+			if (msg.type === "system" && msg.subtype === "init") {
+				if (msg.session_id) sessionId = msg.session_id;
+				if (msg.model && msg.model !== resolvedModel) {
+					resolvedModel = msg.model;
+					console.error(`[${agentName}] Model: ${resolvedModel}${process.env.AGENT_MODEL ? ` (requested: ${process.env.AGENT_MODEL})` : ""}`);
+				}
+			}
+
+			tracker.observe(msg);
+
+			if (msg.type === "result") {
+				const output = {
+					session_id: sessionId || msg.session_id,
+					result: msg.result || "",
+					is_error: msg.is_error || false,
+					num_turns: msg.num_turns || 0,
+					cost_usd: msg.total_cost_usd || 0,
+					model: resolvedModel || undefined,
+					tool_calls: tracker.toolCalls,
+					...tracker.outcome(msg.is_error || false, msg.result || ""),
+				};
+				console.log(JSON.stringify(output));
+				console.error(`[${agentName}] Done — ${msg.num_turns} turns, $${(msg.total_cost_usd || 0).toFixed(4)}`);
 			}
 		}
-
-		tracker.observe(msg);
-
-		if (msg.type === "result") {
-			const output = {
-				session_id: sessionId || msg.session_id,
-				result: msg.result || "",
-				is_error: msg.is_error || false,
-				num_turns: msg.num_turns || 0,
-				cost_usd: msg.total_cost_usd || 0,
-				model: resolvedModel || undefined,
-				tool_calls: tracker.toolCalls,
-				...tracker.outcome(msg.is_error || false, msg.result || ""),
-			};
-			console.log(JSON.stringify(output));
-			console.error(`[${agentName}] Done — ${msg.num_turns} turns, $${(msg.total_cost_usd || 0).toFixed(4)}`);
-		}
+	} finally {
+		feed?.stop();
 	}
 }
 
@@ -323,7 +359,7 @@ let prompt = message;
 let strictResume = !!resumeId && process.env.RESUME_STRICT === "1";
 while (true) {
 	try {
-		await runSession(sessionArg, prompt);
+		await runSession(sessionArg, prompt, !strictResume);
 		break;
 	} catch (err) {
 		const msg = String(err);

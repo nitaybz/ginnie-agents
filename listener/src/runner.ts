@@ -19,6 +19,7 @@ import { parseWhatsAppConfig, whatsappDockerArgs, type WhatsAppConfig } from "./
 import { parseExtraMounts, checkHostPaths, extraMountDockerArgs, type ExtraMount, type HostEnv } from "./extra-mounts";
 import { parseBotPolicy, type BotPolicy } from "./bot-allow";
 import { parseToolServers, toolServerRefs, toolServersDockerEnv, type ToolServerRef } from "./tool-servers";
+import { midrunDockerArgs } from "./midrun-inbox";
 import {
 	ACCOUNT_COOLDOWNS_FILE,
 	accountDockerAuth,
@@ -30,7 +31,8 @@ import {
 } from "./claude-accounts";
 
 const AGENTS_DIR = path.join(__dirname, "..", "..", "agents");
-const DOCKER_IMAGE = "ginnie-agent";
+// GINNIE_AGENT_IMAGE: run another image tag (testing a new image beside the live one).
+const DOCKER_IMAGE = process.env.GINNIE_AGENT_IMAGE || "ginnie-agent";
 
 // Host facts the extra-mount safety check needs (see extra-mounts.ts).
 function extraMountHost(): HostEnv {
@@ -69,6 +71,8 @@ export interface AgentConfig {
 	allowUnverifiedSenders: boolean;
 	/** config.json "wake_inbox": true = host jobs may wake the agent via <dir>/data/wake/*.json (wake-inbox.ts). */
 	wakeInbox?: boolean;
+	/** config.json "midrun_messages": false = a message that arrives while the agent works waits for the run to end (default: handed to the working run, midrun-inbox.ts). */
+	midrunMessages?: boolean;
 	model?: string;
 	buttonTtlHours: number;
 	// Optional WhatsApp access + wake-up (config.json "whatsapp"; token in
@@ -95,6 +99,7 @@ interface AgentManifest {
 	work_hours?: Partial<AgentWorkHours>;
 	allow_unverified_senders?: boolean;
 	wake_inbox?: boolean;
+	midrun_messages?: boolean;
 	model?: string;
 	button_ttl_hours?: number;
 	whatsapp?: unknown;
@@ -219,6 +224,7 @@ export function loadAgents(): AgentConfig[] {
 			workHours,
 			allowUnverifiedSenders: manifest.allow_unverified_senders === true,
 			wakeInbox: manifest.wake_inbox === true,
+			midrunMessages: manifest.midrun_messages !== false,
 			model: manifest.model,
 			buttonTtlHours: typeof manifest.button_ttl_hours === "number" && manifest.button_ttl_hours > 0
 				? manifest.button_ttl_hours
@@ -249,8 +255,10 @@ export async function runAgent(
 	agent: AgentConfig,
 	message: string,
 	origin: DeliveryOrigin = "slack",
+	// Inbox folder for messages that arrive while this run works (midrun-inbox.ts).
+	midrunDir?: string,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, undefined, origin);
+	return spawnContainer(agent, message, undefined, origin, midrunDir);
 }
 
 /**
@@ -261,8 +269,9 @@ export async function resumeAgent(
 	sessionId: string,
 	message: string,
 	origin: DeliveryOrigin = "slack",
+	midrunDir?: string,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, sessionId, origin);
+	return spawnContainer(agent, message, sessionId, origin, midrunDir);
 }
 
 /**
@@ -293,6 +302,7 @@ async function spawnContainer(
 	message: string,
 	resumeId?: string,
 	origin: DeliveryOrigin = "slack",
+	midrunDir?: string,
 ): Promise<AgentRunResult> {
 	let out;
 	try {
@@ -303,7 +313,7 @@ async function spawnContainer(
 			// A continuation resumes the limited try's session on the next
 			// account instead of replaying the original request.
 			attempt: (account, cont) =>
-				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont),
+				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont, midrunDir),
 			log: (line) => console.log(`[${agent.name}] ${line}`),
 		});
 	} catch (err) {
@@ -325,6 +335,50 @@ async function spawnContainer(
 	};
 }
 
+/**
+ * What a container's stdout says about its run. The entrypoint prints one JSON
+ * line per result, and a run that takes in a mid-run message can have more
+ * than one. The LAST one decides: a run that hit an error, then answered a
+ * message it had been handed, ended well. A non-zero exit is always an error.
+ */
+export function parseRunOutput(stdout: string, exitCode: number | null, resumeId?: string): Omit<AttemptResult, "stderr"> {
+	let sessionId = resumeId || `session_${Date.now()}`;
+	let lastIsError = false;
+	let result = "";
+	let model = "";
+	let limit: AttemptResult["limit"] = null;
+	let toolCalls: number | undefined;
+	let reportedSessionId = "";
+	for (const line of stdout.trim().split("\n")) {
+		try {
+			const parsed = JSON.parse(line);
+			if (parsed.session_id) sessionId = reportedSessionId = parsed.session_id;
+			if (typeof parsed.tool_calls === "number") toolCalls = parsed.tool_calls;
+			if ("is_error" in parsed) lastIsError = !!parsed.is_error;
+			if (typeof parsed.result === "string") result = parsed.result;
+			if (typeof parsed.model === "string" && parsed.model) model = parsed.model;
+			if (parsed.limit_hit) {
+				limit = {
+					type: typeof parsed.limit_type === "string" ? parsed.limit_type : null,
+					resetsAt: typeof parsed.resets_at === "number" ? parsed.resets_at : null,
+				};
+			} else if ("is_error" in parsed) {
+				limit = null;
+			}
+		} catch {}
+	}
+	const isError = exitCode !== 0 || lastIsError;
+	return {
+		sessionId,
+		isError,
+		result,
+		model: model || undefined,
+		limit: isError ? limit : null,
+		toolCalls,
+		reportedSessionId: reportedSessionId || undefined,
+	};
+}
+
 export function spawnAttempt(
 	agent: AgentConfig,
 	message: string,
@@ -334,6 +388,7 @@ export function spawnAttempt(
 	// A continuation after a usage limit: if its session is gone the run must
 	// fail, never start over (that would repeat completed actions).
 	strictResume = false,
+	midrunDir?: string,
 ): Promise<AttemptResult> {
 	return new Promise((resolve, reject) => {
 		const containerName = `ginnie-${agent.name}-${Date.now()}`;
@@ -510,6 +565,9 @@ export function spawnAttempt(
 		// Read-only extra mounts from config.json (under /workspace/mounts).
 		dockerArgs.push(...extraMountDockerArgs(agent.name, agent.extraMounts ?? [], extraMountHost(), (line) => console.warn(`[${agent.name}] ${line}`)));
 
+		// Inbox for messages that arrive while the run works; none = one prompt, as before.
+		dockerArgs.push(...midrunDockerArgs(midrunDir));
+
 		// Docker image
 		dockerArgs.push(DOCKER_IMAGE);
 
@@ -543,50 +601,13 @@ export function spawnAttempt(
 				console.error(`[${agent.name}] Container exited with code ${code}`);
 			}
 
-			// Parse structured output from stdout. The entrypoint emits one JSON
-			// line per result: { session_id, is_error, result, ... }.
-			let sessionId = resumeId || `session_${Date.now()}`;
-			let isError = code !== 0; // non-zero exit always counts as an error
-			let result = "";
-			let model = "";
-			let limit: AttemptResult["limit"] = null;
-			let toolCalls: number | undefined;
-			let reportedSessionId = "";
-			try {
-				const lines = stdout.trim().split("\n");
-				for (const line of lines) {
-					try {
-						const parsed = JSON.parse(line);
-						if (parsed.session_id) sessionId = reportedSessionId = parsed.session_id;
-						if (typeof parsed.tool_calls === "number") toolCalls = parsed.tool_calls;
-						if (parsed.is_error) isError = true;
-						if (typeof parsed.result === "string") result = parsed.result;
-						if (typeof parsed.model === "string" && parsed.model) model = parsed.model;
-						if (parsed.limit_hit) {
-							limit = {
-								type: typeof parsed.limit_type === "string" ? parsed.limit_type : null,
-								resetsAt: typeof parsed.resets_at === "number" ? parsed.resets_at : null,
-							};
-						}
-					} catch {}
-				}
-			} catch {}
-
+			const out = parseRunOutput(stdout, code, resumeId);
 			console.log(
-				`[${agent.name}] Container done: ${sessionId.slice(0, 30)}... ` +
-				`model=${model || "unknown"} account=${account ? account.label : "host-credentials"}` +
-				`${limit ? " (USAGE LIMIT)" : isError ? " (ERROR)" : ""}`,
+				`[${agent.name}] Container done: ${out.sessionId.slice(0, 30)}... ` +
+				`model=${out.model || "unknown"} account=${account ? account.label : "host-credentials"}` +
+				`${out.limit ? " (USAGE LIMIT)" : out.isError ? " (ERROR)" : ""}`,
 			);
-			resolve({
-				sessionId,
-				isError,
-				result,
-				model: model || undefined,
-				limit: isError ? limit : null,
-				stderr,
-				toolCalls,
-				reportedSessionId: reportedSessionId || undefined,
-			});
+			resolve({ ...out, stderr });
 		});
 
 		child.on("error", (err) => {

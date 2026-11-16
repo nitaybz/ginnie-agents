@@ -124,6 +124,22 @@ An agent can use tools served by an MCP server (a "tool server") that the operat
 - The framework does not start, stop or secure these servers. Running them, keeping them up and deciding what each tool may do is the operator's responsibility.
 - Without `tool_servers` nothing changes: the container gets no extra env and the SDK gets no `mcpServers`.
 
+## Messages while the agent is working
+
+A message for a thread whose run is still going is handed to that run and reaches the agent between its tool calls, instead of waiting for the run to end (`"midrun_messages": false` in `config.json` restores the wait; default on, every agent). It arrives in the usual Slack envelope under one line saying it came mid-work.
+
+- Each Slack-thread run gets a folder `data/midrun/<run>/`, mounted at `/workspace/.midrun` (`listener/src/midrun-inbox.ts`). The listener writes the message into `inbox/`; the entrypoint (`docker/midrun.mjs`) feeds the session a stream of user messages (the SDK's streaming input) and moves the file to `claimed/`, then to `seen/` when the Claude program confirms it put the message in the conversation.
+- Exactly once: when the run is done the entrypoint renames `inbox/` to `closed/`, so a late write fails and the message waits in line as before; after the container exits, whatever is not in `seen/` goes to the head of the line for the next run. Nothing in `seen/` is run again.
+- Limits: a run has one turn budget (`max_turns`) across all its turns and takes at most 20 mid-run messages. When either is used up the inbox closes and later messages start a new run. A message already handed over when the budget runs out is still answered (the Claude program starts one more turn for it); the run's outcome is its last result, so that is not reported as a failure.
+- A retry that sends the original request again (usage limit or API error before any tool call) hands over again the messages the dropped session had seen.
+- Trust: the folder is `0700`, owned by the listener's user, which must be the uid the container runs as (1000, the image's `node` user). The agent can write into its own run's folder, never another thread's or agent's. So a message that came through it is worth no more than the agent's own word: it reaches the model as user text only, and nothing may ever treat it as an approval or a verified sender.
+- The SDK is pinned: exactly-once depends on the Claude program confirming each message it took. `docker/package.json` and `docker/package-lock.json` hold the exact version, and the entrypoint checks the installed SDK at start; if it lacks what the feed needs (or the folder is not writable) it closes the inbox for that run, logs why, and messages wait in line as before. To move the pin: `npm install --save-exact @anthropic-ai/claude-agent-sdk@<version>` in `docker/`, run `npm test` in `listener/` (it drives that SDK and `docker/midrun.mjs` against a fake model API), then rebuild the image.
+- Scheduled runs and WhatsApp-woken runs have no inbox and behave as before. An image built before this change ignores the folder, so messages simply wait for the next run. If the folder cannot be created the run goes the old way too (logged once).
+
+## The working sign
+
+Every accepted message gets a reaction from the agent at once (👀 received), changed to ⏳ while a run works on it and removed when that run ends, however it ends; a mid-run message turns ⏳ when the run has taken it (`listener/src/working-sign.ts`). Runs that will answer also keep Slack's "is thinking…" status up, re-set every 15 seconds because Slack drops it whenever the bot posts and two minutes after it was last set. Reactions need the `reactions:write` bot scope; without it the agent shows the status only (logged once).
+
 ## Work hours
 
 `config.json.work_hours` does **not** gate inbound user messages. An @mention, DM, or thread reply reaches the agent and gets answered at any hour, any day — there is no config that silences that.

@@ -30,3 +30,13 @@ export function buildSlackPrompt({ channel, threadTs, message, threadContext = "
 		: `Slack message (channel: ${channel}, thread: ${threadTs}):${threadContext}`;
 	return `${header}\n\n${message}\n\nReply in Slack channel ${channel}, thread ${threadTs}.`;
 }
+
+// First line of a message that is handed to a run that is already working (midrun-inbox.ts).
+export const MIDRUN_NOTE =
+	"[This message arrived while you were working on the task above. Take it into account now: keep going, change course, " +
+	"or answer briefly, as it requires. Do not start the task over and do not repeat actions you already completed.]";
+
+/** The same envelope a thread reply gets, under the note. */
+export function buildMidRunPrompt(args: { channel: string; threadTs: string; message: string }): string {
+	return `${MIDRUN_NOTE}\n\n${buildSlackPrompt({ ...args, resumed: true })}`;
+}

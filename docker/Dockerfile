@@ -33,9 +33,10 @@ RUN ARCH=$(dpkg --print-architecture) \
 RUN mkdir -p /app && chown node:node /app
 WORKDIR /app
 
-# Install Claude Agent SDK as a local dependency
-COPY docker/package.json /app/package.json
-RUN npm install --production
+# Install the Claude Agent SDK at the exact version in docker/package.json
+# (mid-run messages depend on it; see ARCHITECTURE.md for how to move the pin).
+COPY docker/package.json docker/package-lock.json /app/
+RUN npm ci --omit=dev
 
 # Copy entrypoint
 COPY docker/entrypoint.mjs /app/entrypoint.mjs
@@ -44,6 +45,7 @@ COPY docker/limit-detect.mjs /app/limit-detect.mjs
 COPY docker/run-policy.mjs /app/run-policy.mjs
 COPY docker/tool-servers.mjs /app/tool-servers.mjs
 COPY docker/tool-server-headers.mjs /app/tool-server-headers.mjs
+COPY docker/midrun.mjs /app/midrun.mjs
 
 # Create workspace and Claude config dirs
 RUN mkdir -p /workspace /home/node/.claude && chown -R node:node /workspace /home/node/.claude

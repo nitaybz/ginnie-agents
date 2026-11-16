@@ -6,6 +6,7 @@
     "start": "node dist/index.js",
     "build": "tsc",
     "dev": "tsc && node dist/index.js",
+    "pretest": "[ -d ../docker/node_modules/@anthropic-ai/claude-agent-sdk ] || npm --prefix ../docker ci --omit=dev",
     "test": "tsc && node --test dist/*.test.js"
   },
   "dependencies": {
