@@ -126,7 +126,9 @@ const userMessage = (text, uuid) => ({
  *
  * It stops taking messages (closes the inbox) when the run's turn budget or
  * its message cap is used up, or a result reports an error. It ends the input
- * stream once a result is in and nothing it handed over is still unseen. The
+ * stream once a result is in and nothing it handed over is still unseen, unless
+ * background work is still running (or ended within graceMs): then it keeps
+ * taking messages, for at most holdMs without a new turn. The
  * program can still take a message it was handed after that (it does so after
  * a max-turns result), so confirmations are recorded until the query is over.
  *
@@ -138,7 +140,8 @@ const userMessage = (text, uuid) => ({
  *                                what that one had already seen
  */
 export function createFeed(dir, firstPrompt, {
-	pollMs = 2000, idleMs = 60000, maxTurns = Infinity, maxMessages = MAX_MIDRUN_MESSAGES, refeedSeen = false, log = () => {},
+	pollMs = 2000, idleMs = 60000, graceMs = 20000, holdMs = 2 * 3600 * 1000,
+	maxTurns = Infinity, maxMessages = MAX_MIDRUN_MESSAGES, refeedSeen = false, log = () => {},
 } = {}) {
 	openInbox(dir);
 	if (refeedSeen) for (const name of jsonFiles(path.join(dir, "seen"))) move(dir, "seen", "claimed", name);
@@ -153,6 +156,21 @@ export function createFeed(dir, firstPrompt, {
 	let handed = 0;
 	let idleTimer = null;
 	let timer = null;
+	// Background work (a shell command or an agent the run left running) keeps the session going
+	// after a result: its end starts a new turn. While it runs the inbox stays open, so a message
+	// sent in that wait still reaches this run (seen live 2026-11-17: it used to wait for the next).
+	let live = 0;             // background tasks running now, watchers that are not activity left out
+	let graceUntil = 0;       // the last one just ended: its notice may still start a turn
+	let heldSince = 0;        // when this wait began; 0 = not waiting
+	const holding = () => {
+		if (!taking || !(live > 0 || Date.now() < graceUntil)) return false;
+		if (!heldSince) {
+			heldSince = Date.now();
+			log("background work is still running; the run keeps taking messages");
+		}
+		// Work that never ends must not hold the run for ever: then end the input as before.
+		return Date.now() - heldSince < holdMs;
+	};
 
 	const stopTaking = (why) => {
 		if (!taking) return;
@@ -183,7 +201,7 @@ export function createFeed(dir, firstPrompt, {
 	const settle = () => {
 		if (inputEnded || !resultIn) return;
 		if (taking) take(claim(dir, maxMessages - handed));
-		if (unseen.size === 0) return endInput();
+		if (unseen.size === 0) return holding() ? undefined : endInput();
 		// A handed message starts a new turn. If the program never takes it, stop
 		// waiting: it stays in claimed/ and the listener runs it as a new run.
 		if (idleTimer) return;
@@ -220,10 +238,16 @@ export function createFeed(dir, firstPrompt, {
 				idleTimer = null;
 			} else if (msg.type === "assistant" && !msg.parent_tool_use_id) {
 				resultIn = false; // a turn is running; wait for its result
+				heldSince = 0;
 				clearTimeout(idleTimer);
 				idleTimer = null;
 				turns.add(msg.message?.id || turns.size);
 				if (turns.size >= maxTurns) stopTaking(`this run used its ${maxTurns} turns`);
+			} else if (msg.type === "system" && msg.subtype === "background_tasks_changed") {
+				// The full set each time (the SDK's level signal), so a missed event cannot leave a count behind.
+				const now = Array.isArray(msg.tasks) ? msg.tasks.filter((t) => !t?.ambient).length : 0;
+				if (live > 0 && now === 0) graceUntil = Date.now() + graceMs;
+				live = now;
 			} else if (msg.type === "result") {
 				if (msg.is_error) stopTaking();
 				resultIn = true;
