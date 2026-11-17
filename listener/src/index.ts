@@ -69,7 +69,7 @@ interface QueuedMessage {
 	messageTs: string;
 	userId: string;
 	senderLine: string;
-	/** Woken only because it takes part in the thread: no "is thinking" shimmer, since it may stay silent. */
+	/** Woken by another agent's message in a thread it takes part in: no "is thinking" shimmer, since it may stay silent. */
 	quiet?: boolean;
 	/** The messages batched into this run (set when the run starts). */
 	parts?: QueuedMessage[];
@@ -85,7 +85,10 @@ const STATUS_DELETE_DELAY_MS = 1500;
 // bot posts a message, and agents post while they work. So re-set it often
 // (Slack allows 600 of these calls a minute per app); the same beat moves the
 // reaction on a mid-run message once the run has taken it. See working-sign.ts.
-const STATUS_HEARTBEAT_MS = 15_000;
+// Slack drops the status whenever the agent posts a message, so the gap until the next
+// re-set is what a person sees as "the sign vanished" (measured 2026-11-17: gone right
+// after a progress message, back within one heartbeat). 5 seconds keeps that gap short.
+const STATUS_HEARTBEAT_MS = 5_000;
 
 // Inboxes of the runs working right now, by agent+thread (midrun-inbox.ts).
 const midRunInboxes = new Map<string, MidRunInbox<QueuedMessage>>();
@@ -318,7 +321,9 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			console.log(`[thread-reply] Agent: ${agent.name}, From: ${sender.name}, Channel: ${channel}, Thread: ${event.thread_ts} (involved)`);
 			enqueueOrProcess({
 				agent, channel, threadTs: event.thread_ts,
-				message: mentioned ? messageText : withThreadNote(messageText), quiet: !mentioned,
+				// A person's reply shows "is thinking…" also without a mention (Nitay 2026-11-17: "I answer
+				// in the thread and see no sign that she is working"). Only a wake by another agent stays quiet.
+				message: mentioned ? messageText : withThreadNote(messageText),
 				isThreadReply: true, messageTs: event.ts, userId: event.user, senderLine,
 			});
 		}
@@ -579,7 +584,7 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 	if (inbox) midRunInboxes.set(key, inbox);
 
 	// The sign stays up for the whole run and comes down on every way out
-	// (working-sign.ts). A quiet run shows the reaction only: it may end silent.
+	// (working-sign.ts). A run woken only by another agent shows the reaction only: it may end silent.
 	await sign.during(msg.parts || [msg], async () => {
 		try {
 			if (isThreadReply) {

@@ -5,6 +5,8 @@
  * Why the old sign was unreliable: Slack removes the "is thinking…" status every time the bot
  * posts a message and two minutes after it was last set, it was re-set only every 90 seconds, a
  * thread reply that does not @mention the agent got no sign at all, and a failed call was silent.
+ * (Since 2026-11-17 a person's thread reply always raises the status; only a wake by another
+ * agent's message is quiet.)
  *
  * Now every message gets a reaction from the agent the moment it is accepted (👀 received), which
  * changes to ⏳ while a run works on it and is removed when that run ends, however it ends. Runs
@@ -23,7 +25,7 @@ export interface SignMessage {
 	channel: string;
 	threadTs: string;
 	messageTs: string;
-	/** Woken only because it takes part in the thread: reaction only, it may stay silent. */
+	/** Woken by another agent's message in the thread: reaction only, it may stay silent. */
 	quiet?: boolean;
 }
 
