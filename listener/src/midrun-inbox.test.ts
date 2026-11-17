@@ -284,3 +284,82 @@ describe("dispatcher: a busy thread hands the message to the working run", () =>
 		assert.deepEqual(runs, [["a1"]]);
 	});
 });
+
+// Background work (a shell command or an agent the run left running) keeps the session going
+// after a result. Seen live 2026-11-17: the inbox closed at the first result, so a message sent
+// while the run waited on a background command had to wait for the next run. Driven by hand: the
+// events are the program's own types (system/background_tasks_changed is a level signal).
+describe("container feed: background work keeps the inbox open", () => {
+	const tasks = (...ids: string[]) => ({ type: "system", subtype: "background_tasks_changed", tasks: ids.map((id) => ({ task_id: id, task_type: "shell", description: "sleep" })) });
+	const read = (feed: any) => {
+		const got: any[] = [];
+		const done = (async () => { for await (const m of feed.input) got.push(m); })();
+		return { got, done };
+	};
+
+	test("a result while a background command runs: a later message is still handed over", async () => {
+		const { createFeed } = await container();
+		const inbox = new MidRunInbox<string>(root(), "bg1");
+		const feed = createFeed(inbox.dir, "task", { pollMs: 5, graceMs: 30, holdMs: 5000 });
+		const r = read(feed);
+		feed.observe({ type: "assistant", message: { id: "a1" } });
+		feed.observe(tasks("t1"));
+		feed.observe({ type: "result", is_error: false });
+		await sleep(40);
+		assert.equal(inbox.offer("m1", "second message"), true, "the inbox is still open");
+		await sleep(20);
+		assert.equal(r.got.some((m) => m.message?.content === "second message"), true);
+		feed.stop();
+		await r.done;
+	});
+
+	test("one command ends and the next turn starts another: the inbox stays open through the chain", async () => {
+		const { createFeed } = await container();
+		const inbox = new MidRunInbox<string>(root(), "bg2");
+		const feed = createFeed(inbox.dir, "task", { pollMs: 5, graceMs: 40, holdMs: 5000 });
+		const r = read(feed);
+		feed.observe({ type: "assistant", message: { id: "a1" } });
+		feed.observe(tasks("t1"));
+		feed.observe({ type: "result", is_error: false });
+		feed.observe(tasks());                                     // the command ended
+		await sleep(15);                                           // inside the grace: its notice starts a turn
+		feed.observe({ type: "assistant", message: { id: "a2" } });
+		feed.observe(tasks("t2"));
+		feed.observe({ type: "result", is_error: false });
+		await sleep(60);
+		assert.equal(inbox.offer("m1", "late message"), true);
+		feed.stop();
+		await r.done;
+	});
+
+	test("the last command ended and no turn followed: the input ends after the grace", async () => {
+		const { createFeed } = await container();
+		const inbox = new MidRunInbox<string>(root(), "bg3");
+		const feed = createFeed(inbox.dir, "task", { pollMs: 5, graceMs: 20, holdMs: 5000 });
+		const r = read(feed);
+		feed.observe(tasks("t1"));
+		feed.observe({ type: "result", is_error: false });
+		feed.observe(tasks());
+		await r.done;
+		assert.equal(inbox.offer("m1", "too late"), false);
+	});
+
+	test("background work that never ends does not hold the run for ever; watchers that are not activity do not hold it at all", async () => {
+		const { createFeed } = await container();
+		const stuck = new MidRunInbox<string>(root(), "bg4");
+		const feed = createFeed(stuck.dir, "task", { pollMs: 5, graceMs: 20, holdMs: 40 });
+		const r = read(feed);
+		feed.observe(tasks("t1"));
+		feed.observe({ type: "result", is_error: false });
+		await r.done;
+		assert.equal(stuck.offer("m1", "too late"), false);
+
+		const ambient = new MidRunInbox<string>(root(), "bg5");
+		const feed2 = createFeed(ambient.dir, "task", { pollMs: 5, graceMs: 20, holdMs: 5000 });
+		const r2 = read(feed2);
+		feed2.observe({ type: "system", subtype: "background_tasks_changed", tasks: [{ task_id: "w", task_type: "monitor", description: "watch", ambient: true }] });
+		feed2.observe({ type: "result", is_error: false });
+		await r2.done;
+		assert.equal(ambient.offer("m1", "too late"), false);
+	});
+});
