@@ -36,6 +36,7 @@ const errorCode = (err: unknown): string => String((err as any)?.data?.error || 
 export class WorkingSign {
 	private readonly statusUp = new Set<string>();  // threads that carry "is thinking…" now
 	private readonly complained = new Set<string>();
+	private readonly arrivals = new Map<string, number>();  // thread -> person messages received so far
 
 	constructor(private readonly api: SignApi, private readonly opts: {
 		heartbeatMs: number;
@@ -46,7 +47,9 @@ export class WorkingSign {
 
 	/** A message was accepted for this agent: show it at once, before any waiting. */
 	received(m: SignMessage): void {
-		if (!m.quiet) void this.status(m, THINKING);
+		if (m.quiet) return;
+		this.arrivals.set(threadKey(m), (this.arrivals.get(threadKey(m)) || 0) + 1);
+		void this.status(m, THINKING);
 	}
 
 	/**
@@ -68,9 +71,12 @@ export class WorkingSign {
 			return await run();
 		} finally {
 			clearInterval(timer);
+			const seenAtEnd = this.arrivals.get(thread) || 0;
 			if (this.statusUp.has(thread)) {
 				await new Promise((r) => setTimeout(r, this.opts.clearDelayMs));
-				await this.status(first, "");
+				// A person's message that came in after the run ended waits for the next run (the
+				// debounce): clearing now would leave it with no sign. The next run takes the status over.
+				if ((this.arrivals.get(thread) || 0) === seenAtEnd) await this.status(first, "");
 			}
 		}
 	}

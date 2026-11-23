@@ -15,7 +15,7 @@ const msg = (messageTs: string, extra: Partial<SignMessage> = {}): SignMessage =
 	({ agent: { name: "sally" }, channel: "C1", threadTs: TS1, messageTs, ...extra });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-function fake(fail: { status?: string } = {}) {
+function fake(fail: { status?: string } = {}, clearDelayMs = 1) {
 	const calls: string[] = [];
 	const logs: string[] = [];
 	const api: SignApi = {
@@ -28,7 +28,7 @@ function fake(fail: { status?: string } = {}) {
 	const spy = new Proxy(api, {
 		get: (t, k) => (k in t ? (t as any)[k] : async (...args: unknown[]) => { calls.push(`other:${String(k)}:${JSON.stringify(args)}`); }),
 	});
-	const sign = new WorkingSign(spy, { heartbeatMs: 10, clearDelayMs: 1, log: (l) => logs.push(l) });
+	const sign = new WorkingSign(spy, { heartbeatMs: 10, clearDelayMs, log: (l) => logs.push(l) });
 	const lastStatus = () => calls.filter((c) => c.startsWith("status:")).pop();
 	const others = () => calls.filter((c) => !c.startsWith("status:"));
 	return { sign, calls, logs, lastStatus, others };
@@ -105,6 +105,17 @@ describe("working sign", () => {
 		await sleep(5);
 		assert.equal(f.lastStatus(), "status:clear");
 		assert.deepEqual(f.others(), []);
+	});
+
+	test("a person's message that arrives while the ending run waits to clear keeps the status up for the next run", async () => {
+		const f = fake({}, 30);
+		f.sign.received(msg(TS1));
+		const ending = f.sign.during([msg(TS1)], async () => { await sleep(5); });
+		await sleep(15); // the run is over, the sign waits to clear
+		f.sign.received(msg(TS2));
+		await ending;
+		await sleep(5);
+		assert.equal(f.lastStatus(), `status:${THINKING}`, "not cleared under the new message");
 	});
 
 	test("status refused by Slack: logged once, the run still completes", async () => {
