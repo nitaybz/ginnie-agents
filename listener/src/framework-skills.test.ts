@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
 import path from "node:path";
 import { bottomLineDockerEnv } from "./bottom-line";
+import { spawnSync } from "node:child_process";
 
 const repoRoot = path.join(__dirname, "..", "..");
 const skillsDir = path.join(repoRoot, "framework", "skills");
@@ -289,5 +290,28 @@ describe("memory-curation: the rules cap never forces trimming (review I2)", () 
 		assert.ok(!skill().includes("≤200 lines, hard cap"));
 		assert.ok(!/rules\.md` > 200 lines → git commit-msg hook rejects/.test(skill()));
 		assert.match(skill(), /flag it to the operator/i);
+	});
+});
+
+describe("slack-report: numbers go out as a card, not a paragraph (Nitay 2026-11-23)", () => {
+	const dir = path.join(skillsDir, "slack-report");
+
+	test("ships with frontmatter and the helper, at the path the agents read", () => {
+		const body = readFileSync(path.join(dir, "SKILL.md"), "utf-8");
+		assert.match(body, /^---\nname: slack-report\n/);
+		assert.ok(body.includes("/workspace/.framework/skills/slack-report/report.mjs"));
+		assert.ok(existsSync(path.join(dir, "report.mjs")));
+		assert.doesNotMatch(body + readFileSync(path.join(dir, "report.mjs"), "utf-8"), /\bC0[A-Z0-9]{8,}\b/, "no hard-coded channel");
+	});
+
+	test("its own tests pass", () => {
+		const r = spawnSync(process.execPath, ["--test", path.join(dir, "report.test.mjs")], { encoding: "utf-8" });
+		assert.equal(r.status, 0, r.stdout + r.stderr);
+	});
+
+	test("bottom-line sends a finding with three or more numbers as a card, still one message", () => {
+		const body = readFileSync(path.join(skillsDir, "bottom-line", "SKILL.md"), "utf-8");
+		assert.match(body, /three or more numbers/);
+		assert.ok(body.includes("slack-report/report.mjs"));
 	});
 });

@@ -47,6 +47,12 @@ message as a short 4th line, and only when truly needed. Everything else is drop
 already lives in your own channel, and your technical record (queries, ids, logs) belongs in your own
 memory, not here. Write in the language your PROMPT and rules use for reports.
 
+**With numbers.** A finding that needs three or more numbers goes out as a number card instead of lines
+(framework skill `slack-report`, `/workspace/.framework/skills/slack-report/SKILL.md`): title = the finding,
+fields = the numbers, note = why it matters or the one question. Still one message and the same dedup key; post
+it with `node /workspace/.framework/skills/slack-report/report.mjs --channel "$CH" --spec <file>` in place of the
+`curl` below, and take the `ts` it prints.
+
 ## Plain words
 
 The reader is a busy person hearing about this topic for the first time. They do not know your files,
