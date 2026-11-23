@@ -83,8 +83,7 @@ const DEBOUNCE_MS = 20_000; // Wait 20s for additional messages before processin
 const STATUS_DELETE_DELAY_MS = 1500;
 // Slack clears the status two minutes after it was last set AND every time the
 // bot posts a message, and agents post while they work. So re-set it often
-// (Slack allows 600 of these calls a minute per app); the same beat moves the
-// reaction on a mid-run message once the run has taken it. See working-sign.ts.
+// (Slack allows 600 of these calls a minute per app). See working-sign.ts.
 // Slack drops the status whenever the agent posts a message, so the gap until the next
 // re-set is what a person sees as "the sign vanished" (measured 2026-11-17: gone right
 // after a progress message, back within one heartbeat). 5 seconds keeps that gap short.
@@ -219,7 +218,7 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 		// Post early ack BEFORE transcription so the user sees feedback within
 		// the same ~200ms window non-audio messages get.
 		if (hasFiles && hasAudioAttachment(event.files)) {
-			sign.received({ agent, channel, threadTs, messageTs: "" }); // status only; the reaction comes once the message is accepted
+			sign.received({ agent, channel, threadTs, messageTs: "" }); // the status at once, before transcription
 		}
 
 		const messageText = hasFiles
@@ -489,22 +488,13 @@ async function expandFileAttachments(
 }
 
 // ─── Working sign (scoped to agent) ────────────────────────
-// A reaction on each message (received, then working, removed at the end) plus
-// Slack's "is thinking…" status on the thread. See working-sign.ts.
+// Slack's "is thinking…" status on the thread, the only sign (Nitay 2026-11-23). See working-sign.ts.
 const sign = new WorkingSign({
 	status: async (agentName, channel, threadTs, text) => {
 		const app = apps.get(agentName);
 		const agent = agents.find((a) => a.name === agentName);
 		if (!app || !agent) return;
 		await app.client.assistant.threads.setStatus({ token: agent.slackBotToken, channel_id: channel, thread_ts: threadTs, status: text });
-	},
-	react: async (agentName, channel, ts, emoji, add) => {
-		const app = apps.get(agentName);
-		const agent = agents.find((a) => a.name === agentName);
-		if (!app || !agent) return;
-		const args = { token: agent.slackBotToken, channel, timestamp: ts, name: emoji };
-		if (add) await app.client.reactions.add(args);
-		else await app.client.reactions.remove(args);
 	},
 }, { heartbeatMs: STATUS_HEARTBEAT_MS, clearDelayMs: STATUS_DELETE_DELAY_MS, log: (line) => console.log(line) });
 
@@ -584,7 +574,7 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 	if (inbox) midRunInboxes.set(key, inbox);
 
 	// The sign stays up for the whole run and comes down on every way out
-	// (working-sign.ts). A run woken only by another agent shows the reaction only: it may end silent.
+	// (working-sign.ts). A run woken only by another agent shows no sign: it may end silent.
 	await sign.during(msg.parts || [msg], async () => {
 		try {
 			if (isThreadReply) {
@@ -627,7 +617,7 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 				dispatcher.requeue(key, left);
 			}
 		}
-	}, () => inbox?.seen() ?? []);
+	});
 }
 
 // ─── Schedule fire handler ─────────────────────────────────

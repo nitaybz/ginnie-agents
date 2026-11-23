@@ -8,15 +8,24 @@ export function scheduledThreadKey(scheduleId: string, now: number = Date.now())
 	return `scheduled_${scheduleId}_${now}`;
 }
 
+// Nitay 2026-11-23: every agent works in Slack the way Sasha does: before work that takes a while it says
+// what it is doing, and in long work it posts short updates, so nobody waits in the dark.
+export const PROGRESS_NOTE =
+	"If this will take more than about a minute, your first action is one short line in this thread saying, in your own words, " +
+	"what you are doing now (no promise of a result you have not checked). In long work, post a short update every few minutes. " +
+	"A quick answer: just answer, no separate line. If no reply is expected from you here, post nothing extra.";
+
 export interface SlackPromptArgs {
 	channel: string;
 	threadTs: string;
 	message: string;
 	threadContext?: string;
 	resumed?: boolean;
+	/** Add PROGRESS_NOTE (default). Off for a message handed to a run that is already working. */
+	progress?: boolean;
 }
 
-export function buildSlackPrompt({ channel, threadTs, message, threadContext = "", resumed = false }: SlackPromptArgs): string {
+export function buildSlackPrompt({ channel, threadTs, message, threadContext = "", resumed = false, progress = true }: SlackPromptArgs): string {
 	if (!isSlackThreadTs(threadTs)) {
 		return (
 			`Scheduled run (channel: ${channel}, no Slack thread):\n\n${message}\n\n` +
@@ -28,7 +37,7 @@ export function buildSlackPrompt({ channel, threadTs, message, threadContext = "
 	const header = resumed
 		? `Slack reply (channel: ${channel}, thread: ${threadTs}):`
 		: `Slack message (channel: ${channel}, thread: ${threadTs}):${threadContext}`;
-	return `${header}\n\n${message}\n\nReply in Slack channel ${channel}, thread ${threadTs}.`;
+	return `${header}\n\n${message}\n\nReply in Slack channel ${channel}, thread ${threadTs}.${progress ? ` ${PROGRESS_NOTE}` : ""}`;
 }
 
 // First line of a message that is handed to a run that is already working (midrun-inbox.ts).
@@ -38,5 +47,5 @@ export const MIDRUN_NOTE =
 
 /** The same envelope a thread reply gets, under the note. */
 export function buildMidRunPrompt(args: { channel: string; threadTs: string; message: string }): string {
-	return `${MIDRUN_NOTE}\n\n${buildSlackPrompt({ ...args, resumed: true })}`;
+	return `${MIDRUN_NOTE}\n\n${buildSlackPrompt({ ...args, resumed: true, progress: false })}`;
 }
