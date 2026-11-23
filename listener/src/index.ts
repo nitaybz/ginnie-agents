@@ -489,22 +489,13 @@ async function expandFileAttachments(
 }
 
 // ─── Working sign (scoped to agent) ────────────────────────
-// A reaction on each message (received, then working, removed at the end) plus
-// Slack's "is thinking…" status on the thread. See working-sign.ts.
+// Slack's "is thinking…" status on the thread, the only sign (Nitay 2026-11-23). See working-sign.ts.
 const sign = new WorkingSign({
 	status: async (agentName, channel, threadTs, text) => {
 		const app = apps.get(agentName);
 		const agent = agents.find((a) => a.name === agentName);
 		if (!app || !agent) return;
 		await app.client.assistant.threads.setStatus({ token: agent.slackBotToken, channel_id: channel, thread_ts: threadTs, status: text });
-	},
-	react: async (agentName, channel, ts, emoji, add) => {
-		const app = apps.get(agentName);
-		const agent = agents.find((a) => a.name === agentName);
-		if (!app || !agent) return;
-		const args = { token: agent.slackBotToken, channel, timestamp: ts, name: emoji };
-		if (add) await app.client.reactions.add(args);
-		else await app.client.reactions.remove(args);
 	},
 }, { heartbeatMs: STATUS_HEARTBEAT_MS, clearDelayMs: STATUS_DELETE_DELAY_MS, log: (line) => console.log(line) });
 
@@ -627,7 +618,7 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 				dispatcher.requeue(key, left);
 			}
 		}
-	}, () => inbox?.seen() ?? []);
+	});
 }
 
 // ─── Schedule fire handler ─────────────────────────────────

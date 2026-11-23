@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildSlackPrompt, scheduledThreadKey } from "./slack-prompt";
+import { PROGRESS_NOTE, buildMidRunPrompt, buildSlackPrompt, scheduledThreadKey } from "./slack-prompt";
 
 test("a scheduled run is not told to reply in a thread that does not exist", () => {
 	const threadTs = scheduledThreadKey("wp-plugins-2026-10-28", 1793197800669);
@@ -20,16 +20,33 @@ test("a scheduled run that somehow resumes still gets no fake thread", () => {
 
 test("a real Slack message keeps its thread reply instruction", () => {
 	const p = buildSlackPrompt({ channel: "C9", threadTs: "1793197800.669000", message: "hi", threadContext: "\n\nctx\n\n" });
-	assert.equal(p, "Slack message (channel: C9, thread: 1793197800.669000):\n\nctx\n\n\n\nhi\n\nReply in Slack channel C9, thread 1793197800.669000.");
+	assert.equal(p, `Slack message (channel: C9, thread: 1793197800.669000):\n\nctx\n\n\n\nhi\n\nReply in Slack channel C9, thread 1793197800.669000. ${PROGRESS_NOTE}`);
 });
 
 test("a real Slack thread reply on a resumed session keeps its format", () => {
 	const p = buildSlackPrompt({ channel: "C9", threadTs: "1.2", message: "hi", resumed: true });
-	assert.equal(p, "Slack reply (channel: C9, thread: 1.2):\n\nhi\n\nReply in Slack channel C9, thread 1.2.");
+	assert.equal(p, `Slack reply (channel: C9, thread: 1.2):\n\nhi\n\nReply in Slack channel C9, thread 1.2. ${PROGRESS_NOTE}`);
 });
 
 test("the scheduler key is unique per fire and never looks like a Slack ts", () => {
 	const k = scheduledThreadKey("x", 5);
 	assert.equal(k, "scheduled_x_5");
 	assert.ok(!/^\d+\.\d+$/.test(k));
+});
+
+// Nitay 2026-11-23: every agent works the way Sasha does in Slack: a short line on what it is doing
+// before work that takes more than a minute, a short update every few minutes in long work.
+test("every Slack thread run is told to say what it is doing before long work and to update during it", () => {
+	assert.match(PROGRESS_NOTE, /more than about a minute/);
+	assert.match(PROGRESS_NOTE, /every few minutes/);
+	assert.match(PROGRESS_NOTE, /quick answer/i);
+	for (const p of [
+		buildSlackPrompt({ channel: "C9", threadTs: "1.2", message: "hi" }),
+		buildSlackPrompt({ channel: "C9", threadTs: "1.2", message: "hi", resumed: true }),
+	]) assert.ok(p.endsWith(PROGRESS_NOTE));
+});
+
+test("a scheduled run and a mid-run message do not get the progress note", () => {
+	assert.ok(!buildSlackPrompt({ channel: "C1", threadTs: scheduledThreadKey("x", 1), message: "m" }).includes(PROGRESS_NOTE));
+	assert.ok(!buildMidRunPrompt({ channel: "C1", threadTs: "1.2", message: "m" }).includes(PROGRESS_NOTE));
 });
