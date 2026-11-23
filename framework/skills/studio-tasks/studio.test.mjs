@@ -60,6 +60,7 @@ test("open without a Slack message works: a stable anchor from the title, one ch
 	assert.match(args.title, /^Adam: Fix X/);
 	assert.equal(f.calls.filter((c) => c.url.includes("slack.com")).length, 0, "Adam tells Nitay himself; no Slack post");
 	assert.deepEqual(anchorFor("Fix X"), anchorFor("Fix X"));
+	assert.doesNotMatch(args.message, /no-slack/, "no made-up link in the Studio message");
 });
 
 test("config: only the agent's own key, and no Slack at all for either agent (no self-relay, no 'no-slack' posts)", () => {
@@ -86,17 +87,20 @@ test("Shai and Adam: open, check and done never post to Slack; a reply shows onc
 	const cfg = configFrom(profileFor("shai"), creds);
 	const f = fakeFetch({
 		create_chat: () => ({ id: "op1", chatId: "c9", url: "/?chat=c9" }),
-		read_inbox: () => ({ messages: [{ sequence: 1, chatId: "c9", text: "Which order number?", createdAt: new Date().toISOString() }], nextCursor: "k1" }),
+		search_chat_history: () => ({ text: "No matches for: STUDIO-STATUS" }),
+		read_inbox: () => ({ messages: [{ sequence: 1, chatId: "c9", text: "Which order number?", createdAt: Date.now() }], nextCursor: "k1" }),
 	});
 	const rec = await openTask(profileFor("shai"), cfg, state, { project: "p", title: "T", body: "b" }, f);
 	const { checkBugs, skipItems, loadState } = await import("./studio-core.mjs");
 	const r1 = await checkBugs(profileFor("shai"), cfg, state, { post: false }, f);
 	assert.equal(f.calls.filter((c) => c.url.includes("slack.com")).length, 0);
-	const pend = loadState(state).bugs.find((b) => b.id === rec.id).pending;
+	assert.deepEqual(r1.errors, []);
+	assert.equal(r1.news.length, 1);
+	assert.equal(loadState(state).bugs.find((b) => b.id === rec.id).pending.length, 1);
 	skipItems(state, { id: rec.id });
 	assert.equal(loadState(state).bugs.find((b) => b.id === rec.id).pending.length, 0);
-	assert.ok(Array.isArray(r1.news));
-	assert.ok(pend.length <= 1);
+	const r2 = await checkBugs(profileFor("shai"), cfg, state, { post: false }, f);
+	assert.equal(r2.news.length, 0, "a handled reply never shows again");
 });
 
 test("a task closed as fixed and opened again with the same title gets a new Studio chat", async () => {

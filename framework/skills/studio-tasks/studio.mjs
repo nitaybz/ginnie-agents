@@ -32,7 +32,7 @@ export function buildStudioMessage(profile, { title, body, slackLink }) {
 		`Developer task from ${profile.displayName} (${profile.role}): ${title}`,
 		"",
 		String(body || "").trim(),
-		...(slackLink ? ["", `Context: ${slackLink}`] : []),
+		...(slackLink && !/^no-slack\//.test(slackLink) ? ["", `Context: ${slackLink}`] : []),
 		"",
 		`If you need anything (data, examples, a decision), reply here and ${profile.displayName} will answer or ask Nitay.`,
 		`${profile.displayName} reads your replies regularly and tells Nitay what you did.`,
