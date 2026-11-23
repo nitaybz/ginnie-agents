@@ -62,17 +62,57 @@ test("open without a Slack message works: a stable anchor from the title, one ch
 	assert.deepEqual(anchorFor("Fix X"), anchorFor("Fix X"));
 });
 
-test("config: each agent has its own studio_mcp_token in its credentials.json; Adam never relays to himself", () => {
+test("config: only the agent's own key, and no Slack at all for either agent (no self-relay, no 'no-slack' posts)", () => {
 	const d = tmp();
 	const creds = path.join(d, "credentials.json");
 	writeFileSync(creds, JSON.stringify({ studio_mcp_token: "abc", slack_bot_token: "x", handoff_channel: "C1" }));
-	const adam = configFrom(profileFor("adam"), creds);
-	assert.equal(adam.token, "abc");
-	assert.equal(adam.slackToken, null);
-	assert.equal(adam.handoffChannel, null);
-	const shai = configFrom(profileFor("shai"), creds);
-	assert.equal(shai.slackToken, "x");
-	assert.equal(shai.handoffChannel, "C1");
+	process.env.STUDIO_MCP_TOKEN = "from-env";
+	for (const a of ["adam", "shai"]) {
+		const c = configFrom(profileFor(a), creds);
+		assert.equal(c.token, "abc");
+		assert.equal(c.slackToken, null);
+		assert.equal(c.handoffChannel, null);
+	}
+	writeFileSync(creds, JSON.stringify({}));
+	assert.equal(configFrom(profileFor("adam"), creds).token, null, "never another agent's key from the environment");
+	delete process.env.STUDIO_MCP_TOKEN;
+});
+
+test("Shai and Adam: open, check and done never post to Slack; a reply shows once, and not again after done", async () => {
+	const d = tmp();
+	const state = path.join(d, "s.json");
+	const creds = path.join(d, "credentials.json");
+	writeFileSync(creds, JSON.stringify({ studio_mcp_token: "abc", slack_bot_token: "x", handoff_channel: "C1" }));
+	const cfg = configFrom(profileFor("shai"), creds);
+	const f = fakeFetch({
+		create_chat: () => ({ id: "op1", chatId: "c9", url: "/?chat=c9" }),
+		read_inbox: () => ({ messages: [{ sequence: 1, chatId: "c9", text: "Which order number?", createdAt: new Date().toISOString() }], nextCursor: "k1" }),
+	});
+	const rec = await openTask(profileFor("shai"), cfg, state, { project: "p", title: "T", body: "b" }, f);
+	const { checkBugs, skipItems, loadState } = await import("./studio-core.mjs");
+	const r1 = await checkBugs(profileFor("shai"), cfg, state, { post: false }, f);
+	assert.equal(f.calls.filter((c) => c.url.includes("slack.com")).length, 0);
+	const pend = loadState(state).bugs.find((b) => b.id === rec.id).pending;
+	skipItems(state, { id: rec.id });
+	assert.equal(loadState(state).bugs.find((b) => b.id === rec.id).pending.length, 0);
+	assert.ok(Array.isArray(r1.news));
+	assert.ok(pend.length <= 1);
+});
+
+test("a task closed as fixed and opened again with the same title gets a new Studio chat", async () => {
+	const state = path.join(tmp(), "s.json");
+	let n = 0;
+	const f = fakeFetch({ create_chat: () => ({ id: `op${++n}`, chatId: `c${n}`, url: `/?chat=c${n}` }) });
+	const cfg = { mcpUrl: "https://studio.example/mcp", token: "t", origin: "https://studio.example", slackToken: null };
+	const a = await openTask(profileFor("adam"), cfg, state, { project: "p", title: "Same", body: "b" }, f);
+	const s = JSON.parse(readFileSync(state, "utf8"));
+	s.bugs[0].status = "fixed";
+	writeFileSync(state, JSON.stringify(s));
+	const b = await openTask(profileFor("adam"), cfg, state, { project: "p", title: "Same", body: "b" }, f);
+	assert.notEqual(b.id, a.id);
+	assert.equal(b.chatId, "c2");
+	const c = await openTask(profileFor("adam"), cfg, state, { project: "p", title: "Same", body: "b" }, f);
+	assert.equal(c.id, b.id, "while the new one is open, no third chat");
 });
 
 test("no token: exits 3 with a plain line saying where Nitay pastes the key, and never prints a token", () => {
@@ -86,7 +126,10 @@ test("no token: exits 3 with a plain line saying where Nitay pastes the key, and
 });
 
 test("the core is the same file as Omer's (when the agents folder is next to it)", () => {
-	const omer = path.join(HERE, "..", "..", "..", "agents", "omer", "skills", "studio-tasks", "studio-core.mjs");
-	if (!existsSync(omer)) return;
+	let omer = path.join(HERE, "..", "..", "..", "agents", "omer", "skills", "studio-tasks", "studio-core.mjs");
+	const main = path.join(process.env.HOME || "", "Projects", "Ginnie Repos", "ginnie-agents", "agents", "omer", "skills", "studio-tasks", "studio-core.mjs");
+	const src = existsSync(omer) ? omer : main;
+	assert.ok(existsSync(src), "Omer's studio-core.mjs must be reachable to compare");
+	omer = src;
 	assert.equal(readFileSync(path.join(HERE, "studio-core.mjs"), "utf8"), readFileSync(omer, "utf8"));
 });

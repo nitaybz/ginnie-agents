@@ -11,8 +11,8 @@
 //   node studio.mjs check                                          new Studio replies (news)
 //   node studio.mjs pending | list
 //   node studio.mjs reply --id <id> --text "<answer>"              answer Studio in its chat
-//   node studio.mjs skip  --id <id>                                nothing worth telling
-//   node studio.mjs tell|ask --id <id> --text "<Hebrew>"           Shai only: one line to Nitay through Adam
+
+//   node studio.mjs done  --id <id>                                handled (told Nitay, answered, or nothing): never shows again
 // The agent comes from --agent or $AGENT_NAME (set by the listener).
 //
 // Key: each agent has its own Studio access key, created by Nitay only, in that agent's
@@ -23,8 +23,8 @@ import { pathToFileURL } from "node:url";
 import * as core from "./studio-core.mjs";
 
 const PROFILES = {
-	adam: { name: "Adam", role: "office agent: books, iCount, office mail, suppliers", he: "אדם", relay: false },
-	shai: { name: "Shai", role: "SmartShop customer and shop-orders agent", he: "שי", relay: true },
+	adam: { name: "Adam", role: "office agent: books, iCount, office mail, suppliers" },
+	shai: { name: "Shai", role: "SmartShop customer and shop-orders agent" },
 };
 
 export function buildStudioMessage(profile, { title, body, slackLink }) {
@@ -50,7 +50,6 @@ export function profileFor(agent) {
 		agent: key,
 		displayName: p.name,
 		role: p.role,
-		relay: p.relay,
 		logTag: `studio-tasks(${key})`,
 		stateFile: "/workspace/data/studio-tasks.json",
 		titlePrefix: p.name,
@@ -65,27 +64,32 @@ export function profileFor(agent) {
 }
 
 // The core keys a task by a Slack message. A task opened without one gets a stable stand-in from its
-// title, so the same task is never opened twice.
-export function anchorFor(title) {
-	return { channel: "no-slack", ts: createHash("sha256").update(String(title)).digest("hex").slice(0, 16), permalink: null };
+// title, so the same open task is never opened twice; `round` gives a new one after the old one closed.
+export function anchorFor(title, round = 0) {
+	return { channel: "no-slack", ts: createHash("sha256").update(`${title}${round ? `#${round}` : ""}`).digest("hex").slice(0, 16), permalink: null };
 }
+const recordId = (title, a) => createHash("sha256").update(`${a.channel}|${a.ts}|${title}`).digest("hex").slice(0, 16);
 
-// Adam tells Nitay himself in WhatsApp, so his config has no Slack relay (a relay would go to himself).
+// This tool posts nothing to Slack: the agent tells Nitay itself (Adam in WhatsApp, Shai through her own
+// line to Adam). With no Slack token the core never posts (no relay from Adam to himself, no "no-slack"
+// thread). The key comes only from this agent's own credentials.json.
 export function configFrom(profile, credsFile) {
 	const creds = credsFile && existsSync(credsFile) ? JSON.parse(readFileSync(credsFile, "utf8")) : {};
 	const mcpUrl = creds.studio_mcp_url || core.DEFAULT_MCP_URL;
-	return {
-		mcpUrl,
-		token: creds.studio_mcp_token || process.env.STUDIO_MCP_TOKEN || null,
-		origin: new URL(mcpUrl).origin,
-		alertChannel: profile.relay ? creds.alert_slack_user || core.NITAY_SLACK_ID : null,
-		slackToken: profile.relay ? creds.slack_bot_token || null : null,
-		handoffChannel: profile.relay ? creds.handoff_channel || null : null,
-	};
+	return { mcpUrl, token: creds.studio_mcp_token || null, origin: new URL(mcpUrl).origin, alertChannel: null, slackToken: null, handoffChannel: null };
 }
 
 export async function openTask(profile, cfg, stateFile, { project, title, body, nitayText = null, slack = null }, fetchFn = fetch) {
-	return core.openBug(profile, cfg, stateFile, { project, title, body, nitayText, slack: slack || anchorFor(title) }, fetchFn);
+	let anchor = slack;
+	if (!anchor) {
+		const bugs = core.loadState(stateFile).bugs;
+		for (let round = 0; ; round++) {
+			anchor = anchorFor(title, round);
+			const rec = bugs.find((b) => b.id === recordId(title, anchor));
+			if (!rec || rec.status === "open") break;
+		}
+	}
+	return core.openBug(profile, cfg, stateFile, { project, title, body, nitayText, slack: anchor }, fetchFn);
 }
 
 function parseArgs(argv) {
@@ -108,15 +112,9 @@ async function main(argv) {
 	const print = (o) => console.log(JSON.stringify(o, null, 2));
 	if (cmd === "list") return print(core.loadState(stateFile));
 	if (cmd === "pending") return print(core.pendingWork(stateFile));
-	if (cmd === "skip") return print(core.skipItems(stateFile, { id: str(a.id), keys: str(a.keys)?.split(",") || null }));
-	if ((cmd === "tell" || cmd === "ask") && !profile.relay) {
-		console.error(`${profile.logTag}: ${profile.displayName} tells Nitay himself (WhatsApp); tell/ask are for agents that go through Adam.`);
-		process.exit(2);
-	}
-	if (cmd === "tell" || cmd === "ask") {
-		const text = str(a["text-file"]) ? readFileSync(a["text-file"], "utf8") : str(a.text);
-		return print(await (cmd === "tell" ? core.tellNitay : core.askNitay)(cfg, stateFile, { id: str(a.id), text, keys: str(a.keys)?.split(",") || null }));
-	}
+	const keys = str(a.keys) ? str(a.keys).split(",").map((k) => k.trim()).filter(Boolean) : null;
+	// "done" = handled: you told Nitay yourself, answered, or it was nothing. It never shows again.
+	if (cmd === "skip" || cmd === "done") return print(core.skipItems(stateFile, { id: str(a.id), keys }));
 	if (!cfg.token) { console.error(profile.noTokenMessage); process.exit(3); }
 	if (cmd === "projects") return print(await core.mcpCall(cfg, "list_projects", {}));
 	if (cmd === "open") {
@@ -133,9 +131,9 @@ async function main(argv) {
 	}
 	if (cmd === "reply") {
 		const text = str(a["text-file"]) ? readFileSync(a["text-file"], "utf8") : str(a.text);
-		return print(await core.replyStudio(profile, cfg, stateFile, { id: str(a.id), text, keys: str(a.keys)?.split(",") || null, answer: !!a.answer }));
+		return print(await core.replyStudio(profile, cfg, stateFile, { id: str(a.id), text, keys, answer: false }));
 	}
-	console.error("usage: studio.mjs projects | open --project <slug> --title \"..\" --body-file <f> [--nitay \"..\"] | check | pending | list | reply --id <id> --text \"..\" | skip --id <id> | tell|ask (Shai only)");
+	console.error("usage: studio.mjs projects | open --project <slug> --title \"..\" --body-file <f> | check | pending | list | reply --id <id> --text \"..\" | done --id <id>");
 	process.exit(2);
 }
 

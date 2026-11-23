@@ -14,17 +14,20 @@ node $S projects                                    # once: which Studio project
 node $S open --project <slug> --title "<short English title>" --body-file /tmp/task.md --nitay "<one plain Hebrew line>"
 node $S check                                       # Studio's new replies (news) for your tasks
 node $S reply --id <id> --text "<answer, with facts>"
-node $S skip  --id <id>                             # a reply with nothing worth telling
+node $S done  --id <id>                             # handled: told Nitay, answered, or nothing to tell
 node $S list | pending
 ```
 
 - The body file: what is wrong or missing, a real example (dates, numbers, what you saw), what done
   looks like. No customer phone numbers or emails, no tokens.
 - One task per problem: `open` with the same title again does nothing. Add to an open task with `reply`.
-- Tell Nitay once, in plain short Hebrew, what you opened and why, with the link the tool prints.
-  Adam: in his private WhatsApp. Shai: `tell` / `ask` (they go to Nitay through Adam).
+- This tool posts nothing to Slack or WhatsApp. Tell Nitay yourself, once, in plain short Hebrew, what
+  you opened and why, with the link the tool prints (Adam: his private WhatsApp; Shai: her usual
+  line to Adam).
 - Run `check` in your regular rounds. For each news item: Studio asks something you know, `reply`;
-  only Nitay knows, ask him in one plain question; progress or done, tell him one plain sentence.
+  only Nitay knows, ask him in one plain question and pass his answer with `reply`; progress or done,
+  tell him one plain sentence. Then `done --id <id>`, or the same news shows again next round.
+- A task that was closed (fixed / won't fix) and comes back: `open` with the same title opens a new chat.
 
 ## The key
 
