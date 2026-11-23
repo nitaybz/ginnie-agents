@@ -12,15 +12,15 @@ import { buildMessage, postReport } from "./report.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SPEC = {
-	title: "Cash: 12K better than last week",
+	title: "Bank: 43.5K better than last week",
 	fields: [
-		{ label: "Balance", value: "-40K" },
-		{ label: "Credit limit", value: "80K" },
-		{ label: "In from customers", value: "+25K" },
-		{ label: "Out", value: "-6K" },
+		{ label: "Bank balance", value: "-56K" },
+		{ label: "Credit limit", value: "100K" },
+		{ label: "In from customers", value: "+50K" },
+		{ label: "Out", value: "-3K" },
 	],
 	note: "Invoicing this month is thin, so this room may not last.",
-	context: "Biggest payment in: 15K on 3 Mar",
+	context: "Biggest payment in: 30K on 16 Nov",
 };
 
 test("a card: header, the numbers as fields, the note, a small context line", () => {
@@ -28,11 +28,11 @@ test("a card: header, the numbers as fields, the note, a small context line", ()
 	assert.deepEqual(m.blocks.map((b) => b.type), ["header", "section", "section", "context"]);
 	assert.equal(m.blocks[0].text.type, "plain_text");
 	assert.equal(m.blocks[0].text.text, SPEC.title);
-	assert.deepEqual(m.blocks[1].fields[0], { type: "mrkdwn", text: "*Balance*\n-40K" });
+	assert.deepEqual(m.blocks[1].fields[0], { type: "mrkdwn", text: "*Bank balance*\n-56K" });
 	assert.equal(m.blocks[2].text.text, SPEC.note);
 	assert.equal(m.blocks[3].elements[0].text, SPEC.context);
-	assert.match(m.text, /Cash: 12K better/, "a plain fallback for notifications");
-	assert.match(m.text, /Balance: -40K/);
+	assert.match(m.text, /Bank: 43\.5K better/, "a plain fallback for notifications");
+	assert.match(m.text, /Bank balance: -56K/);
 });
 
 test("more than 10 numbers are split into sections of 10 (Slack's limit)", () => {
@@ -91,4 +91,10 @@ test("CLI --dry-run prints the blocks and posts nothing", () => {
 	assert.equal(JSON.parse(r.stdout).blocks[0].type, "header");
 	const bad = spawnSync(process.execPath, [path.join(here, "report.mjs"), "--channel", "C1", "--spec", spec], { encoding: "utf8", env: { ...process.env, SLACK_BOT_TOKEN: "" } });
 	assert.equal(bad.status, 1, "no token: refuses");
+});
+
+test("note and context from data never become a mention or a link", () => {
+	const m = buildMessage({ title: "T", note: "ping <!channel> and <@U123>", context: "<http://x|y>" });
+	const flat = JSON.stringify(m.blocks);
+	assert.equal(/<!channel>|<@U123>|<http/.test(flat), false);
 });

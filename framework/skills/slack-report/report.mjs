@@ -11,6 +11,8 @@ const LIMITS = { title: 150, label: 40, value: 60, fields: 20, perSection: 10, n
 
 // Data never becomes a mention, a link or formatting: strip Slack's control syntax.
 const safe = (s) => String(s).replace(/[<>]/g, "").replace(/[*_~`]/g, "").trim();
+// Note and context keep *bold* and _italic_, but never a mention or a link.
+const noLinks = (s) => String(s).replace(/[<>]/g, "").trim();
 
 export function buildMessage(spec) {
 	const s = spec || {};
@@ -22,9 +24,9 @@ export function buildMessage(spec) {
 		if (!f || typeof f.label !== "string" || !f.label.trim() || f.label.length > LIMITS.label) throw new Error(`each field needs a label of at most ${LIMITS.label} characters`);
 		if (f.value == null || String(f.value).trim() === "" || String(f.value).length > LIMITS.value) throw new Error(`each value is a short number or phrase, at most ${LIMITS.value} characters`);
 	}
-	const note = typeof s.note === "string" ? s.note.trim() : "";
+	const note = typeof s.note === "string" ? noLinks(s.note) : "";
 	if (note.length > LIMITS.note || note.split("\n").length > LIMITS.noteLines) throw new Error(`note: at most ${LIMITS.noteLines} short lines (${LIMITS.note} characters)`);
-	const context = typeof s.context === "string" ? s.context.trim().slice(0, LIMITS.context) : "";
+	const context = typeof s.context === "string" ? noLinks(s.context).slice(0, LIMITS.context) : "";
 
 	const blocks = [{ type: "header", text: { type: "plain_text", text: title, emoji: true } }];
 	for (let i = 0; i < fields.length; i += LIMITS.perSection) {
@@ -32,7 +34,7 @@ export function buildMessage(spec) {
 	}
 	if (note) blocks.push({ type: "section", text: { type: "mrkdwn", text: note } });
 	if (context) blocks.push({ type: "context", elements: [{ type: "mrkdwn", text: context }] });
-	const text = [title, ...fields.map((f) => `${f.label}: ${f.value}`), note].filter(Boolean).join("\n");
+	const text = [noLinks(title), ...fields.map((f) => `${noLinks(f.label)}: ${noLinks(f.value)}`), note].filter(Boolean).join("\n");
 	return { text, blocks };
 }
 
