@@ -28,6 +28,7 @@ import { WakeInbox } from "./wake-inbox";
 import { getSenderInfo, formatSenderLine, slackUserIsBot } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
+import { FORM_CALLBACK, FormStore, defaultFormStateFile, formAnswerers, handleFormInteraction, handleFormSubmit, isFormInteraction, type FormDeps } from "./agent-forms";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
 import { listenerConversationRuns } from "./conversation-runs";
 import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger, fetchMedia, mediaUrl } from "./whatsapp-trigger";
@@ -95,6 +96,27 @@ const midRunInboxes = new Map<string, MidRunInbox<QueuedMessage>>();
 
 // One Bolt App per agent (keyed by agent name)
 const apps = new Map<string, App>();
+
+// Agent forms (agent-forms.ts): a button that opens a modal with many questions, answered in one submit.
+// On disk, so a listener restart still knows which forms were answered.
+const formStore = new FormStore(defaultFormStateFile());
+function formDeps(agent: AgentConfig, app: App): FormDeps {
+	return {
+		agent,
+		token: agent.slackBotToken,
+		client: app.client as any,
+		store: formStore,
+		canAnswer: (userId) => formAnswerers(agent, getKnownUsersFor(agent)).includes(userId),
+		sender: async (userId) => {
+			const s = await getSenderInfo(app, userId, agent);
+			return { ok: passesSenderPolicy(agent, s), line: formatSenderLine(s) };
+		},
+		deliver: (m) => enqueueOrProcess({
+			agent, channel: m.channel, threadTs: m.threadTs, message: m.message,
+			isThreadReply: true, messageTs: m.threadTs, userId: m.userId, senderLine: m.senderLine,
+		}),
+	};
+}
 
 function threadKey(channel: string, threadTs: string): string {
 	return `${channel}:${threadTs}`;
@@ -333,6 +355,12 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 	app.action(/.*/, async ({ action, body, ack }: any) => {
 		await ack();
 
+		// Agent forms: the button opens the modal, a choice inside it redraws it (agent-forms.ts).
+		if (isFormInteraction(action, body)) {
+			await handleFormInteraction(formDeps(agent, app), body, action);
+			return;
+		}
+
 		const channel = body.channel?.id;
 		const threadTs = body.message?.thread_ts || body.message?.ts;
 		const messageTs = body.message?.ts;
@@ -419,6 +447,11 @@ function wireAgentApp(agent: AgentConfig, app: App): void {
 			isThreadReply: true, messageTs: messageTs || "",
 			userId: userId || "", senderLine,
 		});
+	});
+
+	// Agent forms: the submit hands every answer to the agent at once, at most once per form.
+	app.view(FORM_CALLBACK, async ({ ack, body }: any) => {
+		await handleFormSubmit(formDeps(agent, app), body, ack);
 	});
 }
 

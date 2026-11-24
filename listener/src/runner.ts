@@ -75,6 +75,8 @@ export interface AgentConfig {
 	midrunMessages?: boolean;
 	model?: string;
 	buttonTtlHours: number;
+	/** config.json "form_answerers": Slack user ids who may open and submit this agent's forms (agent-forms.ts). Missing = the founders in known-users.json. */
+	formAnswerers?: string[];
 	// Optional WhatsApp access + wake-up (config.json "whatsapp"; token in
 	// credentials.json "whatsapp_token"). See whatsapp-trigger.ts.
 	whatsapp?: WhatsAppConfig;
@@ -231,6 +233,7 @@ interface AgentManifest {
 	midrun_messages?: boolean;
 	model?: string;
 	button_ttl_hours?: number;
+	form_answerers?: unknown;
 	whatsapp?: unknown;
 	extra_mounts?: unknown;
 	accept_bots?: unknown;
@@ -359,6 +362,9 @@ export function loadAgents(): AgentConfig[] {
 			buttonTtlHours: typeof manifest.button_ttl_hours === "number" && manifest.button_ttl_hours > 0
 				? manifest.button_ttl_hours
 				: DEFAULT_BUTTON_TTL_HOURS,
+			formAnswerers: Array.isArray(manifest.form_answerers)
+				? manifest.form_answerers.filter((x): x is string => typeof x === "string")
+				: undefined,
 			whatsapp: parseWhatsAppConfig(manifest.whatsapp),
 			whatsappToken,
 			extraMounts: checkHostPaths(
