@@ -183,6 +183,29 @@ export function profileEnv(agent: AgentConfig, profile?: string): string[] {
 	return args;
 }
 
+/** Choices a caller makes for one run. */
+export interface RunOptions {
+	/**
+	 * Keep the run open for more messages after its answer, for as long as its
+	 * profile's linger_minutes says. Off unless asked: the listener reads a
+	 * run's result only when the container exits, so only conversation runs
+	 * (conversation-runs.ts) ask for it.
+	 */
+	linger?: boolean;
+}
+
+/** The agent as one run sees it: no open-run wait unless the run asked for it. Never changes the loaded config. */
+export function agentForRun(agent: AgentConfig, opts: RunOptions = {}): AgentConfig {
+	if (opts.linger || !agent.runProfiles) return agent;
+	if (!Object.values(agent.runProfiles).some((p) => p.lingerMinutes)) return agent;
+	const runProfiles: Record<string, RunProfile> = {};
+	for (const [name, p] of Object.entries(agent.runProfiles)) {
+		const { lingerMinutes: _wait, ...rest } = p;
+		runProfiles[name] = rest;
+	}
+	return { ...agent, runProfiles };
+}
+
 interface AgentManifest {
 	slack_bot_id?: string;
 	slack_channel?: string;
@@ -354,8 +377,9 @@ export async function runAgent(
 	midrunDir?: string,
 	// Kind of run (a key of config.json "run_profiles"); none = agent defaults.
 	profile?: string,
+	opts?: RunOptions,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, undefined, origin, midrunDir, profile);
+	return spawnContainer(agent, message, undefined, origin, midrunDir, profile, opts);
 }
 
 /**
@@ -368,8 +392,9 @@ export async function resumeAgent(
 	origin: DeliveryOrigin = "slack",
 	midrunDir?: string,
 	profile?: string,
+	opts?: RunOptions,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, sessionId, origin, midrunDir, profile);
+	return spawnContainer(agent, message, sessionId, origin, midrunDir, profile, opts);
 }
 
 /**
@@ -402,7 +427,10 @@ async function spawnContainer(
 	origin: DeliveryOrigin = "slack",
 	midrunDir?: string,
 	profile?: string,
+	opts?: RunOptions,
 ): Promise<AgentRunResult> {
+	// The open-run wait only for a run that asked for it (RunOptions.linger).
+	const runAgentCfg = agentForRun(agent, opts);
 	if (profile && !agent.runProfiles?.[profile]) {
 		console.warn(`[${agent.name}] Run profile "${profile}" is not in config.json run_profiles; using the agent defaults`);
 	}
@@ -416,7 +444,7 @@ async function spawnContainer(
 			// A continuation resumes the limited try's session on the next
 			// account instead of replaying the original request.
 			attempt: (account, cont) =>
-				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont, midrunDir, profile),
+				spawnAttempt(runAgentCfg, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont, midrunDir, profile),
 			log: (line) => console.log(`[${agent.name}] ${line}`),
 		});
 	} catch (err) {
