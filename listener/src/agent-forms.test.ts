@@ -5,11 +5,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync } from "fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import {
-	FORM_CALLBACK, FORM_OPEN_ACTION, OTHER_VALUE, FormStore, buildFormView, collectAnswers, formAnswerers,
+	FORM_CALLBACK, FORM_OPEN_ACTION, OTHER_VALUE, FormDrafts, FormStore, answersPath, buildFormView, expiredFormBlocks, replayPendingAnswers, collectAnswers, formAnswerers,
 	handleFormInteraction, handleFormSubmit, isFormInteraction, parseForm, type FormDeps,
 } from "./agent-forms";
 
@@ -30,7 +30,7 @@ function formFile(extra: Record<string, unknown> = {}) {
 		texts: {
 			submit: "שלח", close: "ביטול", other: "אחר", other_label: "כתוב את הקטגוריה או ההסבר",
 			select_label: "קטגוריה", not_allowed: "רק ניתאי יכול לענות על הטופס הזה",
-			answered: "נענה ✓ {answered} מתוך {total}", expired: "הטופס הזה כבר לא בתוקף",
+			answered: "נענה ✓ {answered} מתוך {total}", expired: "הטופס הזה כבר לא בתוקף", empty: "לא נבחרה אף תשובה",
 		},
 		questions: [
 			{ id: "ROW1", title: "1. ספק לדוגמה, 1,000 ₪", context: "1.1.26, העברה בבנק. על מה ההעברה?", options: OUT },
@@ -63,6 +63,7 @@ function setup(file = formFile()) {
 			},
 		},
 		store: new FormStore(storeFile),
+		drafts: new FormDrafts(),
 		canAnswer: (u) => u === NITAY,
 		sender: async (u) => ({ ok: true, line: `From: ${u === NITAY ? "Nitay" : "x"} | role: founder | slack_id: ${u}` }),
 		deliver: (m) => { calls.deliver.push(m); },
@@ -291,7 +292,8 @@ test("a second submit of the same form is ignored, also after a listener restart
 test("a submit with nothing answered delivers nothing and keeps the button usable", async () => {
 	const s = setup(formFile({ questions: (formFile().questions as any[]).map((q: any) => ({ ...q, initial: undefined })) }));
 	const view = await openModal(s);
-	await submit(s, view, stateOf(view, {}));
+	const acked = await submit(s, view, stateOf(view, {}));
+	assert.deepEqual(acked, { response_action: "errors", errors: { "s:ROW1": "לא נבחרה אף תשובה" } }, "a short note, the modal stays open");
 	assert.equal(s.calls.deliver.length, 0);
 	assert.equal(new FormStore(s.storeFile).get("casper", "books-20261124")?.status, "open");
 });
@@ -344,4 +346,132 @@ test("old state entries are dropped after 30 days", () => {
 	const again = new FormStore(s.storeFile, () => NOW);
 	assert.equal(again.get("casper", "old"), undefined);
 	assert.equal(again.get("casper", "new")?.ts, "2");
+});
+
+test("the answers are on disk before Slack hears the submit, and a restart hands them over again until applied", async () => {
+	const s = setup();
+	const view = await openModal(s);
+	let savedAtAck = false;
+	await handleFormSubmit(s.deps, { type: "view_submission", user: { id: NITAY }, view: { ...view, state: { values: stateOf(view, { ROW1: "stock" }) } } },
+		async () => { savedAtAck = existsSync(answersPath(s.agentDir, "books-20261124")); });
+	assert.ok(savedAtAck, "saved before the ack");
+	const saved = JSON.parse(readFileSync(answersPath(s.agentDir, "books-20261124"), "utf8"));
+	assert.deepEqual(saved.answers.ROW1, { question: "1. ספק לדוגמה, 1,000 ₪", choice: "stock", label: "רכש סחורה וציוד" });
+	assert.equal(saved.ts, "1795.1");
+	// The listener restarts before the agent ran: the delivered message lived only in memory.
+	const again: any[] = [];
+	assert.equal(replayPendingAnswers(s.agentDir, (m) => again.push(m), NOW + 60_000, () => {}), 1);
+	assert.equal(again[0].threadTs, "1795.1");
+	assert.equal(again[0].userId, NITAY);
+	assert.match(again[0].senderLine, /slack_id: U_NITAY/);
+	assert.match(again[0].message, /Delivered again/);
+	assert.match(again[0].message, /form: books-20261124/);
+	// At most 3 times, and never once the agent marked them applied.
+	replayPendingAnswers(s.agentDir, (m) => again.push(m), NOW + 60_000, () => {});
+	replayPendingAnswers(s.agentDir, (m) => again.push(m), NOW + 60_000, () => {});
+	assert.equal(replayPendingAnswers(s.agentDir, (m) => again.push(m), NOW + 60_000, () => {}), 0);
+	const s2 = setup();
+	const v2 = await openModal(s2);
+	await submit(s2, v2, stateOf(v2, { ROW1: "stock" }));
+	const p = answersPath(s2.agentDir, "books-20261124");
+	writeFileSync(p, JSON.stringify({ ...JSON.parse(readFileSync(p, "utf8")), applied_at: "2026-11-24T10:05:00Z" }));
+	assert.equal(replayPendingAnswers(s2.agentDir, () => {}, NOW + 60_000, () => {}), 0);
+});
+
+test("a replaced or expired form is refused also at submit", async () => {
+	for (const extra of [{ superseded: true }, { expires_at: new Date(NOW - 1000).toISOString() }]) {
+		const s = setup();
+		const view = await openModal(s);
+		writeFileSync(path.join(s.agentDir, "data", "forms", "books-20261124.json"), JSON.stringify(formFile(extra)));
+		const acked = await submit(s, view, stateOf(view, { ROW1: "stock" }));
+		assert.deepEqual(acked, { response_action: "errors", errors: { "s:ROW1": "הטופס הזה כבר לא בתוקף" } });
+		assert.equal(s.calls.deliver.length, 0);
+		assert.ok(!existsSync(answersPath(s.agentDir, "books-20261124")));
+	}
+});
+
+test("a state file that cannot be read refuses forms instead of starting empty", async () => {
+	const s = setup();
+	mkdirSync(path.dirname(s.storeFile), { recursive: true });
+	writeFileSync(s.storeFile, "{ broken");
+	s.deps.store = new FormStore(s.storeFile);
+	assert.equal(s.deps.store.broken, true);
+	const { action, body } = clickBody();
+	await handleFormInteraction(s.deps, body, action);
+	assert.equal(s.calls.open.length, 0);
+	const view = buildFormView(parseForm(formFile())!, JSON.stringify({ f: "books-20261124", c: "C_STRATEGY", t: "1795.1" }), {}, {});
+	const acked = await submit(s, view, stateOf(view, { ROW1: "stock" }));
+	assert.equal(acked.response_action, "errors");
+	assert.equal(s.calls.deliver.length, 0);
+	assert.equal(readFileSync(s.storeFile, "utf8"), "{ broken", "the file is left for a person to fix");
+});
+
+test("without a saved copy of the post, the submit leaves the post alone", async () => {
+	const s = setup();
+	const view = buildFormView(parseForm(formFile())!, JSON.stringify({ f: "books-20261124", c: "C_STRATEGY", t: "1795.1" }), {}, {});
+	await submit(s, view, stateOf(view, { ROW1: "stock" }));
+	assert.equal(s.calls.deliver.length, 1);
+	assert.equal(s.calls.chatUpdate.length, 0, "never overwrite the post with only a status line");
+});
+
+test("two fast 'other' picks both get their box (redraws in order, from every pick, retried on a hash conflict)", async () => {
+	const s = setup(formFile({ questions: (formFile().questions as any[]).map((q: any) => ({ ...q, initial: undefined })) }));
+	const view = await openModal(s);
+	let hash = "h1";
+	let n = 0;
+	s.deps.client.views.update = async (a: any) => {
+		s.calls.update.push(a);
+		await new Promise((r) => setTimeout(r, 15));
+		if (a.hash && a.hash !== hash) throw Object.assign(new Error("hash_conflict"), { data: { error: "hash_conflict" } });
+		hash = `h${++n + 1}`;
+		return { ok: true, view: { hash } };
+	};
+	const pick = (q: string, values: any) => {
+		const action = { type: "static_select", action_id: "choice", block_id: `s:${q}`, selected_option: { value: OTHER_VALUE } };
+		return handleFormInteraction(s.deps, { type: "block_actions", user: { id: NITAY }, view: { ...view, id: "V1", hash: "h1", state: { values } }, actions: [action] }, action);
+	};
+	// Both payloads show the modal as first drawn (the second click came before the first redraw).
+	// The second arrives while the first redraw is on its way, and its payload does not show the first pick.
+	const first = pick("ROW1", stateOf(view, { ROW1: OTHER_VALUE }));
+	await new Promise((r) => setTimeout(r, 5));
+	await Promise.all([first, pick("ROW3", stateOf(view, { ROW3: OTHER_VALUE }))]);
+	assert.equal(s.calls.update.length, 2);
+	const last = s.calls.update[1].view.blocks.map((b: any) => b.block_id);
+	assert.ok(last.includes("o:ROW1") && last.includes("o:ROW3"), JSON.stringify(last));
+	assert.equal(s.calls.update[1].hash, "h2", "the second redraw uses the hash of the first");
+	// Both at once: one redraw carries both boxes.
+	const s2 = setup(formFile({ questions: (formFile().questions as any[]).map((q: any) => ({ ...q, initial: undefined })) }));
+	const v2 = await openModal(s2);
+	const pick2 = (q: string) => {
+		const action = { type: "static_select", action_id: "choice", block_id: `s:${q}`, selected_option: { value: OTHER_VALUE } };
+		return handleFormInteraction(s2.deps, { type: "block_actions", user: { id: NITAY }, view: { ...v2, id: "V2", hash: "h1", state: { values: stateOf(v2, {}) } }, actions: [action] }, action);
+	};
+	await Promise.all([pick2("ROW1"), pick2("ROW3")]);
+	const final = s2.calls.update[s2.calls.update.length - 1].view.blocks.map((b: any) => b.block_id);
+	assert.ok(final.includes("o:ROW1") && final.includes("o:ROW3"));
+});
+
+test("the button sweep gives a form post the form's own expiry line and drops its button", () => {
+	const s = setup();
+	const blocks = expiredFormBlocks(messageBlocks, s.agentDir)!;
+	assert.ok(!blocks.some((b: any) => b.type === "actions"));
+	assert.equal(blocks[0].block_id, "line");
+	assert.equal(blocks[blocks.length - 1].elements[0].text, "הטופס הזה כבר לא בתוקף");
+	assert.ok(!/[—–]/.test(blocks[blocks.length - 1].elements[0].text));
+	assert.equal(expiredFormBlocks([{ type: "actions", elements: [{ type: "button", action_id: "approve" }] }], s.agentDir), null, "other posts keep the old sweep");
+});
+
+test("a hash conflict is retried without the hash, from every pick so far", async () => {
+	const s = setup();
+	const view = await openModal(s);
+	s.deps.client.views.update = async (a: any) => {
+		s.calls.update.push(a);
+		if (a.hash) throw Object.assign(new Error("hash_conflict"), { data: { error: "hash_conflict" } });
+		return { ok: true, view: { hash: "h9" } };
+	};
+	const action = { type: "static_select", action_id: "choice", block_id: "s:ROW1", selected_option: { value: OTHER_VALUE } };
+	await handleFormInteraction(s.deps, { type: "block_actions", user: { id: NITAY }, view: { ...view, id: "V3", hash: "stale", state: { values: stateOf(view, { ROW1: OTHER_VALUE }) } }, actions: [action] }, action);
+	assert.equal(s.calls.update.length, 2);
+	assert.equal(s.calls.update[1].hash, undefined);
+	assert.ok(s.calls.update[1].view.blocks.some((b: any) => b.block_id === "o:ROW1"));
 });

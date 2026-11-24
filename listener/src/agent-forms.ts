@@ -7,14 +7,15 @@
  * "other" redraws the modal at once with a free-text box right under that question. One submit hands all
  * answers to the agent as one message in the post's thread (like any other click), the post's button is
  * replaced by an "answered" line, and the form is marked answered on disk so a second submit is ignored,
- * also after a listener restart. A form expires with the agent's button TTL (or its own expires_at), or
+ * also after a listener restart. The answers themselves are saved next to the form before Slack is
+ * answered and handed over again at startup until the agent marks them applied. A form expires with the agent's button TTL (or its own expires_at), or
  * when the agent marks it superseded by a newer one.
  *
  * The form file comes from inside the agent's container: it is data, checked and capped here, and it
  * never decides who may answer. That is config.json "form_answerers" (Slack user ids), or else the
  * people with role "founder" in known-users.json.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "fs";
 import path from "path";
 
 export const FORM_OPEN_ACTION = "agent_form_open";
@@ -42,6 +43,7 @@ export interface FormTexts {
 	expired: string;
 	already: string;
 	missing: string;
+	empty: string;
 }
 
 const DEFAULT_TEXTS: FormTexts = {
@@ -55,12 +57,13 @@ const DEFAULT_TEXTS: FormTexts = {
 	expired: "This form is no longer valid.",
 	already: "This form was already answered.",
 	missing: "This form is no longer available.",
+	empty: "Nothing was chosen.",
 };
 
 // The form file's snake_case keys.
 const TEXT_KEYS: Record<keyof FormTexts, string> = {
 	submit: "submit", close: "close", other: "other", otherLabel: "other_label", selectLabel: "select_label",
-	notAllowed: "not_allowed", answered: "answered", expired: "expired", already: "already_answered", missing: "missing",
+	notAllowed: "not_allowed", answered: "answered", expired: "expired", already: "already_answered", missing: "missing", empty: "empty",
 };
 
 export interface FormOption { value: string; label: string }
@@ -266,6 +269,24 @@ export function retireBlocks(blocks: any[], note: string): any[] {
 	return kept;
 }
 
+/** A form post whose time is up (button sweep): every actions block goes, the form's own expiry line in place. Null: not a form post. */
+export function expiredFormBlocks(blocks: any[], agentDir: string): any[] | null {
+	const list = Array.isArray(blocks) ? blocks : [];
+	const button = list.flatMap((b) => (b?.type === "actions" && Array.isArray(b.elements) ? b.elements : [])).find((e: any) => e?.action_id === FORM_OPEN_ACTION);
+	if (!button) return null;
+	const form = loadForm(agentDir, String(button.value || ""));
+	const kept = list.filter((b) => b?.type !== "actions");
+	kept.push({ type: "context", elements: [{ type: "mrkdwn", text: (form?.texts || DEFAULT_TEXTS).expired }] });
+	return kept;
+}
+
+function writeJsonAtomic(file: string, value: unknown): void {
+	mkdirSync(path.dirname(file), { recursive: true });
+	const tmp = `${file}.${process.pid}.tmp`;
+	writeFileSync(tmp, JSON.stringify(value, null, 1));
+	renameSync(tmp, file);
+}
+
 // ─── State on disk ─────────────────────────────────────────
 
 export interface FormState {
@@ -285,31 +306,43 @@ export function defaultFormStateFile(): string {
 	return process.env.GINNIE_AGENT_FORMS_STATE || path.join(__dirname, "..", "..", "data", "agent-forms.json");
 }
 
-/** Which forms were opened and answered, by agent and form id. Entries older than 30 days are dropped. */
+/**
+ * Which forms were opened and answered, by agent and form id. Entries older than 30 days are dropped.
+ * A state file that cannot be read is never treated as empty (that would reopen answered forms): the
+ * store is "broken" and every form is refused until someone fixes the file. Each change is written to
+ * disk before it is kept in memory.
+ */
 export class FormStore {
 	private entries: Record<string, FormState> = {};
+	readonly broken: boolean = false;
 
 	constructor(private file: string, now: () => number = Date.now) {
-		try {
-			if (existsSync(file)) this.entries = JSON.parse(readFileSync(file, "utf8")) || {};
-		} catch {
-			this.entries = {};
+		if (existsSync(file)) {
+			try {
+				const parsed = JSON.parse(readFileSync(file, "utf8"));
+				if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+				this.entries = parsed;
+			} catch (e) {
+				this.broken = true;
+				console.error(`[agent-forms] ${file} cannot be read (${(e as Error)?.message || e}): forms are refused until it is fixed`);
+				return;
+			}
 		}
 		const cutoff = now() - STATE_DAYS * 86400_000;
+		const next = { ...this.entries };
 		let dropped = false;
-		for (const [k, v] of Object.entries(this.entries)) {
-			if (!v || (v.answeredAt ?? v.openedAt ?? 0) < cutoff) { delete this.entries[k]; dropped = true; }
+		for (const [k, v] of Object.entries(next)) {
+			if (!v || (v.answeredAt ?? v.openedAt ?? 0) < cutoff) { delete next[k]; dropped = true; }
 		}
-		if (dropped) this.save();
+		if (dropped) this.commit(next);
 	}
 
 	private key(agent: string, formId: string): string { return `${agent}|${formId}`; }
 
-	private save(): void {
-		mkdirSync(path.dirname(this.file), { recursive: true });
-		const tmp = `${this.file}.${process.pid}.tmp`;
-		writeFileSync(tmp, JSON.stringify(this.entries, null, 1));
-		renameSync(tmp, this.file);
+	private commit(next: Record<string, FormState>): void {
+		if (this.broken) throw new Error("form state file cannot be read");
+		writeJsonAtomic(this.file, next);
+		this.entries = next;
 	}
 
 	get(agent: string, formId: string): FormState | undefined {
@@ -319,8 +352,7 @@ export class FormStore {
 	markOpened(agent: string, formId: string, msg: { channel: string; ts: string; text: string; blocks: any[] }, at: number = Date.now()): void {
 		const k = this.key(agent, formId);
 		if (this.entries[k]?.status === "answered") return;
-		this.entries[k] = { status: "open", ...msg, openedAt: at };
-		this.save();
+		this.commit({ ...this.entries, [k]: { status: "open", ...msg, openedAt: at } });
 	}
 
 	/** False when the form was answered already (a second submit). */
@@ -328,15 +360,99 @@ export class FormStore {
 		const k = this.key(agent, formId);
 		const cur = this.entries[k];
 		if (cur?.status === "answered") return false;
-		this.entries[k] = {
-			text: cur?.text ?? "", blocks: cur?.blocks ?? [], openedAt: cur?.openedAt ?? at,
-			status: "answered", channel: info.channel, ts: info.ts,
-			answeredAt: at, by: info.by, answered: info.answered, total: info.total,
-		};
-		this.save();
+		this.commit({
+			...this.entries,
+			[k]: {
+				text: cur?.text ?? "", blocks: cur?.blocks ?? [], openedAt: cur?.openedAt ?? at,
+				status: "answered", channel: info.channel, ts: info.ts,
+				answeredAt: at, by: info.by, answered: info.answered, total: info.total,
+			},
+		});
 		return true;
 	}
 }
+
+// ─── Answers on disk ───────────────────────────────────────
+// The answers are written next to the form (<agent dir>/data/forms/<id>.answers.json) before Slack hears
+// the submit, so a listener restart or a failed agent run never loses them: the agent reads its answers
+// from this file (never from text in a chat), marks it applied_at when done, and the listener hands every
+// file not applied yet to the agent again at startup (at most 3 times, for 7 days).
+
+export interface SavedAnswers {
+	form: string;
+	title: string;
+	by: string;
+	at: string;
+	channel: string;
+	ts: string;
+	senderLine: string;
+	message: string;
+	answers: Record<string, Omit<FormAnswer, "id">>;
+	unanswered: string[];
+	replays: number;
+	applied_at?: string;
+}
+
+export function answersPath(agentDir: string, formId: string): string {
+	return path.join(agentDir, "data", "forms", `${formId}.answers.json`);
+}
+
+export function pendingAnswers(agentDir: string, now: number, { maxReplays = 3, maxAgeDays = 7 } = {}): { file: string; saved: SavedAnswers }[] {
+	const dir = path.join(agentDir, "data", "forms");
+	let names: string[] = [];
+	try { names = readdirSync(dir).filter((n) => n.endsWith(".answers.json")); } catch { return []; }
+	const out: { file: string; saved: SavedAnswers }[] = [];
+	for (const n of names) {
+		const file = path.join(dir, n);
+		try {
+			const saved = JSON.parse(readFileSync(file, "utf8")) as SavedAnswers;
+			if (!saved || saved.applied_at || !saved.message || !saved.channel || !saved.ts) continue;
+			if ((saved.replays || 0) >= maxReplays) continue;
+			if (now - Date.parse(saved.at) > maxAgeDays * 86400_000) continue;
+			out.push({ file, saved });
+		} catch { /* not ours to fix */ }
+	}
+	return out;
+}
+
+/** At listener start: hand the agent every saved answer it has not applied yet. Returns how many. */
+export function replayPendingAnswers(agentDir: string, deliver: FormDeps["deliver"], now: number = Date.now(), log: (l: string) => void = (l) => console.log(l)): number {
+	let n = 0;
+	for (const { file, saved } of pendingAnswers(agentDir, now)) {
+		try {
+			writeJsonAtomic(file, { ...saved, replays: (saved.replays || 0) + 1 });
+		} catch (e) {
+			log(`[agent-forms] ${file}: cannot count the replay, not replayed: ${(e as Error)?.message || e}`);
+			continue;
+		}
+		deliver({
+			channel: saved.channel, threadTs: saved.ts, userId: saved.by, senderLine: saved.senderLine,
+			message: `(Delivered again after a listener restart: apply it only if you have not yet.)\n${saved.message}`,
+		});
+		log(`[agent-forms] form ${saved.form}: answers handed over again (${(saved.replays || 0) + 1})`);
+		n++;
+	}
+	return n;
+}
+
+// ─── Open modals ───────────────────────────────────────────
+// Redraws of one modal run one after the other, each from every pick made so far (Slack's payload of a
+// fast second pick still shows the modal before the first redraw), with the hash of the last redraw.
+
+interface Draft { picks: Record<string, string>; typed: Record<string, string>; shown: string; hash?: string; chain: Promise<void>; at: number }
+
+export class FormDrafts {
+	private drafts = new Map<string, Draft>();
+	get(viewId: string, init: () => Omit<Draft, "chain" | "at">, now: number): Draft {
+		for (const [k, d] of this.drafts) if (now - d.at > 2 * 3600_000) this.drafts.delete(k);
+		let d = this.drafts.get(viewId);
+		if (!d) { d = { ...init(), chain: Promise.resolve(), at: now }; this.drafts.set(viewId, d); }
+		d.at = now;
+		return d;
+	}
+	drop(viewId: string): void { this.drafts.delete(viewId); }
+}
+const sharedDrafts = new FormDrafts();
 
 // ─── Slack handlers ────────────────────────────────────────
 
@@ -348,6 +464,7 @@ export interface FormDeps {
 		chat: { postEphemeral: (args: any) => Promise<any>; update: (args: any) => Promise<any> };
 	};
 	store: FormStore;
+	drafts?: FormDrafts;
 	/** Local and fast: a click's trigger id is good for about 3 seconds. */
 	canAnswer: (userId: string) => boolean;
 	/** The sender line for the agent, and whether the sender policy lets this person reach it. */
@@ -406,6 +523,10 @@ async function openForm(deps: FormDeps, body: any, action: any): Promise<void> {
 		log(`[${deps.agent.name}] form ${formId}: no usable form file`);
 		return say(texts.missing);
 	}
+	if (deps.store.broken) {
+		log(`[${deps.agent.name}] form ${formId}: refused, the form state file cannot be read`);
+		return say(texts.missing);
+	}
 	if (deps.store.get(deps.agent.name, form.id)?.status === "answered") return say(texts.already);
 	if (isExpired(form, now, deps.agent.buttonTtlHours)) {
 		await say(texts.expired);
@@ -424,33 +545,61 @@ async function openForm(deps: FormDeps, body: any, action: any): Promise<void> {
 		log(`[${deps.agent.name}] form ${formId}: views.open failed: ${(e as any)?.data?.error || (e as Error)?.message || e}`);
 		return;
 	}
-	deps.store.markOpened(deps.agent.name, form.id, { channel, ts, text: String(body.message?.text || ""), blocks: body.message?.blocks || [] }, now);
+	try {
+		deps.store.markOpened(deps.agent.name, form.id, { channel, ts, text: String(body.message?.text || ""), blocks: body.message?.blocks || [] }, now);
+	} catch (e) {
+		log(`[${deps.agent.name}] form ${formId}: could not save the opened post: ${(e as Error)?.message || e}`);
+	}
 	log(`[${deps.agent.name}] form ${form.id} opened by ${userId} (${form.questions.length} questions)`);
 }
+
+const boxesOf = (form: AgentForm, picks: Record<string, string>) =>
+	form.questions.filter((x) => (x.id in picks ? picks[x.id] : x.initial) === OTHER_VALUE).map((x) => x.id).join("\n");
 
 async function redrawForm(deps: FormDeps, body: any, action: any): Promise<void> {
 	const log = deps.log || ((l: string) => console.log(l));
 	const meta = parseMeta(body.view?.private_metadata);
-	if (!meta || action?.action_id !== SELECT_ACTION) return;
+	if (!meta || action?.action_id !== SELECT_ACTION || !body.view?.id) return;
 	if (!deps.canAnswer(String(body?.user?.id || ""))) return;
 	const form = loadForm(deps.agent.dir, meta.f);
 	if (!form) return;
+	const drafts = deps.drafts || sharedDrafts;
+	const d = drafts.get(String(body.view.id), () => ({
+		picks: {}, typed: {}, hash: body.view.hash,
+		shown: form.questions.filter((x) => (body.view.blocks || []).some((b: any) => b?.block_id === `o:${x.id}`)).map((x) => x.id).join("\n"),
+	}), (deps.now || Date.now)());
+	// Merge now, in arrival order: what Slack shows in this payload, then the pick itself.
 	const { picks, typed } = readState(form, body.view.state?.values);
+	Object.assign(d.picks, picks);
+	Object.assign(d.typed, typed);
 	const q = form.questions.find((x) => `s:${x.id}` === action.block_id);
 	const v = action.selected_option?.value;
-	if (q && typeof v === "string" && (v === OTHER_VALUE || q.options.some((o) => o.value === v))) picks[q.id] = v;
-	const shown = (body.view.blocks || []).filter((b: any) => typeof b?.block_id === "string" && b.block_id.startsWith("o:")).map((b: any) => b.block_id.slice(2)).sort();
-	const wanted = form.questions.filter((x) => (x.id in picks ? picks[x.id] : x.initial) === OTHER_VALUE).map((x) => x.id).sort();
-	if (shown.join("\n") === wanted.join("\n")) return;
-	try {
-		await deps.client.views.update({ token: deps.token, view_id: body.view.id, hash: body.view.hash, view: buildFormView(form, body.view.private_metadata, picks, typed) });
-	} catch (e) {
-		// hash_conflict: a newer change already redrew it; that redraw shows the same boxes.
-		log(`[${deps.agent.name}] form ${form.id}: views.update failed: ${(e as any)?.data?.error || (e as Error)?.message || e}`);
-	}
+	if (q && typeof v === "string" && (v === OTHER_VALUE || q.options.some((o) => o.value === v))) d.picks[q.id] = v;
+	d.chain = d.chain.then(async () => {
+		const wanted = boxesOf(form, d.picks);
+		if (wanted === d.shown) return;
+		const view = buildFormView(form, body.view.private_metadata, d.picks, d.typed);
+		const update = (hash?: string) => deps.client.views.update({ token: deps.token, view_id: body.view.id, ...(hash ? { hash } : {}), view });
+		let res: any;
+		try {
+			res = await update(d.hash);
+		} catch (e) {
+			const err = (e as any)?.data?.error || (e as Error)?.message || String(e);
+			if (!/hash_conflict/.test(err)) { log(`[${deps.agent.name}] form ${form.id}: views.update failed: ${err}`); return; }
+			try {
+				res = await update(undefined); // built from every pick so far, so drawing over the newer one loses nothing
+			} catch (e2) {
+				log(`[${deps.agent.name}] form ${form.id}: views.update failed after a hash conflict: ${(e2 as any)?.data?.error || (e2 as Error)?.message || e2}`);
+				return;
+			}
+		}
+		d.shown = wanted;
+		d.hash = res?.view?.hash;
+	});
+	await d.chain;
 }
 
-/** view_submission. Always acks (closes the modal); delivers at most once per form. */
+/** view_submission. Delivers at most once per form; the answers are on disk before Slack is answered. */
 export async function handleFormSubmit(deps: FormDeps, body: any, ack: (r?: any) => Promise<void>): Promise<void> {
 	const log = deps.log || ((l: string) => console.log(l));
 	const now = (deps.now || Date.now)();
@@ -462,9 +611,16 @@ export async function handleFormSubmit(deps: FormDeps, body: any, ack: (r?: any)
 		log(`[${deps.agent.name}] form submit without a usable form (${meta?.f || "no metadata"}), ignored`);
 		return;
 	}
+	// Slack shows these notes under the first question and keeps the modal open.
+	const note = (text: string) => ack({ response_action: "errors", errors: { [`s:${form.questions[0].id}`]: text } });
 	if (!deps.canAnswer(userId)) {
 		await ack();
 		log(`[${deps.agent.name}] form ${form.id}: submit by ${userId} refused (not an answerer)`);
+		return;
+	}
+	if (deps.store.broken) {
+		await note(form.texts.missing);
+		log(`[${deps.agent.name}] form ${form.id}: submit refused, the form state file cannot be read`);
 		return;
 	}
 	const state = deps.store.get(deps.agent.name, form.id);
@@ -473,10 +629,14 @@ export async function handleFormSubmit(deps: FormDeps, body: any, ack: (r?: any)
 		log(`[${deps.agent.name}] form ${form.id}: second submit ignored`);
 		return;
 	}
+	if (isExpired(form, now, deps.agent.buttonTtlHours)) {
+		await note(form.texts.expired);
+		log(`[${deps.agent.name}] form ${form.id}: submit refused, the form expired or was replaced`);
+		return;
+	}
 	const { answers, unanswered } = collectAnswers(form, body.view.state?.values);
 	if (!answers.length) {
-		await ack();
-		log(`[${deps.agent.name}] form ${form.id}: submitted with nothing answered, nothing delivered`);
+		await note(form.texts.empty);
 		return;
 	}
 	const who = await deps.sender(userId);
@@ -485,18 +645,37 @@ export async function handleFormSubmit(deps: FormDeps, body: any, ack: (r?: any)
 		return;
 	}
 	const total = form.questions.length;
-	if (!deps.store.markAnswered(deps.agent.name, form.id, { by: userId, answered: answers.length, total, channel: meta.c, ts: meta.t }, now)) {
-		await ack();
+	const message = formatSubmission(form, answers, unanswered);
+	const byId: SavedAnswers["answers"] = {};
+	for (const { id, ...rest } of answers) byId[id] = rest;
+	try {
+		writeJsonAtomic(answersPath(deps.agent.dir, form.id), {
+			form: form.id, title: form.title, by: userId, at: new Date(now).toISOString(), channel: meta.c, ts: meta.t,
+			senderLine: who.line, message, answers: byId, unanswered, replays: 0,
+		} satisfies SavedAnswers);
+		if (!deps.store.markAnswered(deps.agent.name, form.id, { by: userId, answered: answers.length, total, channel: meta.c, ts: meta.t }, now)) {
+			await ack();
+			return;
+		}
+	} catch (e) {
+		log(`[${deps.agent.name}] form ${form.id}: could not save the answers: ${(e as Error)?.message || e}`);
+		await note(form.texts.missing);
 		return;
 	}
 	await ack();
+	if (body.view?.id) (deps.drafts || sharedDrafts).drop(String(body.view.id));
 	log(`[${deps.agent.name}] form ${form.id} answered by ${userId}: ${answers.length} of ${total}`);
-	deps.deliver({ channel: meta.c, threadTs: meta.t, message: formatSubmission(form, answers, unanswered), userId, senderLine: who.line });
+	deps.deliver({ channel: meta.c, threadTs: meta.t, message, userId, senderLine: who.line });
+	// Without the post as it was when opened, leave it alone rather than overwrite its text.
+	if (!state?.blocks?.length) {
+		log(`[${deps.agent.name}] form ${form.id}: no saved copy of the post, its button stays (the form is answered)`);
+		return;
+	}
 	try {
 		await deps.client.chat.update({
 			token: deps.token, channel: meta.c, ts: meta.t,
-			text: state?.text || form.title,
-			blocks: retireBlocks(state?.blocks || [], fill(form.texts.answered, answers.length, total)),
+			text: state.text || form.title,
+			blocks: retireBlocks(state.blocks, fill(form.texts.answered, answers.length, total)),
 		});
 	} catch (e) {
 		log(`[${deps.agent.name}] form ${form.id}: marking the post answered failed: ${(e as Error)?.message || e}`);

@@ -20,6 +20,7 @@
  */
 import type { App } from "@slack/bolt";
 import type { AgentConfig } from "./runner";
+import { expiredFormBlocks } from "./agent-forms";
 
 const SWEEP_INTERVAL_MS = 30 * 60 * 1000; // every 30 min
 const FIRST_SWEEP_DELAY_MS = 60 * 1000; // 1 min after boot
@@ -58,14 +59,17 @@ async function sweepAgent(agent: AgentConfig, app: App): Promise<number> {
 		// Still within its TTL — leave it alone.
 		if (parseFloat(msg.ts) >= cutoffSec) continue;
 
-		const kept = (msg.blocks as any[]).filter((b) => b?.type !== "actions");
-		kept.push({
-			type: "context",
-			elements: [{
-				type: "mrkdwn",
-				text: `⌛ Options expired — no response within ${agent.buttonTtlHours}h. Reply in thread if you still need this.`,
-			}],
-		});
+		// A form post (agent-forms.ts) gets the form's own expiry line, in the agent's language.
+		const kept = expiredFormBlocks(msg.blocks, agent.dir) ?? [
+			...(msg.blocks as any[]).filter((b) => b?.type !== "actions"),
+			{
+				type: "context",
+				elements: [{
+					type: "mrkdwn",
+					text: `⌛ Options expired — no response within ${agent.buttonTtlHours}h. Reply in thread if you still need this.`,
+				}],
+			},
+		];
 
 		try {
 			await app.client.chat.update({

@@ -28,7 +28,7 @@ import { WakeInbox } from "./wake-inbox";
 import { getSenderInfo, formatSenderLine, slackUserIsBot } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
-import { FORM_CALLBACK, FormStore, defaultFormStateFile, formAnswerers, handleFormInteraction, handleFormSubmit, isFormInteraction, type FormDeps } from "./agent-forms";
+import { FORM_CALLBACK, FormDrafts, FormStore, defaultFormStateFile, formAnswerers, handleFormInteraction, handleFormSubmit, isFormInteraction, replayPendingAnswers, type FormDeps } from "./agent-forms";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
 import { listenerConversationRuns } from "./conversation-runs";
 import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger, fetchMedia, mediaUrl } from "./whatsapp-trigger";
@@ -100,12 +100,14 @@ const apps = new Map<string, App>();
 // Agent forms (agent-forms.ts): a button that opens a modal with many questions, answered in one submit.
 // On disk, so a listener restart still knows which forms were answered.
 const formStore = new FormStore(defaultFormStateFile());
+const formDrafts = new FormDrafts();
 function formDeps(agent: AgentConfig, app: App): FormDeps {
 	return {
 		agent,
 		token: agent.slackBotToken,
 		client: app.client as any,
 		store: formStore,
+		drafts: formDrafts,
 		canAnswer: (userId) => formAnswerers(agent, getKnownUsersFor(agent)).includes(userId),
 		sender: async (userId) => {
 			const s = await getSenderInfo(app, userId, agent);
@@ -800,6 +802,12 @@ function startSlackHeartbeat(agentName: string, receiver: SocketModeReceiver): v
 
 	startWhatsAppTriggers();
 	startWakeInboxes();
+
+	// Form answers saved but not applied by the agent yet (a restart cut the run short): hand them over again.
+	for (const agent of agents) {
+		const app = apps.get(agent.name);
+		if (app) replayPendingAnswers(agent.dir, formDeps(agent, app).deliver);
+	}
 
 	// Periodically retire stale, never-clicked buttons from agent messages.
 	if (started.length) startButtonSweep(apps, agents);
