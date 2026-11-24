@@ -42,8 +42,10 @@
  *                             /workspace/skills whose SKILL.md is put into the
  *                             system prompt, so the run does not read them.
  *   MIDRUN_LINGER_MS       - Optional: how long the run stays open for more
- *                             messages after its answer (read by the open-run
- *                             wait; unset = none).
+ *                             messages after each answer (the open-run wait,
+ *                             docker/midrun.mjs). Unset, bad or negative = none;
+ *                             capped at 60 minutes; ignored when the run has
+ *                             no mid-run inbox (MIDRUN_DIR unset or feed off).
  *   MIDRUN_DIR             - Optional: folder where the listener drops messages
  *                             that arrive while this run is working; they are
  *                             handed to the session between tool calls
@@ -63,7 +65,7 @@ import { bottomLineSkill, preloadSkills, whatsappSkill } from "./prompt-skills.m
 import { createLimitTracker } from "./limit-detect.mjs";
 import { CONTINUE_AFTER_ERROR_MESSAGE, nextStep } from "./run-policy.mjs";
 import { toolServerOptions } from "./tool-servers.mjs";
-import { closeInbox, createFeed, feedSupport } from "./midrun.mjs";
+import { closeInbox, createFeed, feedSupport, lingerMsFor } from "./midrun.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -317,6 +319,9 @@ if (midrunDir) {
 		midrunDir = "";
 	}
 }
+// The open-run wait needs the inbox: without one the run ends at its result.
+const lingerMs = lingerMsFor(process.env.MIDRUN_LINGER_MS, !!midrunDir);
+if (lingerMs) console.error(`[${agentName}] Open-run wait: ${Math.round(lingerMs / 1000)} s after each answer`);
 
 // replaysRequest: this try sends the original request to a session that does
 // not hold the previous try's history, so mid-run messages that try had
@@ -326,7 +331,7 @@ async function runSession(resumeSessionId, prompt, replaysRequest) {
 	// With an inbox the prompt is a stream: this message first, then whatever
 	// the listener drops in while the run works. The feed ends the stream.
 	const feed = midrunDir
-		? createFeed(midrunDir, prompt, { maxTurns, refeedSeen: replaysRequest, log: (line) => console.error(`[${agentName}] ${line}`) })
+		? createFeed(midrunDir, prompt, { maxTurns, lingerMs, refeedSeen: replaysRequest, log: (line) => console.error(`[${agentName}] ${line}`) })
 		: null;
 
 	try {

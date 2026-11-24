@@ -151,7 +151,7 @@ describe("open-run wait setting (MIDRUN_LINGER_MS)", () => {
 		const check = ep.indexOf("feedSupport(");
 		const read = ep.indexOf("lingerMsFor(process.env.MIDRUN_LINGER_MS, !!midrunDir)");
 		assert.ok(check > 0 && read > check, "computed after the feed check, which clears midrunDir when the feed is off");
-		assert.match(ep, /createFeed\(midrunDir, prompt, \{[^}]*lingerMs[^}]*\}\)/);
+		assert.match(ep, /createFeed\(midrunDir, prompt, \{[^}]*\blingerMs\b/);
 		assert.match(ep, /prompt: feed \? feed\.input : prompt/, "no feed: a plain prompt, the run ends at its result");
 	});
 });
