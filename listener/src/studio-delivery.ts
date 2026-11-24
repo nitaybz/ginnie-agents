@@ -11,7 +11,7 @@
  */
 
 /** Turn origins the framework currently knows how to name. Add here as new bridges appear. */
-export type DeliveryOrigin = "slack" | "studio" | "whatsapp" | string;
+export type DeliveryOrigin = "slack" | "studio" | "whatsapp" | "conversation" | string;
 
 const STUDIO_INSTRUCTION =
 	"You were reached from Ginnie Studio, not from Slack, for this turn. " +
@@ -26,6 +26,11 @@ const WHATSAPP_INSTRUCTION =
 	"goes to the same WhatsApp chat through the WhatsApp gateway (see the WhatsApp skill). " +
 	"Your final reply text is only logged, nobody reads it.";
 
+const CONVERSATION_INSTRUCTION =
+	"This turn is part of a conversation handed to you by a host process, not by Slack. " +
+	"Your answer is delivered by your own tools for this conversation, as your instructions for it say. " +
+	"Never post about this conversation to Slack or anywhere else.";
+
 /**
  * Returns the extra system-prompt instruction for a given turn origin, or ""
  * when none is needed. Anything other than the recognised "studio" origin —
@@ -35,5 +40,6 @@ const WHATSAPP_INSTRUCTION =
 export function deliveryInstruction(origin: DeliveryOrigin): string {
 	if (origin === "studio") return STUDIO_INSTRUCTION;
 	if (origin === "whatsapp") return WHATSAPP_INSTRUCTION;
+	if (origin === "conversation") return CONVERSATION_INSTRUCTION;
 	return "";
 }

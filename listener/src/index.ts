@@ -29,7 +29,7 @@ import { getSenderInfo, formatSenderLine, slackUserIsBot } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
-import { CONVERSATION_CHANNEL, ConversationRuns } from "./conversation-runs";
+import { listenerConversationRuns } from "./conversation-runs";
 import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger, fetchMedia, mediaUrl } from "./whatsapp-trigger";
 import { transcribeBuffer, whisperReady } from "./transcribe";
 import { getKnownUsersFor } from "./users";
@@ -626,14 +626,7 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 // Its own line, separate from the Slack one: an open conversation run never holds
 // up the agent's Slack, schedule or wake work. Its inboxes live under MIDRUN_ROOT,
 // which is cleared at start. Only these runs may ask for the open-run wait.
-const conversationRuns = new ConversationRuns({
-	run: (agent, message, midrunDir, profile, opts) => runAgent(agent, message, "conversation", midrunDir, profile, opts),
-	resume: (agent, sessionId, message, midrunDir, profile, opts) =>
-		resumeAgent(agent, sessionId, message, "conversation", midrunDir, profile, opts),
-	getSession: (agentName, conversation) => getThread(agentName, CONVERSATION_CHANNEL, conversation),
-	setSession: (agentName, conversation, sessionId) => setThread(CONVERSATION_CHANNEL, conversation, sessionId, agentName),
-	now: () => Date.now(),
-});
+const conversationRuns = listenerConversationRuns();
 
 // ─── Schedule fire handler ─────────────────────────────────
 function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {

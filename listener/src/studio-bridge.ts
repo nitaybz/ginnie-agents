@@ -32,6 +32,13 @@ const MIN_KEY_LENGTH = 32;
 /** Refuse request bodies above this size rather than buffering them. */
 const MAX_BODY_BYTES = 256 * 1024;
 
+/**
+ * Largest conversation message (UTF-8 bytes). The message rides in the
+ * container's env, and a much larger one makes docker fail to start (E2BIG)
+ * after the request was accepted; refusing it lets the caller fall back.
+ */
+export const MAX_CONVERSE_MESSAGE_BYTES = 100 * 1024;
+
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 
 export const DEFAULT_KEY_FILE = path.join(REPO_ROOT, "data", "studio-bridge", "key");
@@ -219,15 +226,24 @@ export function startStudioBridge(options: StudioBridgeOptions = {}): http.Serve
 		const agentName = typeof parsed.agent === "string" ? parsed.agent : "";
 		const conversation = typeof parsed.conversation === "string" ? parsed.conversation : "";
 		const message = typeof parsed.message === "string" ? parsed.message : "";
-		const profileOk = parsed.profile === undefined || typeof parsed.profile === "string";
+		const profileOk = parsed.profile === undefined || (typeof parsed.profile === "string" && parsed.profile !== "");
 		if (!agentName || !CONVERSATION_ID.test(conversation) || !message || !profileOk) {
 			sendJson(res, 400, { error: "bad_request" });
 			return;
 		}
-		const profile = typeof parsed.profile === "string" && parsed.profile ? parsed.profile : undefined;
+		if (Buffer.byteLength(message, "utf8") > MAX_CONVERSE_MESSAGE_BYTES) {
+			sendJson(res, 413, { error: "too_large" });
+			return;
+		}
 		const agent = listAgents().find((a) => a.name === agentName);
 		if (!agent) {
 			sendJson(res, 404, { error: "unknown_agent" });
+			return;
+		}
+		// Only a profile the agent defines (run_profiles); the raw string is never logged.
+		const profile = typeof parsed.profile === "string" ? parsed.profile : undefined;
+		if (profile !== undefined && !Object.prototype.hasOwnProperty.call(agent.runProfiles ?? {}, profile)) {
+			sendJson(res, 400, { error: "bad_request" });
 			return;
 		}
 		try {

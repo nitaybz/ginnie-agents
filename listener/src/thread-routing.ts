@@ -56,6 +56,8 @@ export class ThreadDispatcher<M extends Dispatchable> {
 		offerToRun?: (msg: M, key: string) => boolean;
 		onError?: (agentName: string, err: unknown) => void;
 		log?: (line: string) => void;
+		/** The line is empty and no run is going for this key (after its last run). */
+		onDrained?: (key: string) => void;
 	}) {}
 
 	/**
@@ -111,7 +113,10 @@ export class ThreadDispatcher<M extends Dispatchable> {
 
 	private async drain(key: string, agentName: string): Promise<void> {
 		const queue = this.queues.get(key);
-		if (!queue || queue.length === 0) return;
+		if (!queue || queue.length === 0) {
+			this.opts.onDrained?.(key);
+			return;
+		}
 		const batch = [...queue];
 		this.queues.delete(key);
 		if (batch.length > 1) this.opts.log?.(`[${agentName}] Batched ${batch.length} messages for thread ${batch[0].threadTs}`);
@@ -129,6 +134,8 @@ export class ThreadDispatcher<M extends Dispatchable> {
 		if (next && next.length > 0) {
 			this.opts.log?.(`[${agentName}] ${next.length} messages arrived during processing, draining...`);
 			await this.drain(key, agentName);
+		} else {
+			this.opts.onDrained?.(key);
 		}
 	}
 }

@@ -332,12 +332,15 @@ describe("conversation runs", () => {
 		h.cleanup();
 	});
 
-	test("a bad conversation id is refused", () => {
+	test("a bad conversation id or a profile the agent does not define is refused", () => {
 		const h = harness();
 		assert.match("conv-1", CONVERSATION_ID);
 		assert.match("a.b_c:d-1", CONVERSATION_ID);
 		for (const bad of ["", "has space", "x".repeat(129), "../up", "a/b"]) {
 			assert.throws(() => h.runs.deliver(agentWith(), bad, "m"), /conversation/);
+		}
+		for (const bad of ["nope", "constructor", "__proto__", "toString"]) {
+			assert.throws(() => h.runs.deliver(agentWith(), "conv-1", "m", bad), /profile/, bad);
 		}
 		h.cleanup();
 	});
