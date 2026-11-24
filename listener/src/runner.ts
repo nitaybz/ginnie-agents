@@ -462,7 +462,7 @@ async function spawnContainer(
 		});
 	} catch (err) {
 		// The error code only: a spawn error carries the container args, message included.
-		recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${errorCode(err)}`);
+		recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container (spawn docker ${errorCode(err)})`);
 		throw err;
 	}
 	// Feeds the watcher's "N failed runs in a row" alert; a usage limit is not
@@ -781,7 +781,7 @@ export function spawnAttempt(
 
 		child.on("error", (err) => {
 			// Never the error object: its spawnargs hold the container env, AGENT_MESSAGE included.
-			console.error(`[${agent.name}] Failed to spawn container: ${errorCode(err)}`);
+			console.error(`[${agent.name}] Failed to spawn container (spawn docker ${errorCode(err)})`);
 			reject(err);
 		});
 	});
