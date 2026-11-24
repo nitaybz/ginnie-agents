@@ -58,11 +58,15 @@ export class ThreadDispatcher<M extends Dispatchable> {
 		log?: (line: string) => void;
 	}) {}
 
-	enqueue(msg: M): void {
+	/**
+	 * "handed": given to the working run; "queued": waits in line behind it;
+	 * "waiting": no run going, a run starts after the debounce.
+	 */
+	enqueue(msg: M): "handed" | "queued" | "waiting" {
 		const key = queueKey(msg.agent.name, msg.channel, msg.threadTs);
 		if (this.active.has(key) && this.opts.offerToRun?.(msg, key)) {
 			this.opts.log?.(`[${msg.agent.name}] Message handed to the working run in thread ${msg.threadTs}`);
-			return;
+			return "handed";
 		}
 		const queue = this.queues.get(key) || [];
 		queue.push(msg);
@@ -71,7 +75,7 @@ export class ThreadDispatcher<M extends Dispatchable> {
 
 		if (this.active.has(key)) {
 			this.opts.log?.(`[${msg.agent.name}] Queued message for busy thread ${msg.threadTs} (${queue.length} in queue)`);
-			return;
+			return "queued";
 		}
 		const existing = this.timers.get(key);
 		if (existing) {
@@ -84,6 +88,7 @@ export class ThreadDispatcher<M extends Dispatchable> {
 			this.timers.delete(key);
 			this.track(this.drain(key, msg.agent.name));
 		}, this.opts.debounceMs));
+		return "waiting";
 	}
 
 	/** Messages a run was handed but did not use: back to the head of the line. Call before that run's process() returns. */

@@ -29,6 +29,7 @@ import { getSenderInfo, formatSenderLine, slackUserIsBot } from "./users";
 import { isAudioMime, transcribeAudio } from "./transcribe";
 import { startButtonSweep } from "./button-sweep";
 import { startStudioBridge, DEFAULT_STUDIO_BRIDGE_PORT } from "./studio-bridge";
+import { CONVERSATION_CHANNEL, ConversationRuns } from "./conversation-runs";
 import { WHATSAPP_CURSORS_FILE, WhatsAppTrigger, fetchMedia, mediaUrl } from "./whatsapp-trigger";
 import { transcribeBuffer, whisperReady } from "./transcribe";
 import { getKnownUsersFor } from "./users";
@@ -620,6 +621,20 @@ async function processMessage(msg: QueuedMessage): Promise<void> {
 	});
 }
 
+// ─── Conversation runs ─────────────────────────────────────
+// One open run per conversation, fed by POST /studio/converse (conversation-runs.ts).
+// Its own line, separate from the Slack one: an open conversation run never holds
+// up the agent's Slack, schedule or wake work. Its inboxes live under MIDRUN_ROOT,
+// which is cleared at start. Only these runs may ask for the open-run wait.
+const conversationRuns = new ConversationRuns({
+	run: (agent, message, midrunDir, profile, opts) => runAgent(agent, message, "conversation", midrunDir, profile, opts),
+	resume: (agent, sessionId, message, midrunDir, profile, opts) =>
+		resumeAgent(agent, sessionId, message, "conversation", midrunDir, profile, opts),
+	getSession: (agentName, conversation) => getThread(agentName, CONVERSATION_CHANNEL, conversation),
+	setSession: (agentName, conversation, sessionId) => setThread(CONVERSATION_CHANNEL, conversation, sessionId, agentName),
+	now: () => Date.now(),
+});
+
 // ─── Schedule fire handler ─────────────────────────────────
 function onScheduleFire(agent: AgentConfig, entry: ScheduleEntry): void {
 	const channel = agent.slackChannel;
@@ -777,7 +792,10 @@ function startSlackHeartbeat(agentName: string, receiver: SocketModeReceiver): v
 	// Ginnie Studio bridge — loopback only, disabled until a key is installed.
 	const studioBridgePort = Number(process.env.STUDIO_BRIDGE_PORT || DEFAULT_STUDIO_BRIDGE_PORT);
 	try {
-		startStudioBridge({ port: studioBridgePort });
+		startStudioBridge({
+			port: studioBridgePort,
+			converse: (agent, conversation, message, profile) => conversationRuns.deliver(agent, conversation, message, profile),
+		});
 		console.log(`   Studio bridge listening on 127.0.0.1:${studioBridgePort}`);
 	} catch (err) {
 		console.error("[studio-bridge] failed to start:", err instanceof Error ? err.message : err);

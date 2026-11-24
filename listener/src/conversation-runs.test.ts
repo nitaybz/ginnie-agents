@@ -210,13 +210,20 @@ describe("conversation runs", () => {
 		assert.equal(linger("b1"), true);
 		// The agent config is not changed by the cap.
 		assert.deepEqual(agent.runProfiles, { chat: { lingerMinutes: 10 } });
-		// Once one closes, the next run waits again.
+		// Every going run counts, the one without the wait too: with 4 still open the next gets none.
 		h.calls[0].finish();
 		await until(() => h.runs.openCount("agent-a") === 4, "one closed");
-		h.runs.deliver(agent, "conv-9", "m9", "chat");
+		h.runs.deliver(agent, "conv-8", "m8", "chat");
 		await until(() => h.calls.length === 7, "next run");
+		assert.equal(linger("m8"), false);
+		// Below the cap again, the next run waits again.
+		h.calls.find((c) => c.message === "m2")!.finish();
+		h.calls.find((c) => c.message === "m3")!.finish();
+		await until(() => h.runs.openCount("agent-a") === 3, "two more closed");
+		h.runs.deliver(agent, "conv-9", "m9", "chat");
+		await until(() => h.calls.length === 8, "next run");
 		assert.equal(linger("m9"), true);
-		for (const c of h.calls.slice(1)) c.finish();
+		for (const c of h.calls.filter((c) => !["m1", "m2", "m3"].includes(c.message))) c.finish();
 		await until(() => h.runs.openCount("agent-a") === 0 && h.runs.openCount("agent-b") === 0, "runs end");
 		h.cleanup();
 	});
