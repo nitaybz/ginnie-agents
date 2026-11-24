@@ -53,6 +53,18 @@ describe("parseRunProfiles", () => {
 		});
 	});
 
+	test("max_running is kept; a bad one is dropped with a warning", () => {
+		const ok = loaded({ chat: { max_running: 3 } });
+		assert.deepEqual(ok.profiles, { chat: { maxRunning: 3 } });
+		assert.deepEqual(ok.warnings, []);
+		for (const bad of [0, -1, 2.5, "3"]) {
+			const r = loaded({ chat: { max_running: bad } });
+			assert.deepEqual(r.profiles, { chat: {} }, JSON.stringify(bad));
+			assert.equal(r.warnings.length, 1);
+			assert.match(r.warnings[0], /max_running/);
+		}
+	});
+
 	test("missing run_profiles = none, no warning", () => {
 		const { profiles, warnings } = loaded(undefined);
 		assert.equal(profiles, undefined);

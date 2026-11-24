@@ -16,3 +16,15 @@ test("a Studio turn is told where it is and how to answer", () => {
 test("an unknown origin is treated as Slack, the safe default", () => {
 	assert.equal(deliveryInstruction("something-else"), "");
 });
+
+test("a conversation run is told its answer goes out through its own tools, never Slack; no other origin gets that line", () => {
+	const text = deliveryInstruction("conversation");
+	assert.ok(text, "a conversation run gets an instruction");
+	assert.match(text, /own tools/i);
+	assert.match(text, /Slack/);
+	assert.match(text, /never post/i);
+	for (const origin of ["slack", "studio", "whatsapp", "something-else"]) {
+		assert.notEqual(deliveryInstruction(origin), text, `${origin} must not get the conversation line`);
+	}
+	assert.ok(!/Ginnie Studio/.test(text) && !/WhatsApp/.test(text), "one generic line, not another origin's");
+});

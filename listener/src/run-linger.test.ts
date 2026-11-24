@@ -17,7 +17,9 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { existsSync } from "node:fs";
 import { agentForRun, profileEnv, runAgent, resumeAgent, type AgentConfig } from "./runner";
+import { listenerConversationRuns } from "./conversation-runs";
 
 const repoRoot = path.join(__dirname, "..", "..");
 const read = (p: string) => readFileSync(path.join(repoRoot, p), "utf-8");
@@ -77,8 +79,16 @@ describe("runAgent / resumeAgent: container env (fake docker)", () => {
 		agentDir = mkdtempSync(path.join(tmpdir(), "agent-a-"));
 		writeFileSync(path.join(agentDir, "PROMPT.md"), "test agent");
 		argsFile = path.join(bin, "args.txt");
+		writeFileSync(argsFile, "");
 		const script = path.join(bin, "docker");
-		writeFileSync(script, `#!/bin/sh\nprintf '%s\\n' "$@" >> "${argsFile}"\necho '{"session_id":"sess-x","is_error":false,"result":"ok"}'\n`);
+		// A container whose message is BLOCK stays up until the test drops the release file.
+		writeFileSync(script, [
+			"#!/bin/sh",
+			`printf '%s\\n' "$@" >> "${argsFile}"`,
+			`case "$*" in *AGENT_MESSAGE=BLOCK*) while [ ! -f "${path.join(bin, "release")}" ]; do sleep 0.02; done;; esac`,
+			`echo '{"session_id":"sess-x","is_error":false,"result":"ok"}'`,
+			"",
+		].join("\n"));
 		chmodSync(script, 0o755);
 		process.env.PATH = `${bin}:${savedPath}`;
 	});
@@ -119,6 +129,43 @@ describe("runAgent / resumeAgent: container env (fake docker)", () => {
 		assert.ok(a.includes("AGENT_EFFORT=low"), "the over-the-cap run keeps the rest of its profile");
 	});
 
+	test("an open conversation run (the listener's own wiring) does not hold up the same agent's Slack, schedule or wake runs", async () => {
+		const agent = agentWith(agentDir);
+		const inboxRoot = mkdtempSync(path.join(tmpdir(), "conv-inbox-"));
+		const store = mkdtempSync(path.join(tmpdir(), "conv-store-"));
+		const savedStore = process.env.GINNIE_THREAD_STORE;
+		process.env.GINNIE_THREAD_STORE = path.join(store, "threads.json");
+		const logs: string[] = [];
+		try {
+			const runs = listenerConversationRuns({ inboxRoot, log: (l) => logs.push(l) });
+			assert.equal(runs.deliver(agent, "conv-1", "BLOCK", "chat"), "started");
+			for (let i = 0; i < 200 && !readFileSync(argsFile, "utf8").includes("AGENT_MESSAGE=BLOCK"); i++) await new Promise((r) => setTimeout(r, 10));
+			const convArgs = lastArgs();
+			assert.ok(convArgs.includes("AGENT_MESSAGE=BLOCK"), "the conversation container is up");
+			assert.ok(convArgs.includes("MIDRUN_LINGER_MS=600000"), "it asked for the open-run wait");
+			assert.ok(convArgs.some((a) => a.startsWith("MIDRUN_DIR=")), "it has a mid-run inbox");
+			// While it stays open, the same agent's Slack line (schedule and wake files run there too) starts at once.
+			const t0 = Date.now();
+			const slack = await runAgent(agent, "slack message", "slack", undefined, "chat");
+			assert.equal(slack.isError, false);
+			assert.ok(Date.now() - t0 < 5_000, "the Slack run did not wait for the conversation run");
+			assert.equal(runs.openCount("agent-a"), 1, "the conversation run is still open");
+			writeFileSync(path.join(bin, "release"), "");
+			for (let i = 0; i < 300 && runs.openCount("agent-a") > 0; i++) await new Promise((r) => setTimeout(r, 10));
+			assert.equal(runs.openCount("agent-a"), 0);
+			const stored = JSON.parse(readFileSync(process.env.GINNIE_THREAD_STORE, "utf8"));
+			assert.equal(stored["agent-a|conversation:conv-1"]?.sessionId, "sess-x", "the session is stored under the conversation key");
+		} finally {
+			if (savedStore === undefined) delete process.env.GINNIE_THREAD_STORE;
+			else process.env.GINNIE_THREAD_STORE = savedStore;
+			rmSync(path.join(bin, "release"), { force: true });
+			rmSync(inboxRoot, { recursive: true, force: true });
+			rmSync(store, { recursive: true, force: true });
+			writeFileSync(argsFile, "");
+		}
+		assert.ok(existsSync(argsFile));
+	});
+
 	test("wiring: only the conversation route asks for the wait", () => {
 		const idx = read("listener/src/index.ts");
 		const bridge = read("listener/src/studio-bridge.ts");
@@ -129,8 +176,7 @@ describe("runAgent / resumeAgent: container env (fake docker)", () => {
 		}
 		assert.ok(bridge.includes(`run(agent, message, "studio")`));
 		assert.ok(bridge.includes(`resume(agent, sessionId, message, "studio")`));
-		// The conversation route hands its own linger choice through.
-		const conv = read("listener/src/conversation-runs.ts");
-		assert.ok(/linger/.test(conv));
+		// index.ts builds its conversation runs from the same factory the test above runs.
+		assert.ok(idx.includes("listenerConversationRuns("));
 	});
 });

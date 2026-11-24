@@ -286,7 +286,7 @@ async function startConverse(opts: { withRoute?: boolean } = {}): Promise<Conver
 	const server = startStudioBridge({
 		port: 0,
 		keyFile: writeKeyFile(GOOD_KEY),
-		listAgents: () => [fakeAgent("agent-a")],
+		listAgents: () => [{ ...fakeAgent("agent-a"), runProfiles: { chat: { lingerMinutes: 10 } } }],
 		converse: opts.withRoute === false ? undefined : (agent, conversation, message, profile) => runs.deliver(agent, conversation, message, profile),
 	});
 	await new Promise<void>((resolve) => server.once("listening", resolve));
@@ -394,4 +394,50 @@ test("converse: the message body never reaches the log (bridge and runs)", async
 	assert.ok(lines.some((l) => l.includes("conv-1") && l.includes("started")), `the bridge logs the delivery: ${lines.join(" | ")}`);
 	for (const l of all) assert.ok(!l.includes("SECRET"), `log line leaks the message: ${l}`);
 	await h!.close();
+});
+
+test("converse: a message over 100 KB (UTF-8 bytes) is 413, so the host falls back instead of a run that cannot start", async () => {
+	const h = await startConverse();
+	try {
+	const ok = await converse(h, { agent: "agent-a", conversation: "conv-1", message: "a".repeat(100 * 1024) });
+	assert.equal(ok.status, 202, "exactly 100 KB is accepted");
+	// 60,000 Hebrew letters: under 100 K characters, 120,000 bytes.
+	const big = await converse(h, { agent: "agent-a", conversation: "conv-2", message: "\u05d0".repeat(60_000) });
+	assert.equal(big.status, 413);
+	assert.deepEqual(await big.json(), { error: "too_large" });
+	const ascii = await converse(h, { agent: "agent-a", conversation: "conv-3", message: "a".repeat(100 * 1024 + 1) });
+	assert.equal(ascii.status, 413);
+	for (let i = 0; i < 50; i++) await new Promise((r) => setTimeout(r, 5));
+	assert.equal(h.pending.length, 1, "only the accepted message started a run");
+	} finally {
+		await h.close();
+	}
+});
+
+test("converse: the profile must be one the agent defines (400 otherwise); the raw profile is never logged", async () => {
+	const lines: string[] = [];
+	const saved = { log: console.log, warn: console.warn, error: console.error };
+	const grab = (...args: unknown[]) => { lines.push(args.map(String).join(" ")); };
+	console.log = grab; console.warn = grab; console.error = grab;
+	let h: ConverseHarness | undefined;
+	try {
+		h = await startConverse();
+		const bad = await converse(h, { agent: "agent-a", conversation: "conv-1", message: "hi", profile: "nope-PROFILE-SECRET" });
+		assert.equal(bad.status, 400);
+		assert.deepEqual(await bad.json(), { error: "bad_request" });
+		const empty = await converse(h, { agent: "agent-a", conversation: "conv-1", message: "hi", profile: "" });
+		assert.equal(empty.status, 400, "an empty profile is not a profile name");
+		const good = await converse(h, { agent: "agent-a", conversation: "conv-1", message: "hi", profile: "chat" });
+		assert.equal(good.status, 202);
+	} catch (err) {
+		await h?.close();
+		throw err;
+	} finally {
+		console.log = saved.log; console.warn = saved.warn; console.error = saved.error;
+	}
+	try {
+		for (const l of [...lines, ...h!.logs]) assert.ok(!l.includes("PROFILE-SECRET"), `raw profile logged: ${l}`);
+	} finally {
+		await h!.close();
+	}
 });

@@ -16,7 +16,6 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { ConversationRuns, CONVERSATION_ID } from "./conversation-runs";
-import { ThreadDispatcher } from "./thread-routing";
 import type { AgentConfig, AgentRunResult, RunOptions } from "./runner";
 
 const HOUR = 60 * 60 * 1000;
@@ -63,7 +62,12 @@ async function until(cond: () => boolean, what: string): Promise<void> {
 	assert.fail(`timed out waiting for: ${what}`);
 }
 
-function harness(extra: { maxOpen?: number; root?: string; store?: Map<string, { sessionId: string; createdAt: number }> } = {}) {
+function harness(extra: {
+	maxOpen?: number;
+	root?: string;
+	store?: Map<string, { sessionId: string; createdAt: number }>;
+	getSessionThrows?: { on: boolean };
+} = {}) {
 	const calls: Call[] = [];
 	const logs: string[] = [];
 	const store = extra.store ?? new Map<string, { sessionId: string; createdAt: number }>();
@@ -83,7 +87,10 @@ function harness(extra: { maxOpen?: number; root?: string; store?: Map<string, {
 		run: (agent, message, midrunDir, profile, opts) => call({ kind: "run", agent: agent.name, message, midrunDir, profile, opts }),
 		resume: (agent, sessionId, message, midrunDir, profile, opts) =>
 			call({ kind: "resume", agent: agent.name, sessionId, message, midrunDir, profile, opts }),
-		getSession: (agentName, conversation) => store.get(`${agentName}|${conversation}`),
+		getSession: (agentName, conversation) => {
+			if (extra.getSessionThrows?.on) throw new Error("store unreadable");
+			return store.get(`${agentName}|${conversation}`);
+		},
 		setSession: (agentName, conversation, sessionId) => store.set(`${agentName}|${conversation}`, { sessionId, createdAt: clock.now }),
 		now: () => clock.now,
 		maxOpen: extra.maxOpen,
@@ -257,7 +264,7 @@ describe("conversation runs", () => {
 		assert.ok(h.logs.some((l) => /failed/i.test(l) && l.includes("conv-1")), "the failure is logged");
 		// A run that throws (container never started) is logged too, and the line moves on.
 		h.runs.deliver(agent, "conv-1", "third", "chat");
-		h.calls[1].fail(new Error("spawn docker ENOENT"));
+		h.calls[1].fail(Object.assign(new Error("spawn docker ENOENT"), { code: "ENOENT" }));
 		await until(() => h.calls.length === 3, "next run after a thrown one");
 		assert.equal(h.calls[2].message, "third");
 		h.calls[2].finish();
@@ -335,24 +342,63 @@ describe("conversation runs", () => {
 		h.cleanup();
 	});
 
-	test("an open conversation run does not hold up the same agent's Slack or schedule work", async () => {
-		const h = harness();
+	test("a failure before the run (session store unreadable) leaks no open count, no inbox, and the line goes on", async () => {
+		const throws = { on: true };
+		const h = harness({ getSessionThrows: throws });
 		const agent = agentWith();
-		h.runs.deliver(agent, "conv-1", "chat message", "chat");
-		await until(() => h.calls.length === 1, "conversation run open (waiting for more messages)");
-		// The Slack line is its own dispatcher (index.ts), keyed by Slack thread.
-		const started: string[] = [];
-		const slack = new ThreadDispatcher<{ agent: { name: string }; channel: string; threadTs: string }>({
-			debounceMs: 0,
-			process: async (_a, batch) => { started.push(batch[0].threadTs); },
-		});
-		slack.enqueue({ agent: { name: "agent-a" }, channel: "C1", threadTs: "1700000000.000100" });
-		slack.enqueue({ agent: { name: "agent-a" }, channel: "C1", threadTs: "scheduled:daily" });
-		await slack.idle();
-		assert.deepEqual(started.sort(), ["1700000000.000100", "scheduled:daily"]);
-		assert.equal(h.runs.openCount("agent-a"), 1, "the conversation run is still open");
+		h.runs.deliver(agent, "conv-1", "first", "chat");
+		await until(() => h.logs.some((l) => /failed/.test(l)), "the failure is logged");
+		await tick(20);
+		assert.equal(h.calls.length, 0, "no run was started");
+		assert.equal(h.runs.openCount("agent-a"), 0, "the open count is back to 0");
+		assert.deepEqual(existsSync(h.root) ? readdirSync(h.root) : [], [], "no inbox folder is left");
+		throws.on = false;
+		assert.equal(h.runs.deliver(agent, "conv-1", "second", "chat"), "started", "the conversation is free again");
+		await until(() => h.calls.length === 1, "next run");
+		assert.equal(h.calls[0].opts.linger, true);
 		h.calls[0].finish();
 		await until(() => h.runs.openCount("agent-a") === 0, "run end");
+		h.cleanup();
+	});
+
+	test("max_running: beyond it new conversations wait in line (queued) until one ends; open ones still take messages", async () => {
+		const h = harness();
+		const agent = agentWith("agent-a", { runProfiles: { chat: { lingerMinutes: 10, maxRunning: 2 } } });
+		assert.equal(h.runs.deliver(agent, "conv-1", "a1", "chat"), "started");
+		assert.equal(h.runs.deliver(agent, "conv-2", "b1", "chat"), "started");
+		assert.equal(h.runs.deliver(agent, "conv-3", "c1", "chat"), "queued");
+		assert.equal(h.runs.deliver(agent, "conv-3", "c2", "chat"), "queued");
+		assert.equal(h.runs.deliver(agent, "conv-4", "d1", "chat"), "queued");
+		await until(() => h.calls.length === 2, "two runs");
+		await tick(20);
+		assert.equal(h.calls.length, 2, "the third conversation waits");
+		assert.equal(h.runs.deliver(agent, "conv-1", "a2", "chat"), "midrun", "a running conversation still takes messages");
+		modelTakesAll(h.calls[0].midrunDir!);
+		h.calls[0].finish();
+		await until(() => h.calls.length === 3, "conv-3 starts when conv-1 ends");
+		assert.equal(h.calls[2].message, "c1\n\nc2", "its waiting messages go in together, in order");
+		await tick(20);
+		assert.equal(h.calls.length, 3, "conv-4 still waits (2 running)");
+		h.calls[1].finish();
+		await until(() => h.calls.length === 4, "conv-4 starts");
+		assert.equal(h.calls[3].message, "d1");
+		h.calls[2].finish();
+		h.calls[3].finish();
+		await until(() => h.runs.openCount("agent-a") === 0, "runs end");
+		h.cleanup();
+	});
+
+	test("max_running defaults to 8 per agent", async () => {
+		const h = harness();
+		const agent = agentWith();
+		for (let i = 1; i <= 8; i++) assert.equal(h.runs.deliver(agent, `conv-${i}`, `m${i}`, "chat"), "started");
+		assert.equal(h.runs.deliver(agent, "conv-9", "m9", "chat"), "queued");
+		assert.equal(h.runs.deliver(agentWith("agent-b"), "conv-9", "b9", "chat"), "started", "another agent has its own ceiling");
+		await until(() => h.calls.length === 9, "nine runs");
+		h.calls[0].finish();
+		await until(() => h.calls.length === 10, "the ninth conversation starts");
+		for (const c of h.calls.slice(1)) c.finish();
+		await until(() => h.runs.openCount("agent-a") === 0 && h.runs.openCount("agent-b") === 0, "runs end");
 		h.cleanup();
 	});
 
