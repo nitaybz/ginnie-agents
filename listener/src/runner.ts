@@ -88,6 +88,99 @@ export interface AgentConfig {
 	// MCP tool servers this agent may use (config.json "tool_servers"; token
 	// in credentials.json under token_key). See tool-servers.ts.
 	toolServers?: Record<string, ToolServerRef>;
+	// Model, effort, preloaded skills and open-run wait per kind of run
+	// (config.json "run_profiles"). A run names its profile; none = agent defaults.
+	runProfiles?: Record<string, RunProfile>;
+}
+
+export type RunEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
+export interface RunProfile {
+	model?: string;
+	effort?: RunEffort;
+	/** Skill folder names under the agent's skills/ put straight into the system prompt. */
+	preloadSkills?: string[];
+	/** How long the run stays open for more messages after its answer (the wait itself lives in the entrypoint). */
+	lingerMinutes?: number;
+	/** How many such open runs the agent may have at once. */
+	lingerMaxOpen?: number;
+}
+
+const RUN_EFFORTS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+// Same rule the entrypoint applies, so a name can never climb out of skills/.
+const SKILL_NAME = /^[a-z0-9-]{1,40}$/;
+
+/**
+ * Check config.json "run_profiles". A bad value is dropped (the rest of the
+ * profile stays) and each profile with something dropped gets one warning, so
+ * a typo shows in the log instead of silently changing how runs behave.
+ */
+export function parseRunProfiles(raw: unknown, warn: (line: string) => void): Record<string, RunProfile> | undefined {
+	if (raw === undefined || raw === null) return undefined;
+	if (typeof raw !== "object" || Array.isArray(raw)) {
+		warn(`run_profiles ignored: expected an object of named profiles`);
+		return undefined;
+	}
+	const out: Record<string, RunProfile> = {};
+	for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			warn(`run_profiles.${name} ignored: expected an object`);
+			continue;
+		}
+		const v = value as Record<string, unknown>;
+		const dropped: string[] = [];
+		const p: RunProfile = {};
+		if (v.model !== undefined) {
+			if (typeof v.model === "string" && /^\S+$/.test(v.model.trim())) p.model = v.model.trim();
+			else dropped.push(`model ${JSON.stringify(v.model)}`);
+		}
+		if (v.effort !== undefined) {
+			if (typeof v.effort === "string" && RUN_EFFORTS.includes(v.effort)) p.effort = v.effort as RunEffort;
+			else dropped.push(`effort ${JSON.stringify(v.effort)} (allowed: ${RUN_EFFORTS.join(", ")})`);
+		}
+		if (v.preload_skills !== undefined) {
+			if (Array.isArray(v.preload_skills)) {
+				const good = v.preload_skills.filter((s): s is string => typeof s === "string" && SKILL_NAME.test(s));
+				const bad = v.preload_skills.filter((s) => !(typeof s === "string" && SKILL_NAME.test(s)));
+				if (bad.length) dropped.push(`preload_skills ${bad.map((b) => JSON.stringify(b)).join(", ")}`);
+				if (good.length) p.preloadSkills = good;
+			} else {
+				dropped.push(`preload_skills (expected a list of skill names)`);
+			}
+		}
+		if (v.linger_minutes !== undefined) {
+			if (typeof v.linger_minutes === "number" && Number.isFinite(v.linger_minutes) && v.linger_minutes > 0) p.lingerMinutes = v.linger_minutes;
+			else dropped.push(`linger_minutes ${JSON.stringify(v.linger_minutes)}`);
+		}
+		if (v.linger_max_open !== undefined) {
+			if (typeof v.linger_max_open === "number" && Number.isInteger(v.linger_max_open) && v.linger_max_open > 0) p.lingerMaxOpen = v.linger_max_open;
+			else dropped.push(`linger_max_open ${JSON.stringify(v.linger_max_open)}`);
+		}
+		if (dropped.length) warn(`run_profiles.${name}: dropped ${dropped.join("; ")}`);
+		out[name] = p;
+	}
+	return Object.keys(out).length ? out : undefined;
+}
+
+/** The model a run uses: its profile's, else the agent's. */
+export function profileModel(agent: AgentConfig, profile?: string): string | undefined {
+	const p = profile ? agent.runProfiles?.[profile] : undefined;
+	return p?.model || agent.model;
+}
+
+/**
+ * Docker `-e` args for a run's profile. An unknown or missing profile gives the
+ * agent defaults: its model only, default effort, nothing preloaded, no wait.
+ */
+export function profileEnv(agent: AgentConfig, profile?: string): string[] {
+	const p = profile ? agent.runProfiles?.[profile] : undefined;
+	const args: string[] = [];
+	const model = profileModel(agent, profile);
+	if (model) args.push("-e", `AGENT_MODEL=${model}`);
+	if (p?.effort) args.push("-e", `AGENT_EFFORT=${p.effort}`);
+	if (p?.preloadSkills?.length) args.push("-e", `PRELOAD_SKILLS=${p.preloadSkills.join(",")}`);
+	if (p?.lingerMinutes) args.push("-e", `MIDRUN_LINGER_MS=${Math.round(p.lingerMinutes * 60_000)}`);
+	return args;
 }
 
 interface AgentManifest {
@@ -108,6 +201,7 @@ interface AgentManifest {
 	handoff_channels?: unknown;
 	agent_turn_cap?: unknown;
 	tool_servers?: unknown;
+	run_profiles?: unknown;
 }
 
 // How long an interactive (actions) block stays live before the listener's
@@ -239,6 +333,7 @@ export function loadAgents(): AgentConfig[] {
 			),
 			botPolicy: bots.policy,
 			toolServers: toolServerNames.length ? toolServerRefs(manifest, tools.servers) : undefined,
+			runProfiles: parseRunProfiles(manifest.run_profiles, (line) => console.warn(`[${entry.name}] ${line}`)),
 		});
 	}
 
@@ -257,8 +352,10 @@ export async function runAgent(
 	origin: DeliveryOrigin = "slack",
 	// Inbox folder for messages that arrive while this run works (midrun-inbox.ts).
 	midrunDir?: string,
+	// Kind of run (a key of config.json "run_profiles"); none = agent defaults.
+	profile?: string,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, undefined, origin, midrunDir);
+	return spawnContainer(agent, message, undefined, origin, midrunDir, profile);
 }
 
 /**
@@ -270,8 +367,9 @@ export async function resumeAgent(
 	message: string,
 	origin: DeliveryOrigin = "slack",
 	midrunDir?: string,
+	profile?: string,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, sessionId, origin, midrunDir);
+	return spawnContainer(agent, message, sessionId, origin, midrunDir, profile);
 }
 
 /**
@@ -303,17 +401,22 @@ async function spawnContainer(
 	resumeId?: string,
 	origin: DeliveryOrigin = "slack",
 	midrunDir?: string,
+	profile?: string,
 ): Promise<AgentRunResult> {
+	if (profile && !agent.runProfiles?.[profile]) {
+		console.warn(`[${agent.name}] Run profile "${profile}" is not in config.json run_profiles; using the agent defaults`);
+	}
 	let out;
 	try {
 		out = await runWithAccountFallback({
 			accounts: loadClaudeAccounts(process.env),
 			cooldownFile: ACCOUNT_COOLDOWNS_FILE,
-			model: agent.model,
+			// The run's own model, so a limit on one model family cools only that family.
+			model: profileModel(agent, profile),
 			// A continuation resumes the limited try's session on the next
 			// account instead of replaying the original request.
 			attempt: (account, cont) =>
-				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont, midrunDir),
+				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont, midrunDir, profile),
 			log: (line) => console.log(`[${agent.name}] ${line}`),
 		});
 	} catch (err) {
@@ -389,6 +492,7 @@ export function spawnAttempt(
 	// fail, never start over (that would repeat completed actions).
 	strictResume = false,
 	midrunDir?: string,
+	profile?: string,
 ): Promise<AttemptResult> {
 	return new Promise((resolve, reject) => {
 		const containerName = `ginnie-${agent.name}-${Date.now()}`;
@@ -470,9 +574,8 @@ export function spawnAttempt(
 			if (strictResume) dockerArgs.push("-e", "RESUME_STRICT=1");
 		}
 
-		if (agent.model) {
-			dockerArgs.push("-e", `AGENT_MODEL=${agent.model}`);
-		}
+		// Model, effort, preloaded skills and open-run wait for this kind of run.
+		dockerArgs.push(...profileEnv(agent, profile));
 
 		// Bottom-line channel (framework/skills/bottom-line). Off when unset.
 		dockerArgs.push(...bottomLineDockerEnv(process.env));
@@ -574,7 +677,8 @@ export function spawnAttempt(
 		// Account label and requested model only; never the token.
 		console.log(
 			`[${agent.name}] Starting container ${containerName}${resumeId ? " (resume)" : " (new)"} ` +
-			`account=${account ? account.label : "host-credentials"} model=${agent.model || "default"}...`,
+			`account=${account ? account.label : "host-credentials"} model=${profileModel(agent, profile) || "default"}` +
+			`${profile ? ` profile=${profile}` : ""}...`,
 		);
 
 		const child = spawn("docker", dockerArgs, {

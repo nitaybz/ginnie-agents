@@ -142,8 +142,12 @@ describe("run profiles: wiring", () => {
 		const src = read("listener/src/runner.ts");
 		assert.ok(src.includes("parseRunProfiles(manifest.run_profiles"));
 		assert.ok(src.includes("profileEnv(agent, profile)"));
-		assert.match(src, /export async function runAgent\([^)]*profile\?: string/s);
-		assert.match(src, /export async function resumeAgent\([^)]*profile\?: string/s);
+		const params = (fn: string) => {
+			const start = src.indexOf(`export async function ${fn}(`);
+			return src.slice(start, src.indexOf("): Promise<AgentRunResult>", start));
+		};
+		assert.ok(params("runAgent").includes("profile?: string"));
+		assert.ok(params("resumeAgent").includes("profile?: string"));
 	});
 
 	test("entrypoint passes the effort and preloads the named skills", () => {
