@@ -77,7 +77,13 @@ function checkSettings(raw: any): string | null {
 }
 
 /** Returns the process exit code. deps.agents replaces the agents/ folder lookup (tests). */
-export async function runReplayCli(argv: string[], deps: ReplayDeps & { agents?: AgentConfig[] } = {}): Promise<number> {
+export interface CliDeps extends ReplayDeps {
+	agents?: AgentConfig[];
+	/** The .env read for Claude accounts (default: the framework root .env, as the listener reads it). */
+	envFile?: string;
+}
+
+export async function runReplayCli(argv: string[], deps: CliDeps = {}): Promise<number> {
 	const say = (line: string) => console.error(`[replay] ${line}`);
 	const name = arg(argv, "--agent"), casesFile = arg(argv, "--cases"), settingsFile = arg(argv, "--settings"), outDir = arg(argv, "--out");
 	if (!name || !casesFile || !settingsFile || !outDir) {

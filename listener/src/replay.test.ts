@@ -13,13 +13,15 @@ import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
-	existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync,
+	existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { AgentConfig } from "./runner";
 import { makeSandbox, replayOne, runTimings } from "./replay";
 import { runReplayCli } from "./replay-cli";
+import { spawnAttempt } from "./runner";
+import type { ClaudeAccount } from "./claude-accounts";
 
 const made: string[] = [];
 const tmp = (p: string) => { const d = mkdtempSync(path.join(tmpdir(), `replay-test-${p}-`)); made.push(d); return d; };
@@ -234,6 +236,13 @@ fs.mkdirSync(path.join(sessions, "projects", "-workspace"), { recursive: true })
 fs.writeFileSync(path.join(sessions, "projects", "-workspace", "s-fake.jsonl"), ${JSON.stringify(transcript)});
 if (mounts["/workspace/data"]) { fs.mkdirSync(path.join(mounts["/workspace/data"], "out"), { recursive: true }); fs.writeFileSync(path.join(mounts["/workspace/data"], "out", "reply.json"), JSON.stringify({ text: "written by " + env.AGENT_MODEL })); }
 if (mounts["/workspace/memory"]) fs.writeFileSync(path.join(mounts["/workspace/memory"], "rules.md"), "changed by the run");
+// Links a hostile run could plant, pointing outside the sandbox.
+const out = mounts["/workspace/data"] && path.join(mounts["/workspace/data"], "out");
+if (process.env.PLANT_OUT_LINK) { fs.rmSync(out, { recursive: true, force: true }); fs.symlinkSync(process.env.PLANT_OUT_LINK, out); }
+if (process.env.PLANT_FILE_LINK) fs.symlinkSync(process.env.PLANT_FILE_LINK, path.join(out, "linked.txt"));
+if (process.env.PLANT_DIR_LINK) fs.symlinkSync(process.env.PLANT_DIR_LINK, path.join(out, "linked-dir"));
+if (process.env.PLANT_TRANSCRIPT_LINK) { const w = path.join(sessions, "projects", "-workspace"); fs.rmSync(w, { recursive: true, force: true }); fs.symlinkSync(process.env.PLANT_TRANSCRIPT_LINK, w); }
+if (process.env.PLANT_TRANSCRIPT_FILE_LINK) { const f = path.join(sessions, "projects", "-workspace", "s-fake.jsonl"); fs.rmSync(f); fs.symlinkSync(process.env.PLANT_TRANSCRIPT_FILE_LINK, f); }
 console.log(JSON.stringify({ session_id: "s-fake", is_error: false, result: "final text", model: env.AGENT_MODEL, tool_calls: 2 }));
 `;
 	writeFileSync(path.join(dir, "docker"), script, { mode: 0o755 });
@@ -241,11 +250,13 @@ console.log(JSON.stringify({ session_id: "s-fake", is_error: false, result: "fin
 }
 
 async function withFakeDocker<T>(bin: string, fn: () => Promise<T>): Promise<T> {
-	const saved = { PATH: process.env.PATH, BL: process.env.BOTTOM_LINE_CHANNEL };
+	const saved = { PATH: process.env.PATH, BL: process.env.BOTTOM_LINE_CHANNEL, HOME: process.env.HOME };
 	const log = console.log, warn = console.warn, err = console.error, write = process.stderr.write.bind(process.stderr);
 	// Only the fake on PATH, so a real docker can never start from a test.
 	process.env.PATH = bin;
 	process.env.BOTTOM_LINE_CHANNEL = "C-bottom-line";
+	// A home with a host Claude login file: a replay must never mount it.
+	process.env.HOME = fakeHome();
 	console.log = () => {}; console.warn = () => {}; console.error = () => {};
 	(process.stderr as any).write = () => true;
 	try {
@@ -253,10 +264,21 @@ async function withFakeDocker<T>(bin: string, fn: () => Promise<T>): Promise<T> 
 	} finally {
 		console.log = log; console.warn = warn; console.error = err; (process.stderr as any).write = write;
 		process.env.PATH = saved.PATH;
+		process.env.HOME = saved.HOME;
 		if (saved.BL === undefined) delete process.env.BOTTOM_LINE_CHANNEL; else process.env.BOTTOM_LINE_CHANNEL = saved.BL;
 	}
 }
 
+function fakeHome(): string {
+	const home = tmp("home");
+	mkdirSync(path.join(home, ".claude"));
+	writeFileSync(path.join(home, ".claude", ".credentials.json"), JSON.stringify({ claudeAiOauth: { accessToken: "host-login-test" } }));
+	return home;
+}
+
+const HOST_LOGIN = "/home/node/.claude/.credentials.json";
+const TEST_ACCOUNT: ClaudeAccount = { label: "A", envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "sk-test-replay" };
+const oneAccount = { accounts: [TEST_ACCOUNT], cooldownFile: path.join(tmp("cool"), "cooldowns.json") };
 const noAccounts = { accounts: [], cooldownFile: path.join(tmp("cool"), "cooldowns.json") };
 
 describe("replayOne", () => {
@@ -272,7 +294,7 @@ describe("replayOne", () => {
 			env: { READONLY_GATE_URL: "http://gate.invalid" },
 			keepData: ["keep"],
 			replyMarker: /chat\.mjs (reply|handoff)/,
-		}, noAccounts));
+		}, oneAccount));
 		try {
 			assert.equal(r.ok, true, r.reason);
 			assert.equal(r.model, "model-x");
@@ -298,6 +320,7 @@ describe("replayOne", () => {
 			assert.ok(!argv.includes(agentDir), "nothing mounted from the real agent folder");
 			assert.equal(seen.mounts["/home/node/.claude"], path.join(r.sandbox, "sessions"));
 			assert.equal(seen.mounts["/workspace/credentials.json"], undefined, "no credentials mounted");
+			assert.ok(!seen.args.some((a: string) => a.includes(HOST_LOGIN)), "no host Claude login mounted");
 			assert.match(seen.args[seen.args.indexOf("--name") + 1], /^ginnie-replay-agent-a-\d+$/);
 
 			// The sandbox is left for the caller; the run's writes landed there.
@@ -313,7 +336,7 @@ describe("replayOne", () => {
 		const { bin } = fakeDocker();
 		const r = await withFakeDocker(bin, () => replayOne(agentWith(fixtureAgent()), {
 			prompt: "hello", model: "not-a-model", replyMarker: /reply/,
-		}, noAccounts));
+		}, oneAccount));
 		try {
 			assert.equal(r.ok, false);
 			assert.match(r.reason || "", /not-a-model/);
@@ -326,7 +349,7 @@ describe("replayOne", () => {
 		const empty = tmp("empty-bin");
 		const r = await withFakeDocker(empty, () => replayOne(agentWith(fixtureAgent()), {
 			prompt: "hello", model: "model-x", replyMarker: /reply/,
-		}, noAccounts));
+		}, oneAccount));
 		try {
 			assert.equal(r.ok, false);
 			assert.match(r.reason || "", /ENOENT|spawn/);
@@ -341,12 +364,19 @@ describe("replayOne", () => {
 			{ env: { CLAUDE_CODE_OAUTH_TOKEN: "x" } },
 			{ env: { AGENT_MODEL: "other" } },
 			{ env: { "bad name": "x" } },
+			{ env: { LD_PRELOAD: "/x.so" } },
+			{ env: { LD_LIBRARY_PATH: "/x" } },
+			{ env: { NODE_OPTIONS: "--require /x.js" } },
+			{ env: { DOCKER_HOST: "tcp://x" } },
+			{ env: { PATH: "/x" } },
+			{ env: { HOME: "/x" } },
+			{ env: { lower_case: "x" } },
 			{ model: "has space" },
 		];
 		for (const extra of cases) {
 			const r = await withFakeDocker(bin, () => replayOne(agentWith(fixtureAgent()), {
 				prompt: "hello", model: "model-x", replyMarker: /reply/, ...extra,
-			} as any, noAccounts));
+			} as any, oneAccount));
 			assert.equal(r.ok, false, JSON.stringify(extra));
 			assert.ok(r.reason, JSON.stringify(extra));
 			if (r.sandbox) rmSync(r.sandbox, { recursive: true, force: true });
@@ -379,7 +409,7 @@ describe("replay CLI", () => {
 		const { bin } = fakeDocker();
 		const code = await withFakeDocker(bin, () => runReplayCli(
 			["--agent", "agent-a", "--cases", cases, "--settings", settings, "--out", out],
-			{ agents: [agentWith(agentDir)], sandboxRoot, ...noAccounts },
+			{ agents: [agentWith(agentDir)], sandboxRoot, ...oneAccount },
 		));
 		assert.equal(code, 0);
 		assert.equal(statSync(out).mode & 0o777, 0o700, "results folder private to this user");
@@ -399,10 +429,167 @@ describe("replay CLI", () => {
 
 	test("an unknown agent or a missing argument exits non-zero without running anything", async () => {
 		const { bin, seenFile } = fakeDocker();
-		const code1 = await withFakeDocker(bin, () => runReplayCli(["--agent", "nobody", "--cases", "x", "--settings", "y", "--out", "z"], { agents: [], ...noAccounts }));
-		const code2 = await withFakeDocker(bin, () => runReplayCli(["--agent", "agent-a"], { agents: [], ...noAccounts }));
+		const code1 = await withFakeDocker(bin, () => runReplayCli(["--agent", "nobody", "--cases", "x", "--settings", "y", "--out", "z"], { agents: [], ...oneAccount }));
+		const code2 = await withFakeDocker(bin, () => runReplayCli(["--agent", "agent-a"], { agents: [], ...oneAccount }));
 		assert.notEqual(code1, 0);
 		assert.notEqual(code2, 0);
 		assert.ok(!existsSync(seenFile));
+	});
+});
+
+describe("replay never gets the host Claude login", () => {
+	test("a replay with no Claude account is refused before any container starts", async () => {
+		const { bin, seenFile } = fakeDocker();
+		const r = await withFakeDocker(bin, () => replayOne(agentWith(fixtureAgent()), {
+			prompt: "hello", model: "model-x", replyMarker: /reply/,
+		}, noAccounts));
+		assert.equal(r.ok, false);
+		assert.match(r.reason || "", /account/);
+		assert.equal(r.sandbox, "");
+		assert.ok(!existsSync(seenFile), "docker was never called");
+	});
+
+	test("spawnAttempt for a replay never adds the host login mount, even with no account", async () => {
+		const { bin, seenFile } = fakeDocker();
+		const dir = fixtureAgent();
+		const agent = agentWith(dir);
+		let err: unknown;
+		try {
+			await withFakeDocker(bin, () => spawnAttempt(agent, "hello", undefined, "slack", null, false, undefined, undefined, { replay: true }));
+		} catch (e) { err = e; }
+		const seen = existsSync(seenFile) ? JSON.parse(readFileSync(seenFile, "utf-8")) : [];
+		for (const run of seen) assert.ok(!run.args.some((a: string) => a.includes(HOST_LOGIN)), "host login mounted for a replay");
+		assert.match(String(err), /account/, "a replay with no account is refused");
+		assert.equal(seen.length, 0, "docker was never called");
+	});
+
+	test("the CLI reads the framework .env for the Claude account, like the listener", async () => {
+		const agentDir = fixtureAgent();
+		const work = tmp("cli-env");
+		const envFile = path.join(work, ".env");
+		writeFileSync(envFile, "CLAUDE_CODE_OAUTH_TOKEN=sk-from-env-file\n");
+		writeFileSync(path.join(work, "cases.jsonl"), JSON.stringify({ id: "case-1", prompt: "hello" }) + "\n");
+		writeFileSync(path.join(work, "settings.json"), JSON.stringify({ replyMarker: "reply", settings: [{ model: "model-x" }] }));
+		const { bin, seenFile } = fakeDocker();
+		const saved = { t: process.env.CLAUDE_CODE_OAUTH_TOKEN, k: process.env.ANTHROPIC_API_KEY };
+		delete process.env.CLAUDE_CODE_OAUTH_TOKEN; delete process.env.ANTHROPIC_API_KEY;
+		let code: number;
+		try {
+			code = await withFakeDocker(bin, () => runReplayCli(
+				["--agent", "agent-a", "--cases", path.join(work, "cases.jsonl"), "--settings", path.join(work, "settings.json"), "--out", path.join(work, "out"), "--sandbox-root", path.join(work, "sb")],
+				{ agents: [agentWith(agentDir)], envFile, cooldownFile: path.join(work, "cool.json") },
+			));
+		} finally {
+			if (saved.t === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN; else process.env.CLAUDE_CODE_OAUTH_TOKEN = saved.t;
+			if (saved.k === undefined) delete process.env.ANTHROPIC_API_KEY; else process.env.ANTHROPIC_API_KEY = saved.k;
+		}
+		assert.equal(code!, 0);
+		const [seen] = JSON.parse(readFileSync(seenFile, "utf-8"));
+		assert.equal(seen.env.CLAUDE_CODE_OAUTH_TOKEN, "(from env) sk-from-env-file");
+		assert.ok(!seen.args.some((a: string) => a.includes(HOST_LOGIN)));
+	});
+});
+
+describe("links the run plants are never followed", () => {
+	function outside(): string {
+		const d = tmp("outside");
+		writeFileSync(path.join(d, "secret.txt"), "outside secret");
+		writeFileSync(path.join(d, "s-fake.jsonl"), fixtureTranscript());
+		return d;
+	}
+
+	async function cliWith(env: Record<string, string>) {
+		const agentDir = fixtureAgent();
+		const work = tmp("cli-link");
+		writeFileSync(path.join(work, "cases.jsonl"), JSON.stringify({ id: "case-1", prompt: "hello" }) + "\n");
+		writeFileSync(path.join(work, "settings.json"), JSON.stringify({ replyMarker: "chat\\.mjs reply", outputDir: "data/out", env, settings: [{ model: "model-x" }] }));
+		const sandboxRoot = path.join(work, "sandboxes");
+		const { bin } = fakeDocker();
+		const code = await withFakeDocker(bin, () => runReplayCli(
+			["--agent", "agent-a", "--cases", path.join(work, "cases.jsonl"), "--settings", path.join(work, "settings.json"), "--out", path.join(work, "out"), "--sandbox-root", sandboxRoot],
+			{ agents: [agentWith(agentDir)], ...oneAccount },
+		));
+		const rows = readFileSync(path.join(work, "out", "results.jsonl"), "utf-8").trim().split("\n").map((l) => JSON.parse(l));
+		return { code, rows, sandboxRoot };
+	}
+
+	test("an output folder replaced by a link to a folder outside the sandbox is refused, not read", async () => {
+		const { code, rows, sandboxRoot } = await cliWith({ PLANT_OUT_LINK: outside() });
+		assert.equal(code, 0);
+		assert.deepEqual(rows[0].outputs, {});
+		assert.match(rows[0].outputsError, /link/);
+		assert.ok(!JSON.stringify(rows).includes("outside secret"));
+		assert.deepEqual(readdirSync(sandboxRoot), []);
+	});
+
+	test("links inside the output folder (to a file or a folder outside) are skipped, the rest is read", async () => {
+		const o = outside();
+		const { rows } = await cliWith({ PLANT_FILE_LINK: path.join(o, "secret.txt"), PLANT_DIR_LINK: o });
+		assert.deepEqual(Object.keys(rows[0].outputs), ["reply.json"]);
+		assert.deepEqual(rows[0].outputsSkipped.sort(), ["linked-dir", "linked.txt"]);
+		assert.ok(!JSON.stringify(rows).includes("outside secret"));
+	});
+
+	test("a transcript folder or file replaced by a link is not read", async () => {
+		const o = outside();
+		const plants: Record<string, string>[] = [{ PLANT_TRANSCRIPT_LINK: o }, { PLANT_TRANSCRIPT_FILE_LINK: path.join(o, "s-fake.jsonl") }];
+		for (const env of plants) {
+			const { bin } = fakeDocker();
+			const r = await withFakeDocker(bin, () => replayOne(agentWith(fixtureAgent()), {
+				prompt: "hello", model: "model-x", replyMarker: /reply/, env,
+			}, oneAccount));
+			try {
+				assert.equal(r.ok, false, JSON.stringify(env));
+				assert.match(r.reason || "", /no transcript/);
+				assert.equal(r.toReplyMs, null);
+			} finally { if (r.sandbox) rmSync(r.sandbox, { recursive: true, force: true }); }
+		}
+	});
+
+	test("the sandbox copy skips links at any depth", () => {
+		const agentDir = fixtureAgent();
+		const o = outside();
+		symlinkSync(o, path.join(agentDir, "memory", "linked-dir"));
+		symlinkSync(path.join(o, "secret.txt"), path.join(agentDir, "data", "keep", "linked.txt"));
+		symlinkSync(path.join(o, "secret.txt"), path.join(agentDir, "top-link.md"));
+		const sb = makeSandbox(agentDir, { keepData: ["keep"] });
+		try {
+			for (const rel of ["memory/linked-dir", "data/keep/linked.txt", "top-link.md"]) {
+				assert.ok(!existsSync(path.join(sb, rel)), `${rel} copied`);
+			}
+			assert.equal(readFileSync(path.join(sb, "data/keep/a.txt"), "utf-8"), "kept");
+		} finally { rmSync(sb, { recursive: true, force: true }); }
+	});
+});
+
+describe("sandboxes are always deleted", () => {
+	test("a failure after the sandbox is made deletes it and answers ok:false", async () => {
+		class Boom extends RegExp { get flags(): string { throw new Error("boom while reading"); } }
+		const root = tmp("sb-root");
+		const { bin } = fakeDocker();
+		const r = await withFakeDocker(bin, () => replayOne(agentWith(fixtureAgent()), {
+			prompt: "hello", model: "model-x", replyMarker: new Boom("reply"),
+		}, { ...oneAccount, sandboxRoot: root }));
+		assert.equal(r.ok, false);
+		assert.match(r.reason || "", /boom/);
+		assert.equal(r.sandbox, "");
+		assert.deepEqual(readdirSync(root), []);
+	});
+
+	test("--sandbox-root is created private to this user and left empty", async () => {
+		const agentDir = fixtureAgent();
+		const work = tmp("cli-root");
+		writeFileSync(path.join(work, "cases.jsonl"), JSON.stringify({ id: "case-1", prompt: "hello" }) + "\n");
+		writeFileSync(path.join(work, "settings.json"), JSON.stringify({ replyMarker: "reply", settings: [{ model: "model-x" }] }));
+		const root = path.join(work, "host-only", "sandboxes");
+		const cool = path.join(work, "own-cooldowns.json");
+		const { bin } = fakeDocker();
+		const code = await withFakeDocker(bin, () => runReplayCli(
+			["--agent", "agent-a", "--cases", path.join(work, "cases.jsonl"), "--settings", path.join(work, "settings.json"), "--out", path.join(work, "out"), "--sandbox-root", root, "--cooldown-file", cool],
+			{ agents: [agentWith(agentDir)], accounts: [TEST_ACCOUNT] },
+		));
+		assert.equal(code, 0);
+		assert.equal(statSync(root).mode & 0o777, 0o700);
+		assert.deepEqual(readdirSync(root), []);
 	});
 });
