@@ -126,6 +126,50 @@ describe("open-run wait (lingerMs)", () => {
 		await f.tick(2000);
 		assert.equal(f.ended(), true);
 	});
+
+	test("a message taken just before the wait runs out keeps the run open while the model works on it", async (t) => {
+		const f = await start(t, { lingerMs: 10_000, pollMs: 500 });
+		f.feed.observe(assistant("a1"));
+		f.feed.observe(result());
+		await f.tick(9200);
+		assert.equal(f.inbox.offer("m1", "one more thing"), true);
+		await f.tick(300); // 9.5 s: handed
+		assert.equal(f.got.length, 2, "handed at 9.5 s");
+		f.feed.observe({ type: "user", isReplay: true, uuid: f.got[1].uuid }); // the program takes it; its answer starts later
+		await f.tick(1500); // 11 s: the first wait has passed, the model is still thinking
+		assert.equal(f.ended(), false, "input still open while the model works on the taken message");
+		assert.equal(f.inbox.offer("m2", "and another"), true, "a second message at 11 s still reaches this run");
+		await f.tick(500); // 11.5 s: handed
+		assert.equal(f.got.length, 3);
+		await f.tick(500); // 12 s: the model's first output on m1
+		f.feed.observe(assistant("a2"));
+		f.feed.observe({ type: "user", isReplay: true, uuid: f.got[2].uuid });
+		f.feed.observe(result());
+		await f.tick(9000);
+		assert.equal(f.ended(), false, "the wait restarts after that turn's result");
+		await f.tick(1500);
+		assert.equal(f.ended(), true, "and ends when it runs out");
+		assert.deepEqual(f.inbox.finish(), [], "both messages seen by this run: none run again");
+	});
+
+	test("background work still running at the answer holds the run past the wait; it ends once that work is done and the wait has passed", async (t) => {
+		const f = await start(t, { lingerMs: 5000, graceMs: 1000 });
+		f.feed.observe(assistant("a1"));
+		f.feed.observe({ type: "system", subtype: "background_tasks_changed", tasks: [{ id: "b1" }] });
+		f.feed.observe(result());
+		await f.tick(7000);
+		assert.equal(f.ended(), false, "held by the background work after the 5 s wait");
+		assert.equal(f.inbox.offer("m0", "probe"), true, "still taking messages");
+		await f.tick(1000); // 8 s: handed; the program takes it and answers
+		f.takeLast("a2");
+		f.feed.observe({ type: "system", subtype: "background_tasks_changed", tasks: [] });
+		f.feed.observe(result());
+		await f.tick(4000);
+		assert.equal(f.ended(), false, "a new 5 s wait after that answer");
+		await f.tick(2000);
+		assert.equal(f.ended(), true, "background done, grace and wait passed: the run ends");
+		assert.deepEqual(f.inbox.finish(), []);
+	});
 });
 
 describe("open-run wait setting (MIDRUN_LINGER_MS)", () => {
