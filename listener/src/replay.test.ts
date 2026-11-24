@@ -9,7 +9,7 @@
  * Run: cd listener && npx tsc && node --test dist/replay.test.js
  */
 
-import { test, describe } from "node:test";
+import { test, describe, after } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
@@ -21,7 +21,9 @@ import type { AgentConfig } from "./runner";
 import { makeSandbox, replayOne, runTimings } from "./replay";
 import { runReplayCli } from "./replay-cli";
 
-const tmp = (p: string) => mkdtempSync(path.join(tmpdir(), `replay-test-${p}-`));
+const made: string[] = [];
+const tmp = (p: string) => { const d = mkdtempSync(path.join(tmpdir(), `replay-test-${p}-`)); made.push(d); return d; };
+after(() => { for (const d of made) rmSync(d, { recursive: true, force: true }); });
 
 function agentWith(dir: string, extra: Partial<AgentConfig> = {}): AgentConfig {
 	return {
