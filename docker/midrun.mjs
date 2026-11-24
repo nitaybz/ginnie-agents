@@ -24,6 +24,21 @@ import path from "path";
 // A run takes at most this many mid-run messages; the next one waits for the next run.
 export const MAX_MIDRUN_MESSAGES = 20;
 
+// The longest a run stays open for more messages after an answer.
+export const MAX_LINGER_MS = 60 * 60 * 1000;
+
+/**
+ * The open-run wait for this run, from MIDRUN_LINGER_MS. A run with no mid-run
+ * inbox (none given, or the feed is off) does not wait: it ends at its result.
+ * Not a number, negative or empty = 0; above MAX_LINGER_MS = MAX_LINGER_MS.
+ */
+export function lingerMsFor(raw, hasInbox) {
+	if (!hasInbox || typeof raw !== "string" || !raw.trim()) return 0;
+	const ms = Number(raw);
+	if (!Number.isFinite(ms) || ms <= 0) return 0;
+	return Math.min(Math.round(ms), MAX_LINGER_MS);
+}
+
 const jsonFiles = (dir) => (existsSync(dir) ? readdirSync(dir).filter((n) => n.endsWith(".json")).sort() : []);
 
 function move(dir, from, to, name) {
@@ -132,16 +147,22 @@ const userMessage = (text, uuid) => ({
  * program can still take a message it was handed after that (it does so after
  * a max-turns result), so confirmations are recorded until the query is over.
  *
+ * With lingerMs > 0 the run also stays open after each answer: the inbox keeps
+ * taking messages until lingerMs (at most holdMs) has passed with no new turn.
+ * A message that arrives is handed over and starts a turn; its result starts
+ * the wait again. The caps above still close the inbox and end the wait.
+ *
  * @param {object} o
  * @param {number} o.maxTurns     turn budget of the whole run, follow-up turns included
  * @param {number} o.maxMessages  cap on mid-run messages
+ * @param {number} o.lingerMs    open-run wait after each answer (0 = end at the result)
  * @param {boolean} o.refeedSeen  this try replays the original request in a session that
  *                                does not have the earlier one's history: hand over again
  *                                what that one had already seen
  */
 export function createFeed(dir, firstPrompt, {
 	pollMs = 2000, idleMs = 60000, graceMs = 20000, holdMs = 2 * 3600 * 1000,
-	maxTurns = Infinity, maxMessages = MAX_MIDRUN_MESSAGES, refeedSeen = false, log = () => {},
+	maxTurns = Infinity, maxMessages = MAX_MIDRUN_MESSAGES, refeedSeen = false, lingerMs = 0, log = () => {},
 } = {}) {
 	openInbox(dir);
 	if (refeedSeen) for (const name of jsonFiles(path.join(dir, "seen"))) move(dir, "seen", "claimed", name);
@@ -171,6 +192,9 @@ export function createFeed(dir, firstPrompt, {
 		// Work that never ends must not hold the run for ever: then end the input as before.
 		return Date.now() - heldSince < holdMs;
 	};
+	// The open-run wait: set at each answer, cleared when a turn starts.
+	let lingerUntil = 0;
+	const lingering = () => taking && Date.now() < lingerUntil;
 
 	const stopTaking = (why) => {
 		if (!taking) return;
@@ -201,7 +225,11 @@ export function createFeed(dir, firstPrompt, {
 	const settle = () => {
 		if (inputEnded || !resultIn) return;
 		if (taking) take(claim(dir, maxMessages - handed));
-		if (unseen.size === 0) return holding() ? undefined : endInput();
+		if (unseen.size === 0) {
+			if (holding() || lingering()) return;
+			if (lingerUntil && taking) log("no message in the open-run wait; the run ends");
+			return endInput();
+		}
 		// A handed message starts a new turn. If the program never takes it, stop
 		// waiting: it stays in claimed/ and the listener runs it as a new run.
 		if (idleTimer) return;
@@ -236,9 +264,14 @@ export function createFeed(dir, firstPrompt, {
 				unseen.delete(msg.uuid);
 				clearTimeout(idleTimer);
 				idleTimer = null;
+				// The model is now working on it, though its first output may come after the
+				// current wait ends: start the wait again so the inbox stays open meanwhile.
+				// Bounded: if no turn ever starts, the run still ends when this wait runs out.
+				if (taking && lingerMs > 0) lingerUntil = Date.now() + Math.min(lingerMs, holdMs);
 			} else if (msg.type === "assistant" && !msg.parent_tool_use_id) {
 				resultIn = false; // a turn is running; wait for its result
 				heldSince = 0;
+				lingerUntil = 0;
 				clearTimeout(idleTimer);
 				idleTimer = null;
 				turns.add(msg.message?.id || turns.size);
@@ -251,6 +284,11 @@ export function createFeed(dir, firstPrompt, {
 			} else if (msg.type === "result") {
 				if (msg.is_error) stopTaking();
 				resultIn = true;
+				if (taking && lingerMs > 0) {
+					const wait = Math.min(lingerMs, holdMs);
+					lingerUntil = Date.now() + wait;
+					log(`answer in; the run stays open for more messages for ${Math.round(wait / 1000)} s`);
+				}
 				settle();
 			}
 		},

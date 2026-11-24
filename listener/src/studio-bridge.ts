@@ -21,6 +21,7 @@ import { timingSafeEqual } from "crypto";
 import { agents, runAgent, resumeAgent, type AgentConfig, type AgentRunResult } from "./runner";
 import { buildRoster } from "./studio-roster";
 import type { DeliveryOrigin } from "./studio-delivery";
+import { CONVERSATION_ID, type Delivery } from "./conversation-runs";
 
 /** Default port. Override with STUDIO_BRIDGE_PORT. */
 export const DEFAULT_STUDIO_BRIDGE_PORT = 4870;
@@ -30,6 +31,13 @@ const MIN_KEY_LENGTH = 32;
 
 /** Refuse request bodies above this size rather than buffering them. */
 const MAX_BODY_BYTES = 256 * 1024;
+
+/**
+ * Largest conversation message (UTF-8 bytes). The message rides in the
+ * container's env, and a much larger one makes docker fail to start (E2BIG)
+ * after the request was accepted; refusing it lets the caller fall back.
+ */
+export const MAX_CONVERSE_MESSAGE_BYTES = 100 * 1024;
 
 const REPO_ROOT = path.resolve(__dirname, "..", "..");
 
@@ -41,6 +49,12 @@ export interface StudioBridgeOptions {
 	listAgents?: () => AgentConfig[];
 	run?: (agent: AgentConfig, message: string, origin?: DeliveryOrigin) => Promise<AgentRunResult>;
 	resume?: (agent: AgentConfig, sessionId: string, message: string, origin?: DeliveryOrigin) => Promise<AgentRunResult>;
+	/**
+	 * POST /studio/converse: hand one conversation message to its open run
+	 * (conversation-runs.ts). Absent = the route answers 404, like a listener
+	 * that does not have it, and the caller keeps its old path.
+	 */
+	converse?: (agent: AgentConfig, conversation: string, message: string, profile?: string) => Delivery;
 }
 
 /** Reads the installed key, or null when there is not a usable one. */
@@ -178,7 +192,68 @@ export function startStudioBridge(options: StudioBridgeOptions = {}): http.Serve
 			return;
 		}
 
+		if (req.method === "POST" && url === "/studio/converse" && options.converse) {
+			await handleConverse(req, res, options.converse);
+			return;
+		}
+
 		sendJson(res, 404, { error: "not_found" });
+	}
+
+	// The body carries a conversation's text (names, phone numbers): it is
+	// never logged nor echoed back. Log lines name agent, key, delivery and length.
+	async function handleConverse(
+		req: http.IncomingMessage,
+		res: http.ServerResponse,
+		converse: NonNullable<StudioBridgeOptions["converse"]>,
+	): Promise<void> {
+		const raw = await readBody(req);
+		if (raw === null) {
+			sendJson(res, 413, { error: "too_large" });
+			return;
+		}
+		let parsed: { agent?: unknown; conversation?: unknown; message?: unknown; profile?: unknown };
+		try {
+			parsed = JSON.parse(raw);
+		} catch {
+			sendJson(res, 400, { error: "bad_request" });
+			return;
+		}
+		if (!parsed || typeof parsed !== "object") {
+			sendJson(res, 400, { error: "bad_request" });
+			return;
+		}
+		const agentName = typeof parsed.agent === "string" ? parsed.agent : "";
+		const conversation = typeof parsed.conversation === "string" ? parsed.conversation : "";
+		const message = typeof parsed.message === "string" ? parsed.message : "";
+		const profileOk = parsed.profile === undefined || (typeof parsed.profile === "string" && parsed.profile !== "");
+		if (!agentName || !CONVERSATION_ID.test(conversation) || !message || !profileOk) {
+			sendJson(res, 400, { error: "bad_request" });
+			return;
+		}
+		if (Buffer.byteLength(message, "utf8") > MAX_CONVERSE_MESSAGE_BYTES) {
+			sendJson(res, 413, { error: "too_large" });
+			return;
+		}
+		const agent = listAgents().find((a) => a.name === agentName);
+		if (!agent) {
+			sendJson(res, 404, { error: "unknown_agent" });
+			return;
+		}
+		// Only a profile the agent defines (run_profiles); the raw string is never logged.
+		const profile = typeof parsed.profile === "string" ? parsed.profile : undefined;
+		if (profile !== undefined && !Object.prototype.hasOwnProperty.call(agent.runProfiles ?? {}, profile)) {
+			sendJson(res, 400, { error: "bad_request" });
+			return;
+		}
+		try {
+			const delivery = converse(agent, conversation, message, profile);
+			console.log(`[studio-bridge] converse ${agentName} conversation ${conversation}: ${delivery} (${message.length} chars)`);
+			sendJson(res, 202, { delivery });
+		} catch (err) {
+			console.error(`[studio-bridge] converse failed for ${agentName} conversation ${conversation}: ${err instanceof Error ? err.name : "error"}`);
+			sendJson(res, 500, { error: "converse_failed" });
+		}
 	}
 
 	// A container run can take many minutes. Node would otherwise cut the

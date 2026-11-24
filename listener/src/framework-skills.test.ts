@@ -315,3 +315,35 @@ describe("slack-report: numbers go out as a card, not a paragraph (Nitay 2026-11
 		assert.ok(body.includes("slack-report/report.mjs"));
 	});
 });
+
+describe("preloadSkills: a run profile's skills go into the system prompt", () => {
+	// eslint-disable-next-line @typescript-eslint/no-implied-eval
+	const esmImport = new Function("s", "return import(s)") as (s: string) => Promise<any>;
+	const mod = () => esmImport(require("node:url").pathToFileURL(path.join(repoRoot, "docker", "prompt-skills.mjs")).href);
+
+	test("includes valid names only and never reads a path-like name", async () => {
+		const { preloadSkills } = await mod();
+		const asked: string[] = [];
+		const readSkill = (name: string) => { asked.push(name); return `text of ${name}`; };
+		const out = preloadSkills("a,../x", readSkill);
+		assert.deepEqual(asked, ["a"]);
+		assert.ok(out.includes("# Skill: a"));
+		assert.ok(out.includes("text of a"));
+		assert.ok(!out.includes("../x"));
+	});
+
+	test("joins several skills in order and skips missing ones", async () => {
+		const { preloadSkills } = await mod();
+		const texts: Record<string, string> = { a: "AAA", c: "CCC" };
+		const out = preloadSkills(" a , b ,c", (n: string) => texts[n] ?? null);
+		assert.ok(out.indexOf("# Skill: a") < out.indexOf("# Skill: c"));
+		assert.ok(!out.includes("# Skill: b"));
+	});
+
+	test("null when nothing is named or nothing could be read", async () => {
+		const { preloadSkills } = await mod();
+		assert.equal(preloadSkills("", () => "x"), null);
+		assert.equal(preloadSkills(undefined, () => "x"), null);
+		assert.equal(preloadSkills("a", () => null), null);
+	});
+});

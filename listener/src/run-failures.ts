@@ -18,7 +18,8 @@ import type { CheckResult } from "./watcher-checks";
 
 export const FAILURE_ALERT_THRESHOLD = 3;
 
-export const RUN_FAILURES_FILE = path.join(__dirname, "..", "..", "data", "run-failures.json");
+// GINNIE_RUN_FAILURES_FILE overrides the file (tests).
+export const RUN_FAILURES_FILE = process.env.GINNIE_RUN_FAILURES_FILE || path.join(__dirname, "..", "..", "data", "run-failures.json");
 
 interface FailureStreak {
 	count: number;

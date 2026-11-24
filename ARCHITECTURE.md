@@ -136,6 +136,17 @@ A message for a thread whose run is still going is handed to that run and reache
 - The SDK is pinned: exactly-once depends on the Claude program confirming each message it took. `docker/package.json` and `docker/package-lock.json` hold the exact version, and the entrypoint checks the installed SDK at start; if it lacks what the feed needs (or the folder is not writable) it closes the inbox for that run, logs why, and messages wait in line as before. To move the pin: `npm install --save-exact @anthropic-ai/claude-agent-sdk@<version>` in `docker/`, run `npm test` in `listener/` (it drives that SDK and `docker/midrun.mjs` against a fake model API), then rebuild the image.
 - Scheduled runs and WhatsApp-woken runs have no inbox and behave as before. An image built before this change ignores the folder, so messages simply wait for the next run. If the folder cannot be created the run goes the old way too (logged once).
 
+## Conversation runs (host processes)
+
+A host process with no model (for example one that watches a customer chat line) can hand an agent the messages of one conversation through `POST /studio/converse` on the loopback Studio bridge (`listener/src/studio-bridge.ts`, `listener/src/conversation-runs.ts`). The answer is `202` at once; the run happens in the background.
+
+- One run per agent and conversation key, with its own waiting line and no debounce. A message for a conversation whose run is working goes into that run's mid-run inbox, as for Slack threads above; the message text is passed as is, with no Slack envelope, and the run gets one delivery line saying its answer goes out through its own tools.
+- Open-run wait: with a run profile's `linger_minutes`, a conversation run stays open after its answer and takes the next message without a new container. The wait restarts after each answer, is capped at 60 minutes, and only conversation runs ever get it (the listener reads a run's result only when the container exits, so a wait would delay anything the listener itself delivers). At most `linger_max_open` runs per agent wait at once; later ones end at their answer.
+- Sessions: after each good run the session id is stored under the conversation key; the next run resumes it when that was under 24 hours ago, else starts fresh. A failed run keeps the old session; its unseen mid-run messages run next.
+- Limits: `max_running` conversation containers per agent (default 8); more conversations wait in line. Bodies over 100 KB are refused (413) so the host can fall back.
+- Privacy: the listener never logs the message body, never stores a conversation run's result text in the failure file, and logs only agent, conversation key, delivery kind and lengths. A failed container start logs the error code only.
+- The host owns the customer outcome: a 202 only means the message was taken. If no answer comes (a failed run, a restart), the host must retry or hand the conversation to a person.
+
 ## The working sign
 
 Every accepted message gets a reaction from the agent at once (👀 received), changed to ⏳ while a run works on it and removed when that run ends, however it ends; a mid-run message turns ⏳ when the run has taken it (`listener/src/working-sign.ts`). Runs that will answer also keep Slack's "is thinking…" status up, re-set every 15 seconds because Slack drops it whenever the bot posts and two minutes after it was last set. Reactions need the `reactions:write` bot scope; without it the agent shows the status only (logged once).

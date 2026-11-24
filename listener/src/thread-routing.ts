@@ -56,13 +56,19 @@ export class ThreadDispatcher<M extends Dispatchable> {
 		offerToRun?: (msg: M, key: string) => boolean;
 		onError?: (agentName: string, err: unknown) => void;
 		log?: (line: string) => void;
+		/** The line is empty and no run is going for this key (after its last run). */
+		onDrained?: (key: string) => void;
 	}) {}
 
-	enqueue(msg: M): void {
+	/**
+	 * "handed": given to the working run; "queued": waits in line behind it;
+	 * "waiting": no run going, a run starts after the debounce.
+	 */
+	enqueue(msg: M): "handed" | "queued" | "waiting" {
 		const key = queueKey(msg.agent.name, msg.channel, msg.threadTs);
 		if (this.active.has(key) && this.opts.offerToRun?.(msg, key)) {
 			this.opts.log?.(`[${msg.agent.name}] Message handed to the working run in thread ${msg.threadTs}`);
-			return;
+			return "handed";
 		}
 		const queue = this.queues.get(key) || [];
 		queue.push(msg);
@@ -71,7 +77,7 @@ export class ThreadDispatcher<M extends Dispatchable> {
 
 		if (this.active.has(key)) {
 			this.opts.log?.(`[${msg.agent.name}] Queued message for busy thread ${msg.threadTs} (${queue.length} in queue)`);
-			return;
+			return "queued";
 		}
 		const existing = this.timers.get(key);
 		if (existing) {
@@ -84,6 +90,7 @@ export class ThreadDispatcher<M extends Dispatchable> {
 			this.timers.delete(key);
 			this.track(this.drain(key, msg.agent.name));
 		}, this.opts.debounceMs));
+		return "waiting";
 	}
 
 	/** Messages a run was handed but did not use: back to the head of the line. Call before that run's process() returns. */
@@ -106,7 +113,10 @@ export class ThreadDispatcher<M extends Dispatchable> {
 
 	private async drain(key: string, agentName: string): Promise<void> {
 		const queue = this.queues.get(key);
-		if (!queue || queue.length === 0) return;
+		if (!queue || queue.length === 0) {
+			this.opts.onDrained?.(key);
+			return;
+		}
 		const batch = [...queue];
 		this.queues.delete(key);
 		if (batch.length > 1) this.opts.log?.(`[${agentName}] Batched ${batch.length} messages for thread ${batch[0].threadTs}`);
@@ -124,6 +134,8 @@ export class ThreadDispatcher<M extends Dispatchable> {
 		if (next && next.length > 0) {
 			this.opts.log?.(`[${agentName}] ${next.length} messages arrived during processing, draining...`);
 			await this.drain(key, agentName);
+		} else {
+			this.opts.onDrained?.(key);
 		}
 	}
 }

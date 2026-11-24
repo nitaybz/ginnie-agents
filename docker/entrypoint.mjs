@@ -35,6 +35,17 @@
  *   AGENT_MODEL            — Optional: model or alias (e.g. "opus"). The model
  *                             the SDK actually resolved is logged at session
  *                             start and returned as `model` in the result JSON.
+ *   AGENT_EFFORT           - Optional: low | medium | high | xhigh | max, from the
+ *                             run's profile (config.json "run_profiles").
+ *                             Unset = the SDK default.
+ *   PRELOAD_SKILLS         - Optional: comma list of skill folder names under
+ *                             /workspace/skills whose SKILL.md is put into the
+ *                             system prompt, so the run does not read them.
+ *   MIDRUN_LINGER_MS       - Optional: how long the run stays open for more
+ *                             messages after each answer (the open-run wait,
+ *                             docker/midrun.mjs). Unset, bad or negative = none;
+ *                             capped at 60 minutes; ignored when the run has
+ *                             no mid-run inbox (MIDRUN_DIR unset or feed off).
  *   MIDRUN_DIR             - Optional: folder where the listener drops messages
  *                             that arrive while this run is working; they are
  *                             handed to the session between tool calls
@@ -50,11 +61,11 @@
  */
 
 import { createRequire } from "module";
-import { bottomLineSkill, whatsappSkill } from "./prompt-skills.mjs";
+import { bottomLineSkill, preloadSkills, whatsappSkill } from "./prompt-skills.mjs";
 import { createLimitTracker } from "./limit-detect.mjs";
 import { CONTINUE_AFTER_ERROR_MESSAGE, nextStep } from "./run-policy.mjs";
 import { toolServerOptions } from "./tool-servers.mjs";
-import { closeInbox, createFeed, feedSupport } from "./midrun.mjs";
+import { closeInbox, createFeed, feedSupport, lingerMsFor } from "./midrun.mjs";
 const require = createRequire("/app/");
 const { query } = require("@anthropic-ai/claude-agent-sdk");
 import { readFileSync, existsSync } from "fs";
@@ -121,6 +132,8 @@ if (!message) {
 //                                                overrides any conflicting rule there
 //   7. /workspace/memory/rules.md              — agent's USER-STATED RULES (always loaded)
 //   8. /workspace/memory/playbook.md           — agent's SETTLED PATTERNS (always loaded)
+//   9. PRELOAD_SKILLS env var (if set)         — the run profile's skills from
+//                                                /workspace/skills/<name>/SKILL.md
 //
 // Episodes (/workspace/memory/episodes/*.md) are NOT auto-loaded. The agent
 // greps them on demand. This keeps the system prompt bounded regardless of
@@ -261,11 +274,27 @@ if (existsSync(playbookPath)) {
 	);
 }
 
+// Run profile skills, already in the prompt so a short run (a customer chat)
+// does not spend model round trips reading them.
+if (process.env.PRELOAD_SKILLS) {
+	const preloaded = preloadSkills(process.env.PRELOAD_SKILLS, (name) => {
+		const p = `/workspace/skills/${name}/SKILL.md`;
+		if (!existsSync(p)) {
+			console.error(`[${agentName}] Warning: preloaded skill ${name} not found`);
+			return null;
+		}
+		return readFileSync(p, "utf-8");
+	});
+	if (preloaded) parts.push(preloaded);
+}
+
 if (parts.length) systemPrompt = parts.join("\n\n---\n\n");
 
 console.error(`[${agentName}] Starting session${resumeId ? ` (resume: ${resumeId.slice(0, 20)}...)` : " (new)"}...`);
 console.error(`[${agentName}] Tools: ${allowedTools.join(", ")}`);
 console.error(`[${agentName}] Max turns: ${maxTurns}`);
+if (process.env.AGENT_EFFORT) console.error(`[${agentName}] Effort: ${process.env.AGENT_EFFORT}`);
+if (process.env.PRELOAD_SKILLS) console.error(`[${agentName}] Preloaded skills: ${process.env.PRELOAD_SKILLS}`);
 
 // Usage-limit detection and tool-call count for this run. On a limit the
 // listener cools this subscription and retries on another one: from scratch
@@ -290,6 +319,9 @@ if (midrunDir) {
 		midrunDir = "";
 	}
 }
+// The open-run wait needs the inbox: without one the run ends at its result.
+const lingerMs = lingerMsFor(process.env.MIDRUN_LINGER_MS, !!midrunDir);
+if (lingerMs) console.error(`[${agentName}] Open-run wait: ${Math.round(lingerMs / 1000)} s after each answer`);
 
 // replaysRequest: this try sends the original request to a session that does
 // not hold the previous try's history, so mid-run messages that try had
@@ -299,7 +331,7 @@ async function runSession(resumeSessionId, prompt, replaysRequest) {
 	// With an inbox the prompt is a stream: this message first, then whatever
 	// the listener drops in while the run works. The feed ends the stream.
 	const feed = midrunDir
-		? createFeed(midrunDir, prompt, { maxTurns, refeedSeen: replaysRequest, log: (line) => console.error(`[${agentName}] ${line}`) })
+		? createFeed(midrunDir, prompt, { maxTurns, lingerMs, refeedSeen: replaysRequest, log: (line) => console.error(`[${agentName}] ${line}`) })
 		: null;
 
 	try {
@@ -315,6 +347,7 @@ async function runSession(resumeSessionId, prompt, replaysRequest) {
 				resume: resumeSessionId,
 				persistSession: true,
 				model: process.env.AGENT_MODEL || undefined,
+				effort: process.env.AGENT_EFFORT || undefined,
 				...(mcpServers ? { mcpServers } : {}),
 				// Have the program confirm each streamed message it took (isReplay).
 				...(feed ? { extraArgs: { "replay-user-messages": null } } : {}),

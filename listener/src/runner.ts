@@ -88,6 +88,135 @@ export interface AgentConfig {
 	// MCP tool servers this agent may use (config.json "tool_servers"; token
 	// in credentials.json under token_key). See tool-servers.ts.
 	toolServers?: Record<string, ToolServerRef>;
+	// Model, effort, preloaded skills and open-run wait per kind of run
+	// (config.json "run_profiles"). A run names its profile; none = agent defaults.
+	runProfiles?: Record<string, RunProfile>;
+}
+
+export type RunEffort = "low" | "medium" | "high" | "xhigh" | "max";
+
+export interface RunProfile {
+	model?: string;
+	effort?: RunEffort;
+	/** Skill folder names under the agent's skills/ put straight into the system prompt. */
+	preloadSkills?: string[];
+	/** How long the run stays open for more messages after its answer (the wait itself lives in the entrypoint). */
+	lingerMinutes?: number;
+	/** How many such open runs the agent may have at once. */
+	lingerMaxOpen?: number;
+	/** How many conversation runs of this agent may run at once; more wait in line (default 8). */
+	maxRunning?: number;
+}
+
+const RUN_EFFORTS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
+// Same rule the entrypoint applies, so a name can never climb out of skills/.
+const SKILL_NAME = /^[a-z0-9-]{1,40}$/;
+
+/**
+ * Check config.json "run_profiles". A bad value is dropped (the rest of the
+ * profile stays) and each profile with something dropped gets one warning, so
+ * a typo shows in the log instead of silently changing how runs behave.
+ */
+export function parseRunProfiles(raw: unknown, warn: (line: string) => void): Record<string, RunProfile> | undefined {
+	if (raw === undefined || raw === null) return undefined;
+	if (typeof raw !== "object" || Array.isArray(raw)) {
+		warn(`run_profiles ignored: expected an object of named profiles`);
+		return undefined;
+	}
+	const out: Record<string, RunProfile> = {};
+	for (const [name, value] of Object.entries(raw as Record<string, unknown>)) {
+		if (!value || typeof value !== "object" || Array.isArray(value)) {
+			warn(`run_profiles.${name} ignored: expected an object`);
+			continue;
+		}
+		const v = value as Record<string, unknown>;
+		const dropped: string[] = [];
+		const p: RunProfile = {};
+		if (v.model !== undefined) {
+			if (typeof v.model === "string" && /^\S+$/.test(v.model.trim())) p.model = v.model.trim();
+			else dropped.push(`model ${JSON.stringify(v.model)}`);
+		}
+		if (v.effort !== undefined) {
+			if (typeof v.effort === "string" && RUN_EFFORTS.includes(v.effort)) p.effort = v.effort as RunEffort;
+			else dropped.push(`effort ${JSON.stringify(v.effort)} (allowed: ${RUN_EFFORTS.join(", ")})`);
+		}
+		if (v.preload_skills !== undefined) {
+			if (Array.isArray(v.preload_skills)) {
+				const good = v.preload_skills.filter((s): s is string => typeof s === "string" && SKILL_NAME.test(s));
+				const bad = v.preload_skills.filter((s) => !(typeof s === "string" && SKILL_NAME.test(s)));
+				if (bad.length) dropped.push(`preload_skills ${bad.map((b) => JSON.stringify(b)).join(", ")}`);
+				if (good.length) p.preloadSkills = good;
+			} else {
+				dropped.push(`preload_skills (expected a list of skill names)`);
+			}
+		}
+		if (v.linger_minutes !== undefined) {
+			if (typeof v.linger_minutes === "number" && Number.isFinite(v.linger_minutes) && v.linger_minutes > 0) p.lingerMinutes = v.linger_minutes;
+			else dropped.push(`linger_minutes ${JSON.stringify(v.linger_minutes)}`);
+		}
+		if (v.linger_max_open !== undefined) {
+			if (typeof v.linger_max_open === "number" && Number.isInteger(v.linger_max_open) && v.linger_max_open > 0) p.lingerMaxOpen = v.linger_max_open;
+			else dropped.push(`linger_max_open ${JSON.stringify(v.linger_max_open)}`);
+		}
+		if (v.max_running !== undefined) {
+			if (typeof v.max_running === "number" && Number.isInteger(v.max_running) && v.max_running > 0) p.maxRunning = v.max_running;
+			else dropped.push(`max_running ${JSON.stringify(v.max_running)}`);
+		}
+		if (dropped.length) warn(`run_profiles.${name}: dropped ${dropped.join("; ")}`);
+		out[name] = p;
+	}
+	return Object.keys(out).length ? out : undefined;
+}
+
+/** An error's code (ENOENT, EACCES, ...) or class name: never its message, args or env. */
+export function errorCode(err: unknown): string {
+	const code = (err as { code?: unknown } | null)?.code;
+	if (typeof code === "string" && /^[A-Z0-9_]{1,40}$/.test(code)) return code;
+	return err instanceof Error ? err.name : "unknown error";
+}
+
+/** The model a run uses: its profile's, else the agent's. */
+export function profileModel(agent: AgentConfig, profile?: string): string | undefined {
+	const p = profile ? agent.runProfiles?.[profile] : undefined;
+	return p?.model || agent.model;
+}
+
+/**
+ * Docker `-e` args for a run's profile. An unknown or missing profile gives the
+ * agent defaults: its model only, default effort, nothing preloaded, no wait.
+ */
+export function profileEnv(agent: AgentConfig, profile?: string): string[] {
+	const p = profile ? agent.runProfiles?.[profile] : undefined;
+	const args: string[] = [];
+	const model = profileModel(agent, profile);
+	if (model) args.push("-e", `AGENT_MODEL=${model}`);
+	if (p?.effort) args.push("-e", `AGENT_EFFORT=${p.effort}`);
+	if (p?.preloadSkills?.length) args.push("-e", `PRELOAD_SKILLS=${p.preloadSkills.join(",")}`);
+	if (p?.lingerMinutes) args.push("-e", `MIDRUN_LINGER_MS=${Math.round(p.lingerMinutes * 60_000)}`);
+	return args;
+}
+
+/** Choices a caller makes for one run. */
+export interface RunOptions {
+	/**
+	 * Keep the run open for more messages after its answer, for as long as its
+	 * profile's linger_minutes says. Off unless asked: the listener reads a
+	 * run's result only when the container exits, so only conversation runs
+	 * (conversation-runs.ts) ask for it.
+	 */
+	linger?: boolean;
+}
+
+/** The agent as one run sees it: no open-run wait unless the run asked for it. Never changes the loaded config. */
+export function agentForRun(agent: AgentConfig, opts: RunOptions = {}): AgentConfig {
+	if (opts.linger || !agent.runProfiles) return agent;
+	if (!Object.values(agent.runProfiles).some((p) => p.lingerMinutes)) return agent;
+	const runProfiles: Record<string, RunProfile> = {};
+	for (const [name, p] of Object.entries(agent.runProfiles)) {
+		const { lingerMinutes: _wait, ...rest } = p;
+		runProfiles[name] = rest;
+	}
+	return { ...agent, runProfiles };
 }
 
 interface AgentManifest {
@@ -108,6 +237,7 @@ interface AgentManifest {
 	handoff_channels?: unknown;
 	agent_turn_cap?: unknown;
 	tool_servers?: unknown;
+	run_profiles?: unknown;
 }
 
 // How long an interactive (actions) block stays live before the listener's
@@ -239,6 +369,7 @@ export function loadAgents(): AgentConfig[] {
 			),
 			botPolicy: bots.policy,
 			toolServers: toolServerNames.length ? toolServerRefs(manifest, tools.servers) : undefined,
+			runProfiles: parseRunProfiles(manifest.run_profiles, (line) => console.warn(`[${entry.name}] ${line}`)),
 		});
 	}
 
@@ -257,8 +388,11 @@ export async function runAgent(
 	origin: DeliveryOrigin = "slack",
 	// Inbox folder for messages that arrive while this run works (midrun-inbox.ts).
 	midrunDir?: string,
+	// Kind of run (a key of config.json "run_profiles"); none = agent defaults.
+	profile?: string,
+	opts?: RunOptions,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, undefined, origin, midrunDir);
+	return spawnContainer(agent, message, undefined, origin, midrunDir, profile, opts);
 }
 
 /**
@@ -270,8 +404,10 @@ export async function resumeAgent(
 	message: string,
 	origin: DeliveryOrigin = "slack",
 	midrunDir?: string,
+	profile?: string,
+	opts?: RunOptions,
 ): Promise<AgentRunResult> {
-	return spawnContainer(agent, message, sessionId, origin, midrunDir);
+	return spawnContainer(agent, message, sessionId, origin, midrunDir, profile, opts);
 }
 
 /**
@@ -303,26 +439,40 @@ async function spawnContainer(
 	resumeId?: string,
 	origin: DeliveryOrigin = "slack",
 	midrunDir?: string,
+	profile?: string,
+	opts?: RunOptions,
 ): Promise<AgentRunResult> {
+	// The open-run wait only for a run that asked for it (RunOptions.linger).
+	const runAgentCfg = agentForRun(agent, opts);
+	if (profile && !agent.runProfiles?.[profile]) {
+		console.warn(`[${agent.name}] Run profile "${profile}" is not in config.json run_profiles; using the agent defaults`);
+	}
 	let out;
 	try {
 		out = await runWithAccountFallback({
 			accounts: loadClaudeAccounts(process.env),
 			cooldownFile: ACCOUNT_COOLDOWNS_FILE,
-			model: agent.model,
+			// The run's own model, so a limit on one model family cools only that family.
+			model: profileModel(agent, profile),
 			// A continuation resumes the limited try's session on the next
 			// account instead of replaying the original request.
 			attempt: (account, cont) =>
-				spawnAttempt(agent, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont, midrunDir),
+				spawnAttempt(runAgentCfg, cont ? cont.message : message, cont ? cont.sessionId : resumeId, origin, account, !!cont, midrunDir, profile),
 			log: (line) => console.log(`[${agent.name}] ${line}`),
 		});
 	} catch (err) {
-		recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${String(err)}`);
+		// The error code only: a spawn error carries the container args, message included.
+		recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container (spawn docker ${errorCode(err)})`);
 		throw err;
 	}
 	// Feeds the watcher's "N failed runs in a row" alert; a usage limit is not
-	// a broken agent and leaves the streak alone.
-	if (!recordFinalOutcome(RUN_FAILURES_FILE, agent.name, out)) {
+	// a broken agent and leaves the streak alone. A conversation run's result
+	// and stderr can quote the conversation (customer text): kind and lengths only.
+	const describe = origin === "conversation"
+		? (o: { result: string; stderr?: string }) =>
+			`conversation run failed (result ${o.result.length} chars, stderr ${(o.stderr || "").length} chars)`
+		: undefined;
+	if (!recordFinalOutcome(RUN_FAILURES_FILE, agent.name, out, describe)) {
 		console.log(`[${agent.name}] Run stopped on a usage limit (account ${out.account ?? "none"}); not counted as a failure`);
 	}
 	return {
@@ -379,6 +529,13 @@ export function parseRunOutput(stdout: string, exitCode: number | null, resumeId
 	};
 }
 
+export interface AttemptExtras {
+	/** Marks a replay run (see replay.ts). */
+	replay?: boolean;
+	/** Extra container env; the caller has checked the names. */
+	env?: Record<string, string>;
+}
+
 export function spawnAttempt(
 	agent: AgentConfig,
 	message: string,
@@ -389,9 +546,18 @@ export function spawnAttempt(
 	// fail, never start over (that would repeat completed actions).
 	strictResume = false,
 	midrunDir?: string,
+	profile?: string,
+	// A replay run (replay.ts): its own container name, no bottom-line
+	// channel, and extra env passed by name (values in docker's own env).
+	extras?: AttemptExtras,
 ): Promise<AttemptResult> {
 	return new Promise((resolve, reject) => {
-		const containerName = `ginnie-${agent.name}-${Date.now()}`;
+		// A replay runs only on an account token: never on the host's own
+		// Claude login file (it holds more than this run should see).
+		if (extras?.replay && !account) {
+			throw new Error("a replay needs a Claude account token (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY); it never uses the host login file");
+		}
+		const containerName = `ginnie-${extras?.replay ? "replay-" : ""}${agent.name}-${Date.now()}`;
 
 		// Ensure directories exist
 		const memoryDir = path.join(agent.dir, "memory");
@@ -470,12 +636,14 @@ export function spawnAttempt(
 			if (strictResume) dockerArgs.push("-e", "RESUME_STRICT=1");
 		}
 
-		if (agent.model) {
-			dockerArgs.push("-e", `AGENT_MODEL=${agent.model}`);
-		}
+		// Model, effort, preloaded skills and open-run wait for this kind of run.
+		dockerArgs.push(...profileEnv(agent, profile));
 
-		// Bottom-line channel (framework/skills/bottom-line). Off when unset.
-		dockerArgs.push(...bottomLineDockerEnv(process.env));
+		// Caller env for a replay: the name here, the value in docker's env.
+		for (const name of Object.keys(extras?.env ?? {})) dockerArgs.push("-e", name);
+
+		// Bottom-line channel (framework/skills/bottom-line). Off when unset, and in a replay.
+		if (!extras?.replay) dockerArgs.push(...bottomLineDockerEnv(process.env));
 
 		// WhatsApp gateway agent API (framework/skills/whatsapp). The token is
 		// not passed here; the agent reads it from its credentials.json mount.
@@ -492,7 +660,7 @@ export function spawnAttempt(
 		dockerArgs.push(
 			"-v", `${claudeDir}:/home/node/.claude`,
 		);
-		if (!account && existsSync(hostCredentials)) {
+		if (!account && !extras?.replay && existsSync(hostCredentials)) {
 			dockerArgs.push("-v", `${hostCredentials}:/home/node/.claude/.credentials.json:ro`);
 		}
 
@@ -574,12 +742,13 @@ export function spawnAttempt(
 		// Account label and requested model only; never the token.
 		console.log(
 			`[${agent.name}] Starting container ${containerName}${resumeId ? " (resume)" : " (new)"} ` +
-			`account=${account ? account.label : "host-credentials"} model=${agent.model || "default"}...`,
+			`account=${account ? account.label : "host-credentials"} model=${profileModel(agent, profile) || "default"}` +
+			`${profile ? ` profile=${profile}` : ""}...`,
 		);
 
 		const child = spawn("docker", dockerArgs, {
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, ...auth.env },
+			env: { ...process.env, ...(extras?.env ?? {}), ...auth.env },
 		});
 
 		let stdout = "";
@@ -611,7 +780,8 @@ export function spawnAttempt(
 		});
 
 		child.on("error", (err) => {
-			console.error(`[${agent.name}] Failed to spawn container:`, err);
+			// Never the error object: its spawnargs hold the container env, AGENT_MESSAGE included.
+			console.error(`[${agent.name}] Failed to spawn container (spawn docker ${errorCode(err)})`);
 			reject(err);
 		});
 	});

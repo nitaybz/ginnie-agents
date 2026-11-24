@@ -133,6 +133,37 @@ describe("mid-run messages with the real Claude program", { concurrency: false }
 		assert.deepEqual(inbox.finish(), []);
 	});
 
+	test("open-run wait: a message 3 s after the answer, inside a 10 s wait, is answered by the same run, once", async () => {
+		const inbox = newInbox();
+		let offeredAt = 0;
+		const run = await runSession({
+			inboxDir: inbox.dir, prompt: "hello", feed: { lingerMs: 10_000 },
+			script: (r) => ({ text: r.userText.includes("one more thing") ? "answered the follow-up" : `answer ${r.call}` }),
+			onEvent: (m) => { if (m.type === "result" && !offeredAt) { offeredAt = Date.now(); setTimeout(() => assert.equal(inbox.offer("m1", "one more thing"), true), 3000); } },
+		});
+		const t = trace(run.events);
+		assert.deepEqual(run.results.map((r) => r.subtype), ["success", "success"], t.join(" | "));
+		assert.equal(taken(run.events, "one more thing"), 1, "taken once by this run");
+		assert.ok(t.includes('assistant:"answered the follow-up"'), t.join(" | "));
+		assert.equal(inbox.offer("late", "after the run"), false, "the run closed its inbox when the second wait ran out");
+		assert.deepEqual(inbox.finish(), [], "not run again as a new run");
+	});
+
+	test("open-run wait: with no message the run ends when the 10 s wait runs out", async () => {
+		const inbox = newInbox();
+		let answeredAt = 0;
+		const run = await runSession({
+			inboxDir: inbox.dir, prompt: "hello", feed: { lingerMs: 10_000 },
+			script: (r) => ({ text: `answer ${r.call}` }),
+			onEvent: (m) => { if (m.type === "result") answeredAt = Date.now(); },
+		});
+		const waited = Date.now() - answeredAt;
+		assert.equal(run.results.length, 1, trace(run.events).join(" | "));
+		assert.ok(waited >= 8000 && waited <= 12_000, `ended ${waited} ms after its answer`);
+		assert.equal(inbox.offer("late", "after the run"), false);
+		assert.deepEqual(inbox.finish(), []);
+	});
+
 	test("a retry that continues the same session does not get seen messages again", async () => {
 		const { markSeen, claim } = await containerMidrun();
 		const inbox = newInbox();
