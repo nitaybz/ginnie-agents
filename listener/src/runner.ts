@@ -20,6 +20,7 @@ import { parseExtraMounts, checkHostPaths, extraMountDockerArgs, type ExtraMount
 import { parseBotPolicy, type BotPolicy } from "./bot-allow";
 import { parseToolServers, toolServerRefs, toolServersDockerEnv, type ToolServerRef } from "./tool-servers";
 import { midrunDockerArgs } from "./midrun-inbox";
+import { FORM_ANSWERS_MOUNT, formAnswersDir } from "./agent-forms";
 import {
 	ACCOUNT_COOLDOWNS_FILE,
 	accountDockerAuth,
@@ -705,6 +706,13 @@ export function spawnAttempt(
 		const dataDir = path.join(agent.dir, "data");
 		if (existsSync(dataDir)) {
 			dockerArgs.push("-v", `${dataDir}:/workspace/data`);
+		}
+
+		// Form answers the listener saved for this agent (agent-forms.ts): read-only, so the agent can
+		// read what the person submitted but never write or forge it.
+		const formAnswers = formAnswersDir(agent.name);
+		if (existsSync(formAnswers)) {
+			dockerArgs.push("-v", `${formAnswers}:${FORM_ANSWERS_MOUNT}:ro`);
 		}
 
 		// Skills directory (read-only, if exists)

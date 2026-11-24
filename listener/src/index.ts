@@ -806,7 +806,7 @@ function startSlackHeartbeat(agentName: string, receiver: SocketModeReceiver): v
 	// Form answers saved but not applied by the agent yet (a restart cut the run short): hand them over again.
 	for (const agent of agents) {
 		const app = apps.get(agent.name);
-		if (app) replayPendingAnswers(agent.dir, formDeps(agent, app).deliver);
+		if (app) void replayPendingAnswers(formDeps(agent, app)).catch((e) => console.error(`[${agent.name}] form answers replay failed:`, e));
 	}
 
 	// Periodically retire stale, never-clicked buttons from agent messages.

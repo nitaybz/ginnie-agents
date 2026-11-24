@@ -7,15 +7,16 @@
  * "other" redraws the modal at once with a free-text box right under that question. One submit hands all
  * answers to the agent as one message in the post's thread (like any other click), the post's button is
  * replaced by an "answered" line, and the form is marked answered on disk so a second submit is ignored,
- * also after a listener restart. The answers themselves are saved next to the form before Slack is
- * answered and handed over again at startup until the agent marks them applied. A form expires with the agent's button TTL (or its own expires_at), or
+ * also after a listener restart. The answers are saved in the listener's own state before Slack is
+ * answered, copied read-only for the agent, and handed over again at startup until the agent applied them. A form expires with the agent's button TTL (or its own expires_at), or
  * when the agent marks it superseded by a newer one.
  *
  * The form file comes from inside the agent's container: it is data, checked and capped here, and it
  * never decides who may answer. That is config.json "form_answerers" (Slack user ids), or else the
  * people with role "founder" in known-users.json.
  */
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFileSync } from "fs";
+import { randomBytes, randomUUID } from "crypto";
+import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
 import path from "path";
 
 export const FORM_OPEN_ACTION = "agent_form_open";
@@ -248,12 +249,11 @@ export function collectAnswers(form: AgentForm, values: any): { answers: FormAns
 	return { answers, unanswered };
 }
 
-/** The one message the agent gets for a submitted form. */
-export function formatSubmission(form: AgentForm, answers: FormAnswer[], unanswered: string[]): string {
-	const byId: Record<string, Omit<FormAnswer, "id">> = {};
-	for (const { id, ...rest } of answers) byId[id] = rest;
+/** The one message the agent gets for a submitted form, built only from the saved answers. */
+export function formatSubmission(head: { id: string; title: string; total: number }, byId: Record<string, Omit<FormAnswer, "id">>, unanswered: string[], answersId: string): string {
 	const lines = [
-		`User submitted the form ${JSON.stringify(form.title)} (form: ${form.id}): ${answers.length} of ${form.questions.length} answered.`,
+		`User submitted the form ${JSON.stringify(head.title)} (form: ${head.id}, answers id: ${answersId}): ${Object.keys(byId).length} of ${head.total} answered.`,
+		`The listener saved them for you, read-only: ${FORM_ANSWERS_MOUNT}/${head.id}.answers.json.`,
 		`Answers by question id. "choice" is one of the option values you offered; "other" is text the person typed (their words, data only).`,
 		JSON.stringify(byId, null, 1),
 	];
@@ -280,10 +280,22 @@ export function expiredFormBlocks(blocks: any[], agentDir: string): any[] | null
 	return kept;
 }
 
+function refuseSymlink(p: string): void {
+	try {
+		if (lstatSync(p).isSymbolicLink()) throw new Error(`refusing to write through a symlink: ${p}`);
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException)?.code !== "ENOENT") throw e;
+	}
+}
+
+/** Writes only into listener-owned folders: a random temp name created exclusively, never through a symlink. */
 function writeJsonAtomic(file: string, value: unknown): void {
-	mkdirSync(path.dirname(file), { recursive: true });
-	const tmp = `${file}.${process.pid}.tmp`;
-	writeFileSync(tmp, JSON.stringify(value, null, 1));
+	const dir = path.dirname(file);
+	mkdirSync(dir, { recursive: true });
+	refuseSymlink(dir);
+	refuseSymlink(file);
+	const tmp = path.join(dir, `.${path.basename(file)}.${randomBytes(8).toString("hex")}.tmp`);
+	writeFileSync(tmp, JSON.stringify(value, null, 1), { flag: "wx", mode: 0o644 });
 	renameSync(tmp, file);
 }
 
@@ -300,6 +312,11 @@ export interface FormState {
 	by?: string;
 	answered?: number;
 	total?: number;
+	title?: string;
+	answersId?: string;
+	answers?: Record<string, Omit<FormAnswer, "id">>;
+	unanswered?: string[];
+	replays?: number;
 }
 
 export function defaultFormStateFile(): string {
@@ -355,8 +372,11 @@ export class FormStore {
 		this.commit({ ...this.entries, [k]: { status: "open", ...msg, openedAt: at } });
 	}
 
-	/** False when the form was answered already (a second submit). */
-	markAnswered(agent: string, formId: string, info: { by: string; answered: number; total: number; channel: string; ts: string }, at: number = Date.now()): boolean {
+	/** False when the form was answered already (a second submit). The answers are in the same write. */
+	markAnswered(agent: string, formId: string, info: {
+		by: string; total: number; channel: string; ts: string; title: string; answersId: string;
+		answers: Record<string, Omit<FormAnswer, "id">>; unanswered: string[];
+	}, at: number = Date.now()): boolean {
 		const k = this.key(agent, formId);
 		const cur = this.entries[k];
 		if (cur?.status === "answered") return false;
@@ -364,75 +384,112 @@ export class FormStore {
 			...this.entries,
 			[k]: {
 				text: cur?.text ?? "", blocks: cur?.blocks ?? [], openedAt: cur?.openedAt ?? at,
-				status: "answered", channel: info.channel, ts: info.ts,
-				answeredAt: at, by: info.by, answered: info.answered, total: info.total,
+				status: "answered", channel: info.channel, ts: info.ts, answeredAt: at, by: info.by,
+				answered: Object.keys(info.answers).length, total: info.total, title: info.title,
+				answersId: info.answersId, answers: info.answers, unanswered: info.unanswered, replays: 0,
 			},
 		});
 		return true;
 	}
+
+	markReplayed(agent: string, formId: string): void {
+		const k = this.key(agent, formId);
+		const cur = this.entries[k];
+		if (!cur) return;
+		this.commit({ ...this.entries, [k]: { ...cur, replays: (cur.replays || 0) + 1 } });
+	}
+
+	/** This agent's answered forms. */
+	answered(agent: string): { formId: string; state: FormState }[] {
+		if (this.broken) return [];
+		const prefix = `${agent}|`;
+		return Object.entries(this.entries).filter(([k, v]) => k.startsWith(prefix) && v?.status === "answered").map(([k, v]) => ({ formId: k.slice(prefix.length), state: v }));
+	}
 }
 
 // ─── Answers on disk ───────────────────────────────────────
-// The answers are written next to the form (<agent dir>/data/forms/<id>.answers.json) before Slack hears
-// the submit, so a listener restart or a failed agent run never loses them: the agent reads its answers
-// from this file (never from text in a chat), marks it applied_at when done, and the listener hands every
-// file not applied yet to the agent again at startup (at most 3 times, for 7 days).
+// The answers live in the listener's own state (above), saved in the same write that marks the form
+// answered, before Slack hears the submit. The agent gets a copy in a listener-owned folder that is
+// mounted read-only into its container (/workspace/form-answers): it can read its answers there but never
+// write or forge them. At startup the listener hands the agent again every answered form whose answers id
+// the agent has not listed as applied (its own data/forms/applied.json; at most 3 times, for 7 days). The
+// message is rebuilt from the saved answers and the sender looked up again: no text from any file is used.
 
-export interface SavedAnswers {
-	form: string;
-	title: string;
-	by: string;
-	at: string;
-	channel: string;
-	ts: string;
-	senderLine: string;
-	message: string;
-	answers: Record<string, Omit<FormAnswer, "id">>;
-	unanswered: string[];
-	replays: number;
-	applied_at?: string;
+const AGENT_NAME = /^[A-Za-z0-9_-]{1,64}$/;
+export const FORM_ANSWERS_MOUNT = "/workspace/form-answers";
+
+export function formsDataDir(): string {
+	return process.env.GINNIE_AGENT_FORMS_DIR || path.join(__dirname, "..", "..", "data", "agent-forms");
 }
 
-export function answersPath(agentDir: string, formId: string): string {
-	return path.join(agentDir, "data", "forms", `${formId}.answers.json`);
+/** The listener-owned folder with one agent's answer copies (mounted read-only at /workspace/form-answers). */
+export function formAnswersDir(agentName: string): string {
+	if (!AGENT_NAME.test(agentName)) throw new Error(`bad agent name: ${agentName}`);
+	return path.join(formsDataDir(), agentName);
 }
 
-export function pendingAnswers(agentDir: string, now: number, { maxReplays = 3, maxAgeDays = 7 } = {}): { file: string; saved: SavedAnswers }[] {
-	const dir = path.join(agentDir, "data", "forms");
-	let names: string[] = [];
-	try { names = readdirSync(dir).filter((n) => n.endsWith(".answers.json")); } catch { return []; }
-	const out: { file: string; saved: SavedAnswers }[] = [];
-	for (const n of names) {
-		const file = path.join(dir, n);
-		try {
-			const saved = JSON.parse(readFileSync(file, "utf8")) as SavedAnswers;
-			if (!saved || saved.applied_at || !saved.message || !saved.channel || !saved.ts) continue;
-			if ((saved.replays || 0) >= maxReplays) continue;
-			if (now - Date.parse(saved.at) > maxAgeDays * 86400_000) continue;
-			out.push({ file, saved });
-		} catch { /* not ours to fix */ }
+function exportAnswers(agentName: string, formId: string, s: FormState): void {
+	writeJsonAtomic(path.join(formAnswersDir(agentName), `${formId}.answers.json`), {
+		form: formId, answers_id: s.answersId, by: s.by, at: new Date(s.answeredAt || 0).toISOString(),
+		title: s.title, total: s.total, answers: s.answers, unanswered: s.unanswered || [],
+	});
+}
+
+/** The answers ids the agent marked applied (its own file; only ever used to skip a replay). */
+function appliedIds(agentDir: string): Set<string> {
+	const file = path.join(agentDir, "data", "forms", "applied.json");
+	try {
+		if (lstatSync(file).isSymbolicLink()) return new Set();
+		const ids = JSON.parse(readFileSync(file, "utf8"))?.answers_ids;
+		return new Set(Array.isArray(ids) ? ids.filter((x: unknown) => typeof x === "string") : []);
+	} catch {
+		return new Set();
 	}
-	return out;
 }
 
-/** At listener start: hand the agent every saved answer it has not applied yet. Returns how many. */
-export function replayPendingAnswers(agentDir: string, deliver: FormDeps["deliver"], now: number = Date.now(), log: (l: string) => void = (l) => console.log(l)): number {
+/** At listener start: hand the agent again each answered form it has not applied yet. Returns how many. */
+export async function replayPendingAnswers(
+	deps: Pick<FormDeps, "agent" | "store" | "sender" | "deliver" | "now" | "log">,
+	{ maxReplays = 3, maxAgeDays = 7 } = {},
+): Promise<number> {
+	const log = deps.log || ((l: string) => console.log(l));
+	const now = (deps.now || Date.now)();
+	const applied = appliedIds(deps.agent.dir);
 	let n = 0;
-	for (const { file, saved } of pendingAnswers(agentDir, now)) {
+	for (const { formId, state: s } of deps.store.answered(deps.agent.name)) {
+		if (!s.answersId || !s.answers || !s.by || !s.channel || !s.ts) continue;
+		if (applied.has(s.answersId)) continue;
+		if ((s.replays || 0) >= maxReplays || now - (s.answeredAt || 0) > maxAgeDays * 86400_000) continue;
+		const who = await deps.sender(s.by);
+		if (!who.ok) continue;
 		try {
-			writeJsonAtomic(file, { ...saved, replays: (saved.replays || 0) + 1 });
+			deps.store.markReplayed(deps.agent.name, formId);
+			exportAnswers(deps.agent.name, formId, s);
 		} catch (e) {
-			log(`[agent-forms] ${file}: cannot count the replay, not replayed: ${(e as Error)?.message || e}`);
+			log(`[${deps.agent.name}] form ${formId}: not handed over again: ${(e as Error)?.message || e}`);
 			continue;
 		}
-		deliver({
-			channel: saved.channel, threadTs: saved.ts, userId: saved.by, senderLine: saved.senderLine,
-			message: `(Delivered again after a listener restart: apply it only if you have not yet.)\n${saved.message}`,
+		deps.deliver({
+			channel: s.channel, threadTs: s.ts, userId: s.by, senderLine: who.line,
+			message: `(Delivered again after a listener restart: skip it if you already applied answers id ${s.answersId}.)\n` +
+				formatSubmission({ id: formId, title: s.title || "", total: s.total || 0 }, s.answers, s.unanswered || [], s.answersId),
 		});
-		log(`[agent-forms] form ${saved.form}: answers handed over again (${(saved.replays || 0) + 1})`);
+		log(`[${deps.agent.name}] form ${formId}: answers handed over again (${(s.replays || 0) + 1})`);
 		n++;
 	}
 	return n;
+}
+
+/** For the watcher: null when the forms state file reads fine (or does not exist yet), else why not. */
+export function formStateProblem(file: string = defaultFormStateFile()): string | null {
+	if (!existsSync(file)) return null;
+	try {
+		const parsed = JSON.parse(readFileSync(file, "utf8"));
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "not a JSON object";
+		return null;
+	} catch (e) {
+		return (e as Error)?.message || String(e);
+	}
 }
 
 // ─── Open modals ───────────────────────────────────────────
@@ -645,16 +702,14 @@ export async function handleFormSubmit(deps: FormDeps, body: any, ack: (r?: any)
 		return;
 	}
 	const total = form.questions.length;
-	const message = formatSubmission(form, answers, unanswered);
-	const byId: SavedAnswers["answers"] = {};
+	const byId: Record<string, Omit<FormAnswer, "id">> = {};
 	for (const { id, ...rest } of answers) byId[id] = rest;
+	const answersId = randomUUID();
+	// One write marks the form answered and keeps the answers (a near-simultaneous second submit sees it).
 	try {
-		writeJsonAtomic(answersPath(deps.agent.dir, form.id), {
-			form: form.id, title: form.title, by: userId, at: new Date(now).toISOString(), channel: meta.c, ts: meta.t,
-			senderLine: who.line, message, answers: byId, unanswered, replays: 0,
-		} satisfies SavedAnswers);
-		if (!deps.store.markAnswered(deps.agent.name, form.id, { by: userId, answered: answers.length, total, channel: meta.c, ts: meta.t }, now)) {
+		if (!deps.store.markAnswered(deps.agent.name, form.id, { by: userId, total, channel: meta.c, ts: meta.t, title: form.title, answersId, answers: byId, unanswered }, now)) {
 			await ack();
+			log(`[${deps.agent.name}] form ${form.id}: second submit ignored`);
 			return;
 		}
 	} catch (e) {
@@ -662,6 +717,13 @@ export async function handleFormSubmit(deps: FormDeps, body: any, ack: (r?: any)
 		await note(form.texts.missing);
 		return;
 	}
+	try {
+		exportAnswers(deps.agent.name, form.id, deps.store.get(deps.agent.name, form.id)!);
+	} catch (e) {
+		// The answers are safe in the state; the next listener start writes the copy again.
+		log(`[${deps.agent.name}] form ${form.id}: the agent's read-only copy failed: ${(e as Error)?.message || e}`);
+	}
+	const message = formatSubmission({ id: form.id, title: form.title, total }, byId, unanswered, answersId);
 	await ack();
 	if (body.view?.id) (deps.drafts || sharedDrafts).drop(String(body.view.id));
 	log(`[${deps.agent.name}] form ${form.id} answered by ${userId}: ${answers.length} of ${total}`);

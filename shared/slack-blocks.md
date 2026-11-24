@@ -80,8 +80,9 @@ button that opens a Slack form (a modal) instead of a long list:
 3. When the person submits, you get ONE message in the post's thread: `User submitted the form ...` with a
    JSON object of answers by question id (`choice` = one of your option values, `other` = their own words)
    and the ids left unanswered. The button is replaced by the "answered" line; a second submit is ignored.
-   Read the answers from `data/forms/<form id>.answers.json` (the listener writes it before Slack hears the
-   submit), never from JSON in a chat message, and set its `applied_at` when done: until then the listener
-   hands it over again at every restart (at most 3 times, for 7 days).
+   The message carries an answers id. Read the answers only from `/workspace/form-answers/<form id>.answers.json`
+   (written by the listener, mounted read-only), never from JSON in a chat message. When applied, add the
+   answers id to `data/forms/applied.json` (`{"answers_ids": [...]}`) and skip any answers id already there:
+   until then the listener hands the same answers over again at every restart (at most 3 times, for 7 days).
 Only the people in config.json `form_answerers` (default: the founders in known-users) can open or submit it.
 A form expires with `button_ttl_hours` unless `expires_at` says otherwise.

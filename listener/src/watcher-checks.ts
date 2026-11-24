@@ -13,6 +13,7 @@ import { existsSync, readFileSync, readdirSync, statSync } from "fs";
 import path from "path";
 import { checkRunFailures } from "./run-failures";
 import { checkSlackHeartbeats } from "./slack-heartbeat";
+import { formStateProblem } from "./agent-forms";
 
 export type Severity = "info" | "warn" | "critical";
 
@@ -349,6 +350,26 @@ export function checkSchedulerRejects(): CheckResult[] {
 	return out;
 }
 
+// ─── Agent forms state ─────────────────────────────────────
+// The listener refuses every Slack form while data/agent-forms.json cannot be read (agent-forms.ts), so
+// that answered forms are never reopened. Say so, or forms just stop working with only a log line.
+export function checkFormState(file: string = path.join(REPO, "data", "agent-forms.json")): CheckResult | null {
+	const problem = formStateProblem(file);
+	if (!problem) return null;
+	return {
+		key: "agent-forms-state",
+		severity: "warn",
+		message:
+			`🚫 *Agent forms are off: \`data/agent-forms.json\` cannot be read* (${problem}). ` +
+			`Every form button and submit is refused until the file is fixed or restored (do not just delete it: ` +
+			`it records which forms were answered). Then restart the listener.`,
+		actions: [
+			{ type: "ack_24h", label: "Ack 24h" },
+			{ type: "ack_7d", label: "Ack 7d" },
+		],
+	};
+}
+
 export function runAllChecks(): CheckResult[] {
 	const results: (CheckResult | null)[] = [
 		checkTokenAge(),
@@ -357,6 +378,7 @@ export function runAllChecks(): CheckResult[] {
 		checkDisk(),
 		...checkMemoryCaps(),
 		...checkSchedulerRejects(),
+		checkFormState(),
 		...checkRunFailures(),
 		...checkSlackHeartbeats(),
 	];
