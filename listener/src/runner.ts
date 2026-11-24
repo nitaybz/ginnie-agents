@@ -711,7 +711,7 @@ export function spawnAttempt(
 		// Form answers the listener saved for this agent (agent-forms.ts): read-only, so the agent can
 		// read what the person submitted but never write or forge it.
 		const formAnswers = formAnswersDir(agent.name);
-		if (existsSync(formAnswers)) {
+		if (formAnswers && existsSync(formAnswers)) {
 			dockerArgs.push("-v", `${formAnswers}:${FORM_ANSWERS_MOUNT}:ro`);
 		}
 

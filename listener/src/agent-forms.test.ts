@@ -6,11 +6,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "fs";
+import { execFileSync } from "child_process";
 import { tmpdir } from "os";
 import path from "path";
 import { checkFormState } from "./watcher-checks";
 import {
-	FORM_CALLBACK, FORM_OPEN_ACTION, OTHER_VALUE, FormDrafts, FormStore, buildFormView, expiredFormBlocks, formAnswersDir, formStateProblem, replayPendingAnswers, collectAnswers, formAnswerers,
+	FORM_CALLBACK, FORM_OPEN_ACTION, OTHER_VALUE, FormDrafts, FormStore, buildFormView, expiredFormBlocks, formAnswersDir, formStateProblem, readAgentFile, replayPendingAnswers, collectAnswers, formAnswerers,
 	handleFormInteraction, handleFormSubmit, isFormInteraction, parseForm, type FormDeps,
 } from "./agent-forms";
 
@@ -350,7 +351,7 @@ test("old state entries are dropped after 30 days", () => {
 	assert.equal(again.get("casper", "new")?.ts, "2");
 });
 
-const copyOf = (formId = "books-20261124") => path.join(formAnswersDir("casper"), `${formId}.answers.json`);
+const copyOf = (formId = "books-20261124") => path.join(formAnswersDir("casper")!, `${formId}.answers.json`);
 
 test("the answers are saved in the listener's state before Slack hears the submit, with a read-only copy for the agent", async () => {
 	const s = setup();
@@ -430,8 +431,8 @@ test("never writes through a symlink", async () => {
 	// The agent's copy folder is a symlink: the copy is refused, the answers are still saved and delivered.
 	const target = path.join(s.root, "elsewhere");
 	mkdirSync(target);
-	mkdirSync(path.dirname(formAnswersDir("casper")), { recursive: true });
-	symlinkSync(target, formAnswersDir("casper"));
+	mkdirSync(path.dirname(formAnswersDir("casper")!), { recursive: true });
+	symlinkSync(target, formAnswersDir("casper")!);
 	await submit(s, view, stateOf(view, { ROW1: "stock" }));
 	assert.equal(s.calls.deliver.length, 1);
 	assert.ok(!existsSync(path.join(target, "books-20261124.answers.json")));
@@ -559,4 +560,35 @@ test("a hash conflict is retried without the hash, from every pick so far", asyn
 	assert.equal(s.calls.update.length, 2);
 	assert.equal(s.calls.update[1].hash, undefined);
 	assert.ok(s.calls.update[1].view.blocks.some((b: any) => b.block_id === "o:ROW1"));
+});
+
+test("files in the agent's folder are read only when they are regular files: a FIFO or symlink never blocks or is followed", async () => {
+	const s = setup();
+	const forms = path.join(s.agentDir, "data", "forms");
+	const fifo = path.join(forms, "applied.json");
+	execFileSync("mkfifo", [fifo]); // nobody ever writes to it: a blocking read would hang the listener
+	assert.equal(readAgentFile(fifo), null);
+	const view = await openModal(s);
+	await submit(s, view, stateOf(view, { ROW1: "stock" }));
+	const started = Date.now();
+	assert.equal(await replayPendingAnswers({ ...s.deps, store: new FormStore(s.storeFile), now: () => NOW + 60_000 }), 1, "the FIFO is ignored, not waited on");
+	assert.ok(Date.now() - started < 2000);
+	// A form file that is a FIFO or a symlink is not read either.
+	execFileSync("mkfifo", [path.join(forms, "fifo-form.json")]);
+	const { action, body } = clickBody(NITAY, "fifo-form");
+	await handleFormInteraction(s.deps, body, action);
+	const outside = path.join(s.root, "outside.json");
+	writeFileSync(outside, JSON.stringify(formFile({ id: "linked-form" })));
+	symlinkSync(outside, path.join(forms, "linked-form.json"));
+	assert.equal(readAgentFile(path.join(forms, "linked-form.json")), null);
+	assert.ok(readAgentFile(path.join(forms, "books-20261124.json")), "a regular file reads");
+	const c2 = clickBody(NITAY, "linked-form");
+	await handleFormInteraction(s.deps, c2.body, c2.action);
+	assert.equal(s.calls.open.length, 1, "only the first, real form opened");
+});
+
+test("an agent name that could leave the answers folder gets no folder and no mount", () => {
+	setup();
+	assert.ok(formAnswersDir("casper"));
+	for (const bad of ["../adam", "a/b", "", "x y", "..", "casper\n"]) assert.equal(formAnswersDir(bad), null, JSON.stringify(bad));
 });

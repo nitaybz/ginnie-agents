@@ -16,7 +16,7 @@
  * people with role "founder" in known-users.json.
  */
 import { randomBytes, randomUUID } from "crypto";
-import { existsSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "fs";
+import { closeSync, constants as fsc, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "fs";
 import path from "path";
 
 export const FORM_OPEN_ACTION = "agent_form_open";
@@ -141,10 +141,40 @@ export function formPath(agentDir: string, formId: string): string {
 	return path.join(agentDir, "data", "forms", `${formId}.json`);
 }
 
+const AGENT_FILE_MAX = 1024 * 1024;
+
+/**
+ * Read a file from an agent's (agent-writable) folder: only a regular file, never through a symlink, a
+ * FIFO or a device, opened non-blocking and checked again once open, at most 1 MB. Null otherwise.
+ */
+export function readAgentFile(file: string): string | null {
+	let fd: number | undefined;
+	try {
+		const before = lstatSync(file);
+		if (!before.isFile() || before.size > AGENT_FILE_MAX) return null;
+		fd = openSync(file, fsc.O_RDONLY | fsc.O_NONBLOCK | (fsc.O_NOFOLLOW ?? 0));
+		const st = fstatSync(fd);
+		if (!st.isFile() || st.ino !== before.ino || st.dev !== before.dev || st.size > AGENT_FILE_MAX) return null;
+		const buf = Buffer.alloc(st.size);
+		let off = 0;
+		while (off < buf.length) {
+			const n = readSync(fd, buf, off, buf.length - off, off);
+			if (n <= 0) break;
+			off += n;
+		}
+		return buf.subarray(0, off).toString("utf8");
+	} catch {
+		return null;
+	} finally {
+		if (fd !== undefined) closeSync(fd);
+	}
+}
+
 export function loadForm(agentDir: string, formId: string): AgentForm | null {
 	if (!FORM_ID.test(formId)) return null;
 	try {
-		return parseForm(JSON.parse(readFileSync(formPath(agentDir, formId), "utf8")));
+		const text = readAgentFile(formPath(agentDir, formId));
+		return text === null ? null : parseForm(JSON.parse(text));
 	} catch {
 		return null;
 	}
@@ -423,13 +453,15 @@ export function formsDataDir(): string {
 }
 
 /** The listener-owned folder with one agent's answer copies (mounted read-only at /workspace/form-answers). */
-export function formAnswersDir(agentName: string): string {
-	if (!AGENT_NAME.test(agentName)) throw new Error(`bad agent name: ${agentName}`);
+export function formAnswersDir(agentName: string): string | null {
+	if (!AGENT_NAME.test(agentName)) return null; // no folder (and no mount) for a name that could leave it
 	return path.join(formsDataDir(), agentName);
 }
 
 function exportAnswers(agentName: string, formId: string, s: FormState): void {
-	writeJsonAtomic(path.join(formAnswersDir(agentName), `${formId}.answers.json`), {
+	const dir = formAnswersDir(agentName);
+	if (!dir) throw new Error(`no answers folder for agent name ${JSON.stringify(agentName)}`);
+	writeJsonAtomic(path.join(dir, `${formId}.answers.json`), {
 		form: formId, answers_id: s.answersId, by: s.by, at: new Date(s.answeredAt || 0).toISOString(),
 		title: s.title, total: s.total, answers: s.answers, unanswered: s.unanswered || [],
 	});
@@ -439,8 +471,9 @@ function exportAnswers(agentName: string, formId: string, s: FormState): void {
 function appliedIds(agentDir: string): Set<string> {
 	const file = path.join(agentDir, "data", "forms", "applied.json");
 	try {
-		if (lstatSync(file).isSymbolicLink()) return new Set();
-		const ids = JSON.parse(readFileSync(file, "utf8"))?.answers_ids;
+		const text = readAgentFile(file);
+		if (text === null) return new Set();
+		const ids = JSON.parse(text)?.answers_ids;
 		return new Set(Array.isArray(ids) ? ids.filter((x: unknown) => typeof x === "string") : []);
 	} catch {
 		return new Set();
