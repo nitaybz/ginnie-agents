@@ -3,6 +3,13 @@
  * sandbox per run (replay.ts), and write one result line per case and setting.
  *
  *   node dist/replay-cli.js --agent <name> --cases <file.jsonl> --settings <file.json> --out <dir>
+ *        [--sandbox-root <dir>] [--cooldown-file <file>]
+ *
+ * Claude accounts come from the framework .env, read the same way the listener
+ * reads it; with none the replay refuses (it never uses the host login file).
+ * --sandbox-root: where the per-run sandboxes go (created private to this
+ * user; default the system temp folder). Each is deleted after its run.
+ * --cooldown-file: an own usage-limit cooldown file instead of the listener's.
  *
  * cases.jsonl, one per line: { "id": "case-1", "prompt": "..." }
  * settings.json:
@@ -20,12 +27,13 @@
  * Progress lines carry ids and times only.
  */
 
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, appendFileSync, writeFileSync } from "fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, appendFileSync, writeFileSync } from "fs";
 import path from "path";
+import dotenv from "dotenv";
 import { loadAgents, type AgentConfig } from "./runner";
-import { replayOne, type ReplayDeps } from "./replay";
+import { readSandboxDir, replayOne, type ReplayDeps } from "./replay";
 
-const MAX_OUTPUT_BYTES = 256 * 1024;
+const FRAMEWORK_ENV = path.join(__dirname, "..", "..", ".env");
 
 interface Setting { model: string; effort?: string; label?: string }
 interface SettingsFile {
@@ -42,25 +50,6 @@ interface SettingsFile {
 function arg(argv: string[], name: string): string | undefined {
 	const i = argv.indexOf(name);
 	return i === -1 ? undefined : argv[i + 1];
-}
-
-// Every file under dir (relative "a/b" keys), text up to MAX_OUTPUT_BYTES each.
-function readOutputs(dir: string): Record<string, string> {
-	const out: Record<string, string> = {};
-	if (!existsSync(dir)) return out;
-	const walk = (d: string) => {
-		for (const e of readdirSync(d, { withFileTypes: true })) {
-			const p = path.join(d, e.name);
-			const key = path.relative(dir, p).split(path.sep).join("/");
-			if (e.isDirectory()) walk(p);
-			else if (e.isFile()) {
-				const size = statSync(p).size;
-				out[key] = size > MAX_OUTPUT_BYTES ? `(${size} bytes, not read)` : readFileSync(p, "utf-8");
-			}
-		}
-	};
-	walk(dir);
-	return out;
 }
 
 function checkSettings(raw: any): string | null {
@@ -90,6 +79,10 @@ export async function runReplayCli(argv: string[], deps: CliDeps = {}): Promise<
 		say("usage: replay-cli.js --agent <name> --cases <file.jsonl> --settings <file.json> --out <dir>");
 		return 2;
 	}
+	// Same .env, same precedence as the listener (listener/src/index.ts).
+	dotenv.config({ path: deps.envFile ?? FRAMEWORK_ENV, override: true });
+	const sandboxRoot = arg(argv, "--sandbox-root") ?? deps.sandboxRoot;
+	const cooldownFile = arg(argv, "--cooldown-file") ?? deps.cooldownFile;
 	const agent = (deps.agents ?? loadAgents()).find((a) => a.name === name);
 	if (!agent) { say(`no agent named ${name}`); return 2; }
 
@@ -112,6 +105,38 @@ export async function runReplayCli(argv: string[], deps: CliDeps = {}): Promise<
 	if (existsSync(resultsFile)) { say(`${resultsFile} already exists; use a new --out folder`); return 2; }
 	writeFileSync(resultsFile, "", { mode: 0o600 });
 
+	if (sandboxRoot) {
+		mkdirSync(sandboxRoot, { recursive: true, mode: 0o700 });
+		chmodSync(sandboxRoot, 0o700);
+	}
+	const runDeps: ReplayDeps = { ...deps, sandboxRoot, cooldownFile };
+
+	// Killed mid-run: delete the sandbox in use before going.
+	let current = "";
+	const onSignal = (sig: NodeJS.Signals) => {
+		if (current) rmSync(current, { recursive: true, force: true });
+		say(`stopped by ${sig}`);
+		process.exit(130);
+	};
+	process.once("SIGINT", onSignal);
+	process.once("SIGTERM", onSignal);
+	try {
+		return await runAll(cases, cfg, agent, runDeps, resultsFile, say, (dir) => { current = dir; });
+	} finally {
+		process.removeListener("SIGINT", onSignal);
+		process.removeListener("SIGTERM", onSignal);
+	}
+}
+
+async function runAll(
+	cases: { id: string; prompt: string }[],
+	cfg: SettingsFile,
+	agent: AgentConfig,
+	deps: ReplayDeps,
+	resultsFile: string,
+	say: (line: string) => void,
+	inUse: (dir: string) => void,
+): Promise<number> {
 	const marker = new RegExp(cfg.replyMarker, cfg.replyMarkerFlags || "");
 	let failed = 0;
 	for (const c of cases) {
@@ -126,14 +151,27 @@ export async function runReplayCli(argv: string[], deps: CliDeps = {}): Promise<
 				keepData: cfg.keepData,
 				replyMarker: marker,
 			}, deps);
+			inUse(r.sandbox);
 			let outputs: Record<string, string> = {};
+			let outputsSkipped: string[] = [];
+			let outputsError: string | undefined;
 			try {
-				if (r.sandbox && cfg.outputDir) outputs = readOutputs(path.join(r.sandbox, cfg.outputDir));
+				if (r.sandbox && cfg.outputDir) {
+					const read = readSandboxDir(r.sandbox, cfg.outputDir);
+					outputs = read.files;
+					outputsSkipped = read.skipped;
+				}
+			} catch (err) {
+				outputsError = String((err as Error)?.message ?? err);
 			} finally {
 				if (r.sandbox) rmSync(r.sandbox, { recursive: true, force: true });
+				inUse("");
 			}
 			const { sandbox: _sandbox, ...rest } = r;
-			appendFileSync(resultsFile, JSON.stringify({ case: c.id, ...(s.label ? { label: s.label } : {}), ...rest, outputs }) + "\n");
+			appendFileSync(resultsFile, JSON.stringify({
+				case: c.id, ...(s.label ? { label: s.label } : {}), ...rest, outputs,
+				...(outputsSkipped.length ? { outputsSkipped } : {}), ...(outputsError ? { outputsError } : {}),
+			}) + "\n");
 			if (!r.ok) failed++;
 			say(`${c.id} ${s.model}/${r.effort ?? "default"}: ${r.ok ? `ok, reply written ${r.toReplyMs == null ? "never" : `${(r.toReplyMs / 1000).toFixed(1)} s`}, run ${((r.totalMs ?? 0) / 1000).toFixed(1)} s` : "failed"}`);
 		}

@@ -278,8 +278,10 @@ function fakeHome(): string {
 
 const HOST_LOGIN = "/home/node/.claude/.credentials.json";
 const TEST_ACCOUNT: ClaudeAccount = { label: "A", envVar: "CLAUDE_CODE_OAUTH_TOKEN", value: "sk-test-replay" };
-const oneAccount = { accounts: [TEST_ACCOUNT], cooldownFile: path.join(tmp("cool"), "cooldowns.json") };
-const noAccounts = { accounts: [], cooldownFile: path.join(tmp("cool"), "cooldowns.json") };
+// envFile: a .env that does not exist, so the CLI never reads a real one in tests.
+const NO_ENV_FILE = path.join(tmp("no-env"), ".env");
+const oneAccount = { accounts: [TEST_ACCOUNT], cooldownFile: path.join(tmp("cool"), "cooldowns.json"), envFile: NO_ENV_FILE };
+const noAccounts = { accounts: [], cooldownFile: path.join(tmp("cool"), "cooldowns.json"), envFile: NO_ENV_FILE };
 
 describe("replayOne", () => {
 	test("runs one container on the sandbox with the chosen model and effort, no Slack, inbox or tool servers, and reads the timings", async () => {
@@ -586,7 +588,7 @@ describe("sandboxes are always deleted", () => {
 		const { bin } = fakeDocker();
 		const code = await withFakeDocker(bin, () => runReplayCli(
 			["--agent", "agent-a", "--cases", path.join(work, "cases.jsonl"), "--settings", path.join(work, "settings.json"), "--out", path.join(work, "out"), "--sandbox-root", root, "--cooldown-file", cool],
-			{ agents: [agentWith(agentDir)], accounts: [TEST_ACCOUNT] },
+			{ agents: [agentWith(agentDir)], accounts: [TEST_ACCOUNT], envFile: NO_ENV_FILE },
 		));
 		assert.equal(code, 0);
 		assert.equal(statSync(root).mode & 0o777, 0o700);

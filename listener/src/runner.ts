@@ -505,6 +505,11 @@ export function spawnAttempt(
 	extras?: AttemptExtras,
 ): Promise<AttemptResult> {
 	return new Promise((resolve, reject) => {
+		// A replay runs only on an account token: never on the host's own
+		// Claude login file (it holds more than this run should see).
+		if (extras?.replay && !account) {
+			throw new Error("a replay needs a Claude account token (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY); it never uses the host login file");
+		}
 		const containerName = `ginnie-${extras?.replay ? "replay-" : ""}${agent.name}-${Date.now()}`;
 
 		// Ensure directories exist
@@ -608,7 +613,7 @@ export function spawnAttempt(
 		dockerArgs.push(
 			"-v", `${claudeDir}:/home/node/.claude`,
 		);
-		if (!account && existsSync(hostCredentials)) {
+		if (!account && !extras?.replay && existsSync(hostCredentials)) {
 			dockerArgs.push("-v", `${hostCredentials}:/home/node/.claude/.credentials.json:ro`);
 		}
 

@@ -5,9 +5,11 @@
  *
  * Safety: the run never sees the real agent folder (a copy, never a mount),
  * gets no credentials unless the caller passes some, no Slack tokens, no
- * mid-run inbox, no tool servers, no WhatsApp, no extra host mounts and no
- * bottom-line channel. The caller reads what the run wrote in the sandbox and
- * then deletes it.
+ * mid-run inbox, no tool servers, no WhatsApp, no extra host mounts, no
+ * bottom-line channel, and never the host's Claude login file (a replay runs
+ * only on an account token). Links are never copied in and never followed
+ * when reading what the run left (a run could plant one). The caller reads
+ * what the run wrote in the sandbox (readSandboxDir) and then deletes it.
  *
  * Timings follow the baseline rules: a run starts at a top-level user prompt
  * (a string, or an array with a text item; not a tool result, not a meta entry,
@@ -17,7 +19,7 @@
  * whose input matches the caller's replyMarker.
  */
 
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "fs";
+import { chmodSync, copyFileSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
 import path from "path";
 import { spawnAttempt, type AgentConfig, type RunEffort, type RunProfile } from "./runner";
@@ -93,14 +95,15 @@ const DATA_NAME = /^[A-Za-z0-9._-]{1,80}$/;
 const ENV_NAME = /^[A-Z][A-Z0-9_]{0,63}$/;
 // Names the framework, the Claude program or an auth path reads, and names
 // that look like a secret: a replay must not override them or carry secrets.
-const RESERVED_ENV = /^(AGENT_|MIDRUN_|RESUME_|CLAUDE|ANTHROPIC|WHATSAPP_|SLACK_|NODE_|DOCKER|GINNIE_|STUDIO)|^(MAX_TURNS|ALLOWED_TOOLS|PRELOAD_SKILLS|DELIVERY_INSTRUCTION|BOTTOM_LINE_CHANNEL|TZ|HOME|PATH|USER|SHELL)$|TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/;
+const RESERVED_ENV = /^(AGENT_|MIDRUN_|RESUME_|CLAUDE|ANTHROPIC|WHATSAPP_|SLACK_|NODE_|DOCKER|GINNIE_|STUDIO|LD_)|^(MAX_TURNS|ALLOWED_TOOLS|PRELOAD_SKILLS|DELIVERY_INSTRUCTION|BOTTOM_LINE_CHANNEL|TZ|HOME|PATH|USER|SHELL)$|TOKEN|SECRET|KEY|PASSWORD|CREDENTIAL/;
 
 /**
  * Copy an agent folder to a new private temp folder for one replay. Leaves out
  * credentials.json, sessions/, logs/, .git, .env files and every data/
  * subfolder not listed (data/ itself is always there, empty or with the listed
- * ones). Symlinks are copied as their contents, so nothing in the copy points
- * back at a real file. credentials.json is written only from opts.credentials.
+ * ones). Links (and anything that is not a plain file or folder) are skipped
+ * at every depth, so nothing in the copy points back at a real file.
+ * credentials.json is written only from opts.credentials.
  */
 export function makeSandbox(agentDir: string, opts: { credentials?: object; keepData?: string[]; root?: string }): string {
 	const keep = opts.keepData ?? [];
@@ -110,23 +113,92 @@ export function makeSandbox(agentDir: string, opts: { credentials?: object; keep
 		}
 	}
 	const src = path.resolve(agentDir);
-	if (!statSync(src).isDirectory()) throw new Error(`not a folder: ${agentDir}`);
+	if (!lstatSync(src).isDirectory()) throw new Error(`not a folder: ${agentDir}`);
 	const sb = mkdtempSync(path.join(opts.root ?? tmpdir(), `replay-${path.basename(src).replace(/[^A-Za-z0-9_-]/g, "_")}-`));
-
-	for (const entry of readdirSync(src)) {
-		if (NEVER_COPY.has(entry) || entry === ".env" || entry.startsWith(".env.")) continue;
-		cpSync(path.join(src, entry), path.join(sb, entry), { recursive: true, dereference: true });
-	}
-	// Always a data/ folder, so what the run writes there lands in the sandbox.
-	mkdirSync(path.join(sb, "data"));
-	for (const name of keep) {
-		const from = path.join(src, "data", name);
-		if (existsSync(from)) cpSync(from, path.join(sb, "data", name), { recursive: true, dereference: true });
-	}
-	if (opts.credentials !== undefined) {
-		writeFileSync(path.join(sb, "credentials.json"), JSON.stringify(opts.credentials, null, 2), { mode: 0o600 });
+	try {
+		for (const entry of readdirSync(src)) {
+			if (NEVER_COPY.has(entry) || entry === ".env" || entry.startsWith(".env.")) continue;
+			copyTree(path.join(src, entry), path.join(sb, entry));
+		}
+		// Always a data/ folder, so what the run writes there lands in the sandbox.
+		mkdirSync(path.join(sb, "data"));
+		const dataDir = path.join(src, "data");
+		if (lstatOrNull(dataDir)?.isDirectory()) {
+			for (const name of keep) copyTree(path.join(dataDir, name), path.join(sb, "data", name));
+		}
+		if (opts.credentials !== undefined) {
+			writeFileSync(path.join(sb, "credentials.json"), JSON.stringify(opts.credentials, null, 2), { mode: 0o600 });
+		}
+	} catch (err) {
+		rmSync(sb, { recursive: true, force: true });
+		throw err;
 	}
 	return sb;
+}
+
+function lstatOrNull(p: string) {
+	try { return lstatSync(p); } catch { return null; }
+}
+
+// Plain files and folders only; a link or anything else is skipped (missing is fine).
+function copyTree(from: string, to: string): void {
+	const st = lstatOrNull(from);
+	if (!st) return;
+	if (st.isDirectory()) {
+		mkdirSync(to, { mode: st.mode & 0o777 });
+		for (const entry of readdirSync(from)) copyTree(path.join(from, entry), path.join(to, entry));
+	} else if (st.isFile()) {
+		copyFileSync(from, to);
+		chmodSync(to, st.mode & 0o777);
+	}
+}
+
+/**
+ * The real path of rel inside the sandbox, or an error when rel is not a
+ * plain relative path, any part of it is a link, or it leaves the sandbox.
+ * null when it does not exist.
+ */
+export function sandboxPath(sandbox: string, rel: string): string | null {
+	const parts = rel.split(/[\\/]+/).filter(Boolean);
+	if (path.isAbsolute(rel) || !parts.length || parts.some((p) => p === ".." || p === ".")) {
+		throw new Error(`${JSON.stringify(rel)} is not a plain relative path`);
+	}
+	const root = realpathSync(sandbox);
+	let cur = root;
+	for (const part of parts) {
+		cur = path.join(cur, part);
+		const st = lstatOrNull(cur);
+		if (!st) return null;
+		if (st.isSymbolicLink()) throw new Error(`${JSON.stringify(rel)} is or passes through a link`);
+	}
+	const real = realpathSync(cur);
+	if (real !== root && !real.startsWith(root + path.sep)) throw new Error(`${JSON.stringify(rel)} leaves the sandbox`);
+	return real;
+}
+
+/**
+ * Read every plain file under a folder inside the sandbox ("a/b" keys, text up
+ * to maxBytes each). Links are never followed: a link folder is refused
+ * (throws), links inside it are listed in skipped.
+ */
+export function readSandboxDir(sandbox: string, rel: string, maxBytes = 256 * 1024): { files: Record<string, string>; skipped: string[] } {
+	const files: Record<string, string> = {};
+	const skipped: string[] = [];
+	const dir = sandboxPath(sandbox, rel);
+	if (!dir) return { files, skipped };
+	if (!lstatSync(dir).isDirectory()) throw new Error(`${JSON.stringify(rel)} is not a folder`);
+	const walk = (d: string) => {
+		for (const name of readdirSync(d)) {
+			const p = path.join(d, name);
+			const key = path.relative(dir, p).split(path.sep).join("/");
+			const st = lstatSync(p);
+			if (st.isDirectory()) walk(p);
+			else if (st.isFile()) files[key] = st.size > maxBytes ? `(${st.size} bytes, not read)` : readFileSync(p, "utf-8");
+			else skipped.push(key);
+		}
+	};
+	walk(dir);
+	return { files, skipped };
 }
 
 // ---- timings ----
@@ -218,19 +290,23 @@ function refuse(c: Pick<ReplayCase, "model" | "effort">, reason: string, sandbox
 }
 
 // The run's transcript: the reported session's file, else the newest one.
-function findTranscript(sessionsDir: string, sessionId: string | undefined): string | null {
-	const projects = path.join(sessionsDir, "projects");
-	if (!existsSync(projects)) return null;
-	const files: string[] = [];
+// Never through a link: the run could plant one pointing anywhere.
+function findTranscript(sandbox: string, sessionId: string | undefined): string | null {
+	const projects = sandboxPath(sandbox, "sessions/projects");
+	if (!projects || !lstatSync(projects).isDirectory()) return null;
+	const files: { file: string; mtime: number }[] = [];
 	for (const d of readdirSync(projects)) {
 		const full = path.join(projects, d);
-		if (!statSync(full).isDirectory()) continue;
-		for (const f of readdirSync(full)) if (f.endsWith(".jsonl")) files.push(path.join(full, f));
+		if (!lstatSync(full).isDirectory()) continue;
+		for (const f of readdirSync(full)) {
+			const st = lstatSync(path.join(full, f));
+			if (f.endsWith(".jsonl") && st.isFile()) files.push({ file: path.join(full, f), mtime: st.mtimeMs });
+		}
 	}
-	const own = sessionId ? files.find((f) => path.basename(f) === `${sessionId}.jsonl`) : undefined;
-	if (own) return own;
-	files.sort((a, b) => statSync(b).mtimeMs - statSync(a).mtimeMs);
-	return files[0] ?? null;
+	const own = sessionId ? files.find((f) => path.basename(f.file) === `${sessionId}.jsonl`) : undefined;
+	if (own) return own.file;
+	files.sort((a, b) => b.mtime - a.mtime);
+	return files[0]?.file ?? null;
 }
 
 /**
@@ -249,6 +325,10 @@ export async function replayOne(agent: AgentConfig, c: ReplayCase, deps: ReplayD
 		if (typeof c.env![name] !== "string") return refuse(c, `env ${name} must be a string`);
 	}
 	const effort = (c.effort ?? base?.effort ?? null) as RunEffort | null;
+	const accounts = deps.accounts ?? loadClaudeAccounts(process.env);
+	if (!accounts.length) {
+		return refuse(c, "no Claude account token (CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY); a replay never uses the host login file");
+	}
 
 	let sandbox: string;
 	try {
@@ -257,6 +337,25 @@ export async function replayOne(agent: AgentConfig, c: ReplayCase, deps: ReplayD
 		return refuse(c, `sandbox: ${String((err as Error)?.message ?? err)}`);
 	}
 
+	// Everything after the sandbox exists: on any unexpected failure it is
+	// deleted here, so a sandbox is only ever handed back to the caller.
+	try {
+		return await runOnSandbox(agent, c, effort, base, accounts, deps, sandbox);
+	} catch (err) {
+		rmSync(sandbox, { recursive: true, force: true });
+		return refuse({ model: c.model, effort: effort ?? undefined }, `replay: ${String((err as Error)?.message ?? err)}`);
+	}
+}
+
+async function runOnSandbox(
+	agent: AgentConfig,
+	c: ReplayCase,
+	effort: RunEffort | null,
+	base: RunProfile | undefined,
+	accounts: ClaudeAccount[],
+	deps: ReplayDeps,
+	sandbox: string,
+): Promise<ReplayResult> {
 	// The agent as it runs in the replay: everything points at the sandbox,
 	// and every way out (Slack, WhatsApp, tool servers, host mounts, inbox) is off.
 	const replayAgent: AgentConfig = {
@@ -273,27 +372,30 @@ export async function replayOne(agent: AgentConfig, c: ReplayCase, deps: ReplayD
 		model: c.model,
 		runProfiles: { [REPLAY_PROFILE]: { model: c.model, ...(effort ? { effort } : {}), ...(base?.preloadSkills ? { preloadSkills: base.preloadSkills } : {}) } },
 	};
+	const failed = (result: string): Promise<AttemptResult> => Promise.resolve({ sessionId: "", isError: true, result, limit: null });
 
 	let out: AttemptResult;
 	try {
 		out = await runWithAccountFallback({
-			accounts: deps.accounts ?? loadClaudeAccounts(process.env),
+			accounts,
 			cooldownFile: deps.cooldownFile ?? ACCOUNT_COOLDOWNS_FILE,
 			model: c.model,
-			// A retry after a usage limit that would resume partway is not a
-			// clean replay (its times mix two runs): report it instead.
-			attempt: (account, cont) => cont
-				? Promise.resolve({ sessionId: "", isError: true, result: "stopped on a usage limit partway; a replay is not continued on another account", limit: null })
-				: spawnAttempt(replayAgent, c.prompt, undefined, c.origin ?? "slack", account, false, undefined, REPLAY_PROFILE, { replay: true, env: c.env }),
+			attempt: (account, cont) => {
+				// Every account cooling down: no host-login fallback for a replay.
+				if (!account) return failed("no Claude account available right now (all cooling down after usage limits)");
+				// A retry after a usage limit that would resume partway is not a
+				// clean replay (its times mix two runs): report it instead.
+				if (cont) return failed("stopped on a usage limit partway; a replay is not continued on another account");
+				return spawnAttempt(replayAgent, c.prompt, undefined, c.origin ?? "slack", account, false, undefined, REPLAY_PROFILE, { replay: true, env: c.env });
+			},
 			log: (line) => console.log(`[${agent.name} replay] ${line}`),
 		});
 	} catch (err) {
 		return refuse({ model: c.model, effort: effort ?? undefined }, `run: ${String((err as Error)?.message ?? err)}`, sandbox);
 	}
 
-	const file = findTranscript(path.join(sandbox, "sessions"), out.reportedSessionId);
-	let timings: RunTimings | null = null;
-	try { timings = file ? runTimings(readFileSync(file, "utf-8"), c.replyMarker) : null; } catch {}
+	const file = findTranscript(sandbox, out.reportedSessionId);
+	const timings = file ? runTimings(readFileSync(file, "utf-8"), c.replyMarker) : null;
 	const reason = out.isError
 		? pickErrorLine(out.result || "", out.stderr || "").slice(0, 2000)
 		: !timings ? "the run left no transcript in the sandbox" : undefined;
