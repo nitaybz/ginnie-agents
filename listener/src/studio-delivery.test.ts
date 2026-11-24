@@ -28,3 +28,10 @@ test("a conversation run is told its answer goes out through its own tools, neve
 	}
 	assert.ok(!/Ginnie Studio/.test(text) && !/WhatsApp/.test(text), "one generic line, not another origin's");
 });
+
+test("the conversation line does not forbid asking a person through the agent's own skills", () => {
+	const text = deliveryInstruction("conversation");
+	assert.doesNotMatch(text, /anywhere else/i, "a blanket ban would stop an agent's own ask-a-person step");
+	assert.match(text, /answer/i);
+	assert.match(text, /ask(ing)? .*(person|people|team)/i);
+});

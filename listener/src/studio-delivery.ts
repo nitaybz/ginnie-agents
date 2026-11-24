@@ -29,7 +29,8 @@ const WHATSAPP_INSTRUCTION =
 const CONVERSATION_INSTRUCTION =
 	"This turn is part of a conversation handed to you by a host process, not by Slack. " +
 	"Your answer is delivered by your own tools for this conversation, as your instructions for it say. " +
-	"Never post about this conversation to Slack or anywhere else.";
+	"Never post your answer, or the other side's messages, to Slack. " +
+	"Asking a person on your team for help through your own skills, as your instructions for this conversation allow, is fine.";
 
 /**
  * Returns the extra system-prompt instruction for a given turn origin, or ""
