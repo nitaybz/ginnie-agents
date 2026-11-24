@@ -264,6 +264,10 @@ export function createFeed(dir, firstPrompt, {
 				unseen.delete(msg.uuid);
 				clearTimeout(idleTimer);
 				idleTimer = null;
+				// The model is now working on it, though its first output may come after the
+				// current wait ends: start the wait again so the inbox stays open meanwhile.
+				// Bounded: if no turn ever starts, the run still ends when this wait runs out.
+				if (taking && lingerMs > 0) lingerUntil = Date.now() + Math.min(lingerMs, holdMs);
 			} else if (msg.type === "assistant" && !msg.parent_tool_use_id) {
 				resultIn = false; // a turn is running; wait for its result
 				heldSince = 0;
