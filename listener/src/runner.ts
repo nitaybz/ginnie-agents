@@ -482,6 +482,13 @@ export function parseRunOutput(stdout: string, exitCode: number | null, resumeId
 	};
 }
 
+export interface AttemptExtras {
+	/** Marks a replay run (see replay.ts). */
+	replay?: boolean;
+	/** Extra container env; the caller has checked the names. */
+	env?: Record<string, string>;
+}
+
 export function spawnAttempt(
 	agent: AgentConfig,
 	message: string,
@@ -493,9 +500,12 @@ export function spawnAttempt(
 	strictResume = false,
 	midrunDir?: string,
 	profile?: string,
+	// A replay run (replay.ts): its own container name, no bottom-line
+	// channel, and extra env passed by name (values in docker's own env).
+	extras?: AttemptExtras,
 ): Promise<AttemptResult> {
 	return new Promise((resolve, reject) => {
-		const containerName = `ginnie-${agent.name}-${Date.now()}`;
+		const containerName = `ginnie-${extras?.replay ? "replay-" : ""}${agent.name}-${Date.now()}`;
 
 		// Ensure directories exist
 		const memoryDir = path.join(agent.dir, "memory");
@@ -577,8 +587,11 @@ export function spawnAttempt(
 		// Model, effort, preloaded skills and open-run wait for this kind of run.
 		dockerArgs.push(...profileEnv(agent, profile));
 
-		// Bottom-line channel (framework/skills/bottom-line). Off when unset.
-		dockerArgs.push(...bottomLineDockerEnv(process.env));
+		// Caller env for a replay: the name here, the value in docker's env.
+		for (const name of Object.keys(extras?.env ?? {})) dockerArgs.push("-e", name);
+
+		// Bottom-line channel (framework/skills/bottom-line). Off when unset, and in a replay.
+		if (!extras?.replay) dockerArgs.push(...bottomLineDockerEnv(process.env));
 
 		// WhatsApp gateway agent API (framework/skills/whatsapp). The token is
 		// not passed here; the agent reads it from its credentials.json mount.
@@ -683,7 +696,7 @@ export function spawnAttempt(
 
 		const child = spawn("docker", dockerArgs, {
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, ...auth.env },
+			env: { ...process.env, ...(extras?.env ?? {}), ...auth.env },
 		});
 
 		let stdout = "";

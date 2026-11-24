@@ -241,7 +241,8 @@ console.log(JSON.stringify({ session_id: "s-fake", is_error: false, result: "fin
 async function withFakeDocker<T>(bin: string, fn: () => Promise<T>): Promise<T> {
 	const saved = { PATH: process.env.PATH, BL: process.env.BOTTOM_LINE_CHANNEL };
 	const log = console.log, warn = console.warn, err = console.error, write = process.stderr.write.bind(process.stderr);
-	process.env.PATH = `${bin}:/usr/bin:/bin`;
+	// Only the fake on PATH, so a real docker can never start from a test.
+	process.env.PATH = bin;
 	process.env.BOTTOM_LINE_CHANNEL = "C-bottom-line";
 	console.log = () => {}; console.warn = () => {}; console.error = () => {};
 	(process.stderr as any).write = () => true;
