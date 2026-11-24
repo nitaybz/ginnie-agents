@@ -104,6 +104,8 @@ export interface RunProfile {
 	lingerMinutes?: number;
 	/** How many such open runs the agent may have at once. */
 	lingerMaxOpen?: number;
+	/** How many conversation runs of this agent may run at once; more wait in line (default 8). */
+	maxRunning?: number;
 }
 
 const RUN_EFFORTS: readonly string[] = ["low", "medium", "high", "xhigh", "max"];
@@ -156,10 +158,21 @@ export function parseRunProfiles(raw: unknown, warn: (line: string) => void): Re
 			if (typeof v.linger_max_open === "number" && Number.isInteger(v.linger_max_open) && v.linger_max_open > 0) p.lingerMaxOpen = v.linger_max_open;
 			else dropped.push(`linger_max_open ${JSON.stringify(v.linger_max_open)}`);
 		}
+		if (v.max_running !== undefined) {
+			if (typeof v.max_running === "number" && Number.isInteger(v.max_running) && v.max_running > 0) p.maxRunning = v.max_running;
+			else dropped.push(`max_running ${JSON.stringify(v.max_running)}`);
+		}
 		if (dropped.length) warn(`run_profiles.${name}: dropped ${dropped.join("; ")}`);
 		out[name] = p;
 	}
 	return Object.keys(out).length ? out : undefined;
+}
+
+/** An error's code (ENOENT, EACCES, ...) or class name: never its message, args or env. */
+export function errorCode(err: unknown): string {
+	const code = (err as { code?: unknown } | null)?.code;
+	if (typeof code === "string" && /^[A-Z0-9_]{1,40}$/.test(code)) return code;
+	return err instanceof Error ? err.name : "unknown error";
 }
 
 /** The model a run uses: its profile's, else the agent's. */
@@ -448,12 +461,18 @@ async function spawnContainer(
 			log: (line) => console.log(`[${agent.name}] ${line}`),
 		});
 	} catch (err) {
-		recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${String(err)}`);
+		// The error code only: a spawn error carries the container args, message included.
+		recordRunOutcome(RUN_FAILURES_FILE, agent.name, true, `Failed to spawn container: ${errorCode(err)}`);
 		throw err;
 	}
 	// Feeds the watcher's "N failed runs in a row" alert; a usage limit is not
-	// a broken agent and leaves the streak alone.
-	if (!recordFinalOutcome(RUN_FAILURES_FILE, agent.name, out)) {
+	// a broken agent and leaves the streak alone. A conversation run's result
+	// and stderr can quote the conversation (customer text): kind and lengths only.
+	const describe = origin === "conversation"
+		? (o: { result: string; stderr?: string }) =>
+			`conversation run failed (result ${o.result.length} chars, stderr ${(o.stderr || "").length} chars)`
+		: undefined;
+	if (!recordFinalOutcome(RUN_FAILURES_FILE, agent.name, out, describe)) {
 		console.log(`[${agent.name}] Run stopped on a usage limit (account ${out.account ?? "none"}); not counted as a failure`);
 	}
 	return {
@@ -761,7 +780,8 @@ export function spawnAttempt(
 		});
 
 		child.on("error", (err) => {
-			console.error(`[${agent.name}] Failed to spawn container:`, err);
+			// Never the error object: its spawnargs hold the container env, AGENT_MESSAGE included.
+			console.error(`[${agent.name}] Failed to spawn container: ${errorCode(err)}`);
 			reject(err);
 		});
 	});

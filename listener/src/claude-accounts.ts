@@ -269,8 +269,14 @@ export async function runWithAccountFallback(opts: {
  * anything else is recorded (success clears, error extends).
  * Returns whether the outcome was recorded.
  */
-export function recordFinalOutcome(file: string, agentName: string, out: FallbackResult): boolean {
+export function recordFinalOutcome(
+	file: string,
+	agentName: string,
+	out: FallbackResult,
+	// How a failure is described; default: the result or the telling stderr line.
+	describe: (out: FallbackResult) => string = (o) => pickErrorLine(o.result, o.stderr || ""),
+): boolean {
 	if (out.limitHit) return false;
-	recordRunOutcome(file, agentName, out.isError, out.isError ? pickErrorLine(out.result, out.stderr || "") : "");
+	recordRunOutcome(file, agentName, out.isError, out.isError ? describe(out) : "");
 	return true;
 }
