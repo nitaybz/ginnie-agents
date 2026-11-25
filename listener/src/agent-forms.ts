@@ -335,6 +335,8 @@ export interface FormState {
 	status: "open" | "answered";
 	channel: string;
 	ts: string;
+	/** The thread the post sits in (the agent replies there); missing in entries from before 2026-11-25. */
+	thread?: string;
 	text: string;
 	blocks: any[];
 	openedAt: number;
@@ -404,7 +406,7 @@ export class FormStore {
 
 	/** False when the form was answered already (a second submit). The answers are in the same write. */
 	markAnswered(agent: string, formId: string, info: {
-		by: string; total: number; channel: string; ts: string; title: string; answersId: string;
+		by: string; total: number; channel: string; ts: string; thread?: string; title: string; answersId: string;
 		answers: Record<string, Omit<FormAnswer, "id">>; unanswered: string[];
 	}, at: number = Date.now()): boolean {
 		const k = this.key(agent, formId);
@@ -414,7 +416,7 @@ export class FormStore {
 			...this.entries,
 			[k]: {
 				text: cur?.text ?? "", blocks: cur?.blocks ?? [], openedAt: cur?.openedAt ?? at,
-				status: "answered", channel: info.channel, ts: info.ts, answeredAt: at, by: info.by,
+				status: "answered", channel: info.channel, ts: info.ts, thread: info.thread || info.ts, answeredAt: at, by: info.by,
 				answered: Object.keys(info.answers).length, total: info.total, title: info.title,
 				answersId: info.answersId, answers: info.answers, unanswered: info.unanswered, replays: 0,
 			},
@@ -503,7 +505,7 @@ export async function replayPendingAnswers(
 			continue;
 		}
 		deps.deliver({
-			channel: s.channel, threadTs: s.ts, userId: s.by, senderLine: who.line,
+			channel: s.channel, threadTs: s.thread || s.ts, userId: s.by, senderLine: who.line,
 			message: `(Delivered again after a listener restart: skip it if you already applied answers id ${s.answersId}.)\n` +
 				formatSubmission({ id: formId, title: s.title || "", total: s.total || 0 }, s.answers, s.unanswered || [], s.answersId),
 		});
@@ -570,7 +572,10 @@ export function isFormInteraction(action: any, body: any): boolean {
 	return action?.action_id === FORM_OPEN_ACTION || body?.view?.callback_id === FORM_CALLBACK;
 }
 
-interface Meta { f: string; c: string; t: string }
+interface Meta { f: string; c: string; t: string; r?: string }
+/** Where the agent replies: the thread the post sits in, or the post itself when it is not in a thread. */
+const threadOf = (m: Meta): string => (typeof m.r === "string" && /^\d+\.\d+$/.test(m.r) ? m.r : m.t);
+
 function parseMeta(raw: unknown): Meta | null {
 	try {
 		const m = JSON.parse(String(raw || ""));
@@ -627,7 +632,9 @@ async function openForm(deps: FormDeps, body: any, action: any): Promise<void> {
 		}
 		return;
 	}
-	const meta = JSON.stringify({ f: form.id, c: channel, t: ts });
+	// t is the post with the button (updated when answered); r is the thread it sits in, where the agent replies.
+	const root = String(body?.message?.thread_ts || ts);
+	const meta = JSON.stringify({ f: form.id, c: channel, t: ts, r: root });
 	const view = buildFormView(form, meta, {}, {});
 	try {
 		await deps.client.views.open({ token: deps.token, trigger_id: body.trigger_id, view });
@@ -740,7 +747,7 @@ export async function handleFormSubmit(deps: FormDeps, body: any, ack: (r?: any)
 	const answersId = randomUUID();
 	// One write marks the form answered and keeps the answers (a near-simultaneous second submit sees it).
 	try {
-		if (!deps.store.markAnswered(deps.agent.name, form.id, { by: userId, total, channel: meta.c, ts: meta.t, title: form.title, answersId, answers: byId, unanswered }, now)) {
+		if (!deps.store.markAnswered(deps.agent.name, form.id, { by: userId, total, channel: meta.c, ts: meta.t, thread: threadOf(meta), title: form.title, answersId, answers: byId, unanswered }, now)) {
 			await ack();
 			log(`[${deps.agent.name}] form ${form.id}: second submit ignored`);
 			return;
@@ -760,7 +767,7 @@ export async function handleFormSubmit(deps: FormDeps, body: any, ack: (r?: any)
 	await ack();
 	if (body.view?.id) (deps.drafts || sharedDrafts).drop(String(body.view.id));
 	log(`[${deps.agent.name}] form ${form.id} answered by ${userId}: ${answers.length} of ${total}`);
-	deps.deliver({ channel: meta.c, threadTs: meta.t, message, userId, senderLine: who.line });
+	deps.deliver({ channel: meta.c, threadTs: threadOf(meta), message, userId, senderLine: who.line });
 	// Without the post as it was when opened, leave it alone rather than overwrite its text.
 	if (!state?.blocks?.length) {
 		log(`[${deps.agent.name}] form ${form.id}: no saved copy of the post, its button stays (the form is answered)`);

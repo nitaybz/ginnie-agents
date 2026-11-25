@@ -276,6 +276,20 @@ test("submit: all answers reach the agent as one message in the post's thread, t
 	assert.equal(upd.blocks[upd.blocks.length - 1].elements[0].text, "נענה ✓ 3 מתוך 3");
 });
 
+test("a form posted inside a thread: answers go to that thread's root, the post itself is still the one updated, also after a restart", async () => {
+	const s = setup();
+	const { action, body } = clickBody();
+	(body as any).message = { ...body.message, ts: "1795.9", thread_ts: "1795.1" };
+	await handleFormInteraction(s.deps, body, action);
+	const view = s.calls.open[0].view;
+	await submit(s, view, stateOf(view, { ROW1: "stock" }));
+	assert.equal(s.calls.deliver[0].threadTs, "1795.1", "the agent replies, and shows it is working, in the thread the post is in");
+	assert.equal(s.calls.chatUpdate[0].ts, "1795.9", "the post with the button is the one marked answered");
+	const again: any[] = [];
+	await replayPendingAnswers({ ...s.deps, store: new FormStore(s.storeFile), now: () => NOW + 60_000, deliver: (m: any) => again.push(m) });
+	assert.equal(again[0].threadTs, "1795.1");
+});
+
 test("a second submit of the same form is ignored, also after a listener restart", async () => {
 	const s = setup();
 	const view = await openModal(s);
